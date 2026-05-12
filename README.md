@@ -28,3 +28,14 @@ Built-in agent with model fallback, tools, and knowledge retrieval.
 ## Legacy Runner
 
 Migrated from `local-agent` in LangBot.
+
+## Contributing
+
+We welcome contributions! Feel free to:
+
+- Submit issues for bugs or feature requests
+- Fork the repo and submit pull requests
+- Improve documentation or add examples
+- Share your ideas and feedback
+
+Star the repo if you find it useful!
