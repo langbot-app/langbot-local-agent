@@ -27,6 +27,7 @@ from pkg.messages import build_messages
 from pkg.model_calling import (
     ModelCallError,
     StreamingModelCaller,
+    build_llm_tools,
     build_tool_call_message,
     invoke_with_fallback,
 )
@@ -165,12 +166,15 @@ class DefaultAgentRunner(AgentRunner):
         allowed_tools: set[str],
     ) -> AsyncGenerator[AgentRunResult, None]:
         """Run with streaming output and tool calling support."""
+        # Build LLM tools from allowed tool names
+        llm_tools = await build_llm_tools(api, allowed_tools)
+
         try:
             caller = StreamingModelCaller(
                 api=api,
                 model_ids=model_ids,
                 messages=messages,
-                tools=[],  # TODO: Get tools from api when tool detail is available
+                tools=llm_tools,
             )
 
             # Stream LLM response
@@ -326,13 +330,16 @@ class DefaultAgentRunner(AgentRunner):
         allowed_tools: set[str],
     ) -> AsyncGenerator[AgentRunResult, None]:
         """Run with non-streaming output and tool calling support."""
+        # Build LLM tools from allowed tool names
+        llm_tools = await build_llm_tools(api, allowed_tools)
+
         try:
             # Non-streaming invocation with fallback
             response = await invoke_with_fallback(
                 api=api,
                 model_ids=model_ids,
                 messages=messages,
-                tools=None,  # TODO: Get tools when tool detail is available
+                tools=llm_tools,
             )
 
             # Check for tool calls

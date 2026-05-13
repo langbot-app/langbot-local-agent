@@ -18,6 +18,40 @@ class ModelCallError(Exception):
         self.retryable = retryable
 
 
+async def build_llm_tools(
+    api: AgentRunAPIProxy,
+    allowed_tools: set[str],
+) -> list[LLMTool]:
+    """Build LLMTool list from allowed tool names.
+
+    Fetches tool details from LangBot and converts to LLMTool format
+    for LLM function calling.
+
+    Args:
+        api: AgentRunAPIProxy for authorized access
+        allowed_tools: Set of tool names authorized for this run
+
+    Returns:
+        List of LLMTool objects ready for LLM invocation
+    """
+    tools: list[LLMTool] = []
+
+    for tool_name in allowed_tools:
+        try:
+            detail = await api.get_tool_detail(tool_name)
+            tool = LLMTool(
+                name=detail.get('name', tool_name),
+                description=detail.get('description', ''),
+                parameters=detail.get('parameters', {}),
+            )
+            tools.append(tool)
+        except Exception:
+            # Tool detail fetch failed - skip this tool
+            continue
+
+    return tools
+
+
 async def invoke_with_fallback(
     api: AgentRunAPIProxy,
     model_ids: list[str],
