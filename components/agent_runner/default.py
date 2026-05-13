@@ -1,9 +1,17 @@
-"""Local Agent default runner implementation."""
+"""Local Agent default runner implementation.
+
+Supports:
+- Model fallback (primary + fallbacks)
+- Streaming and non-streaming
+- Tool calling loop with max iterations
+- Knowledge retrieval with permission validation
+- Protocol v1 AgentRunResult output
+"""
 
 from __future__ import annotations
 
-import uuid
-from typing import AsyncGenerator
+import json
+from typing import Any, AsyncGenerator
 
 from langbot_plugin.api.definition.components.agent_runner.runner import AgentRunner
 from langbot_plugin.api.entities.builtin.agent_runner import (
@@ -12,14 +20,33 @@ from langbot_plugin.api.entities.builtin.agent_runner import (
     AgentRunnerPermissions,
     AgentRunResult,
 )
-from langbot_plugin.api.entities.builtin.provider.message import Message, MessageChunk
+from langbot_plugin.api.entities.builtin.provider.message import Message
+
+from pkg.config import get_knowledge_base_ids, get_max_round, get_rerank_config, parse_model_config
+from pkg.messages import build_messages
+from pkg.model_calling import (
+    ModelCallError,
+    StreamingModelCaller,
+    build_tool_call_message,
+    invoke_with_fallback,
+)
+from pkg.rag import retrieve_from_knowledge_bases
+from pkg.tool_loop import (
+    DEFAULT_MAX_TOOL_ITERATIONS,
+    ToolCallLoop,
+)
 
 
 class DefaultAgentRunner(AgentRunner):
     """Default AgentRunner for Local Agent.
 
-    Minimal LLM runner implementation for MVP testing.
-    Uses AgentRunAPIProxy for authorized resource access.
+    Full-featured LLM runner with:
+    - Model primary/fallback selection
+    - Streaming and non-streaming output
+    - Tool calling loop
+    - Knowledge retrieval (RAG)
+
+    All resource access goes through AgentRunAPIProxy for authorization.
     """
 
     @classmethod
@@ -37,123 +64,388 @@ class DefaultAgentRunner(AgentRunner):
     def get_permissions(cls) -> AgentRunnerPermissions:
         """Get runner permissions for resource access."""
         return AgentRunnerPermissions(
-            models=['invoke', 'stream'],
-            tools=['list', 'detail', 'call'],
-            knowledge_bases=['list', 'retrieve'],
+            models=["invoke", "stream"],
+            tools=["list", "detail", "call"],
+            knowledge_bases=["list", "retrieve"],
         )
 
     async def run(
         self, ctx: AgentRunContext
     ) -> AsyncGenerator[AgentRunResult, None]:
-        """Run the agent with minimal LLM streaming.
+        """Run the agent with full LLM capabilities.
 
-        Implementation matches original localagent runner behavior:
-        1. Get authorized models from ctx.resources
-        2. Build messages from config.prompt + ctx.messages + ctx.input
-        3. Stream LLM response via invoke_llm_stream
-        4. Accumulate content and yield every 8 chunks or on is_final
-        5. Yield message_delta for streaming, run_completed on success
+        Implementation:
+        1. Get authorized models and parse model config
+        2. Retrieve knowledge base context (if configured)
+        3. Build messages from prompt + history + input
+        4. Stream/Invoke LLM with fallback support
+        5. Handle tool calling loop
+        6. Yield AgentRunResult events
         """
         api = self.get_run_api(ctx)
 
         # Get authorized models
-        models = api.get_allowed_models()
-        if not models:
+        allowed_model_ids = set(m.model_id for m in api.get_allowed_models())
+
+        # Parse model config (supports string and dict formats)
+        model_config = ctx.config.get("model")
+        model_ids = parse_model_config(model_config, allowed_model_ids)
+
+        if not model_ids:
             yield AgentRunResult.run_failed(
                 error="No authorized model for local-agent",
                 code="runner.no_model",
             )
             return
 
-        # TODO: Implement model fallback loop when primary fails
-        primary_model = models[0]
+        # Get max round for history truncation
+        max_round = get_max_round(ctx.config, default=10)
+
+        # Get allowed KB IDs from config (intersection with authorized)
+        allowed_kb_ids = set(kb.kb_id for kb in api.get_allowed_knowledge_bases())
+        kb_ids = get_knowledge_base_ids(ctx.config, allowed_kb_ids)
+
+        # Get rerank configuration
+        rerank_model_id, rerank_top_k = get_rerank_config(ctx.config)
+
+        # Get user input text
+        user_text = ctx.input.to_text()
+
+        # Retrieve from knowledge bases if configured
+        rag_context = ""
+        if kb_ids and user_text:
+            rag_context = await retrieve_from_knowledge_bases(
+                api=api,
+                kb_ids=kb_ids,
+                query_text=user_text,
+                top_k=5,
+                rerank_model_id=rerank_model_id,
+                rerank_top_k=rerank_top_k,
+            )
 
         # Build messages for LLM
-        messages = self._build_messages(ctx)
+        prompt_config = ctx.config.get("prompt", [])
+        messages = build_messages(
+            prompt_config=prompt_config,
+            history_messages=ctx.messages,
+            user_text=user_text,
+            max_round=max_round,
+            rag_context=rag_context if rag_context else None,
+        )
 
+        # Get allowed tools for tool calling
+        allowed_tools = set(t.tool_name for t in api.get_allowed_tools())
+
+        # Check if streaming is requested (default to streaming)
+        # Streaming can be disabled via ctx.config["streaming"] = false
+        use_streaming = ctx.config.get("streaming", True)
+
+        if use_streaming:
+            async for result in self._run_streaming(
+                api=api,
+                model_ids=model_ids,
+                messages=messages,
+                allowed_tools=allowed_tools,
+            ):
+                yield result
+        else:
+            async for result in self._run_non_streaming(
+                api=api,
+                model_ids=model_ids,
+                messages=messages,
+                allowed_tools=allowed_tools,
+            ):
+                yield result
+
+    async def _run_streaming(
+        self,
+        api: Any,
+        model_ids: list[str],
+        messages: list[Message],
+        allowed_tools: set[str],
+    ) -> AsyncGenerator[AgentRunResult, None]:
+        """Run with streaming output and tool calling support."""
         try:
-            # Stream LLM response with accumulation (matching original localagent behavior)
-            accumulated_content = ''
-            msg_idx = 0
-            msg_sequence = 0
+            caller = StreamingModelCaller(
+                api=api,
+                model_ids=model_ids,
+                messages=messages,
+                tools=[],  # TODO: Get tools from api when tool detail is available
+            )
 
-            async for chunk in api.invoke_llm_stream(primary_model.model_id, messages):
-                msg_idx += 1
+            # Stream LLM response
+            async for chunk, is_delta in caller.stream():
+                if chunk.content:  # Only yield non-empty chunks
+                    yield AgentRunResult.message_delta(chunk)
 
-                # Accumulate content
-                if chunk.content:
-                    accumulated_content += chunk.content
+            # Check for tool calls after streaming
+            tool_calls = caller.get_tool_calls()
 
-                # Yield accumulated chunk every 8 chunks or on is_final
-                # This matches original localagent runner behavior
-                if msg_idx % 8 == 0 or chunk.is_final:
-                    msg_sequence += 1
-                    yield AgentRunResult.message_delta(
-                        MessageChunk(
-                            role='assistant',
-                            content=accumulated_content,
-                            is_final=chunk.is_final,
-                            msg_sequence=msg_sequence,
-                        )
+            if tool_calls:
+                # Run tool calling loop
+                committed_model_id = caller.get_committed_model_id()
+                if not committed_model_id:
+                    yield AgentRunResult.run_failed(
+                        error="No model committed for tool loop",
+                        code="runner.no_model",
                     )
+                    return
+
+                accumulated_content = caller.get_accumulated_content()
+
+                # Add assistant message with tool calls to messages
+                from langbot_plugin.api.entities.builtin.provider.message import (
+                    FunctionCall,
+                    ToolCall,
+                )
+                assistant_msg = Message(
+                    role="assistant",
+                    content=accumulated_content,
+                    tool_calls=[
+                        ToolCall(
+                            id=tc["id"],
+                            type=tc.get("type", "function"),
+                            function=FunctionCall(
+                                name=tc.get("function_name", ""),
+                                arguments=tc.get("function_arguments", ""),
+                            ),
+                        )
+                        for tc in tool_calls
+                    ],
+                )
+                updated_messages = messages + [assistant_msg]
+
+                # Execute tool calls
+                tool_loop = ToolCallLoop(
+                    api=api,
+                    allowed_tools=allowed_tools,
+                    max_iterations=DEFAULT_MAX_TOOL_ITERATIONS,
+                )
+
+                pending_tool_calls = tool_calls
+                current_messages = updated_messages
+
+                while pending_tool_calls and tool_loop.check_iteration_limit():
+                    tool_loop.increment_iteration()
+
+                    # Execute each tool call
+                    for tool_call in pending_tool_calls:
+                        tool_call_id = tool_call.get("id", "")
+                        tool_name = tool_call.get("function_name", "")
+                        parameters = {}
+                        try:
+                            args_str = tool_call.get("function_arguments", "{}")
+                            parameters = json.loads(args_str) if args_str else {}
+                        except json.JSONDecodeError:
+                            parameters = {}
+
+                        # Yield tool.call.started
+                        yield AgentRunResult.tool_call_started(
+                            tool_call_id=tool_call_id,
+                            tool_name=tool_name,
+                            parameters=parameters,
+                        )
+
+                        # Execute tool
+                        result, error = await tool_loop.execute_tool_call(tool_call)
+
+                        # Yield tool.call.completed
+                        yield AgentRunResult.tool_call_completed(
+                            tool_call_id=tool_call_id,
+                            tool_name=tool_name,
+                            result=result,
+                            error=error,
+                        )
+
+                        # Build tool result message
+                        tool_msg = build_tool_call_message(
+                            tool_call_id, tool_name, error if error else result, is_error=bool(error)
+                        )
+                        current_messages.append(tool_msg)
+
+                    # Call LLM again with tool results
+                    try:
+                        tool_caller = StreamingModelCaller(
+                            api=api,
+                            model_ids=[committed_model_id],
+                            messages=current_messages,
+                            tools=[],
+                        )
+
+                        async for chunk, is_delta in tool_caller.stream():
+                            if chunk.content:
+                                yield AgentRunResult.message_delta(chunk)
+
+                        # Check for more tool calls
+                        pending_tool_calls = tool_caller.get_tool_calls()
+                        if pending_tool_calls:
+                            # Update messages with assistant response
+                            current_messages.append(
+                                Message(
+                                    role="assistant",
+                                    content=tool_caller.get_accumulated_content(),
+                                )
+                            )
+
+                    except ModelCallError as e:
+                        yield AgentRunResult.run_failed(
+                            error=str(e),
+                            code="runner.tool_loop_error",
+                            retryable=e.retryable,
+                        )
+                        return
+
+                # Check if we hit iteration limit
+                if pending_tool_calls and not tool_loop.check_iteration_limit():
+                    yield AgentRunResult.run_failed(
+                        error=f"Tool call iteration limit reached ({DEFAULT_MAX_TOOL_ITERATIONS})",
+                        code="runner.tool_loop_limit",
+                    )
+                    return
 
             # Successful completion
             yield AgentRunResult.run_completed(finish_reason="stop")
 
-        except Exception as e:
+        except ModelCallError as e:
             yield AgentRunResult.run_failed(
                 error=str(e),
                 code="runner.llm_error",
-                retryable=True,
+                retryable=e.retryable,
+            )
+        except Exception as e:
+            yield AgentRunResult.run_failed(
+                error=str(e),
+                code="runner.error",
             )
 
-    def _build_messages(self, ctx: AgentRunContext) -> list[Message]:
-        """Build messages list for LLM invocation.
+    async def _run_non_streaming(
+        self,
+        api: Any,
+        model_ids: list[str],
+        messages: list[Message],
+        allowed_tools: set[str],
+    ) -> AsyncGenerator[AgentRunResult, None]:
+        """Run with non-streaming output and tool calling support."""
+        try:
+            # Non-streaming invocation with fallback
+            response = await invoke_with_fallback(
+                api=api,
+                model_ids=model_ids,
+                messages=messages,
+                tools=None,  # TODO: Get tools when tool detail is available
+            )
 
-        Structure:
-        1. System prompt from config.prompt (if configured)
-        2. Historical messages from ctx.messages (truncated by max-round)
-        3. Current user input from ctx.input
+            # Check for tool calls
+            tool_calls = response.tool_calls
 
-        Args:
-            ctx: Agent run context
+            if tool_calls:
+                # Convert to internal format
+                pending_tool_calls = [
+                    {
+                        "id": tc.id,
+                        "type": tc.type,
+                        "function_name": tc.function.name if tc.function else "",
+                        "function_arguments": tc.function.arguments if tc.function else "",
+                    }
+                    for tc in tool_calls
+                ]
 
-        Returns:
-            List of Message objects ready for LLM
-        """
-        messages: list[Message] = []
+                current_messages = messages + [response]
 
-        # Add system prompt from config
-        prompt_config = ctx.config.get("prompt", [])
-        if prompt_config:
-            for prompt_item in prompt_config:
-                role = prompt_item.get("role", "system")
-                content = prompt_item.get("content", "")
-                if content:
-                    messages.append(Message(role=role, content=content))
+                # Execute tool calls in a loop
+                tool_loop = ToolCallLoop(
+                    api=api,
+                    allowed_tools=allowed_tools,
+                    max_iterations=DEFAULT_MAX_TOOL_ITERATIONS,
+                )
 
-        # Get max-round for history truncation (use safe default if missing)
-        max_round = ctx.config.get("max-round", 10)
-        if max_round < 1:
-            max_round = 10
+                while pending_tool_calls and tool_loop.check_iteration_limit():
+                    tool_loop.increment_iteration()
 
-        # Add historical messages (truncate if exceeds max-round)
-        # Each round = 1 user + 1 assistant message
-        # Keep last N rounds to avoid context overflow
-        history_messages = ctx.messages
-        if len(history_messages) > max_round * 2:
-            # Keep last max_round*2 messages (max_round complete exchanges)
-            history_messages = history_messages[-(max_round * 2):]
+                    for tool_call in pending_tool_calls:
+                        tool_call_id = tool_call.get("id", "")
+                        tool_name = tool_call.get("function_name", "")
+                        parameters = {}
+                        try:
+                            args_str = tool_call.get("function_arguments", "{}")
+                            parameters = json.loads(args_str) if args_str else {}
+                        except json.JSONDecodeError:
+                            parameters = {}
 
-        messages.extend(history_messages)
+                        yield AgentRunResult.tool_call_started(
+                            tool_call_id=tool_call_id,
+                            tool_name=tool_name,
+                            parameters=parameters,
+                        )
 
-        # Add current user input
-        user_text = ctx.input.to_text()
-        if user_text:
-            messages.append(Message(role="user", content=user_text))
+                        result, error = await tool_loop.execute_tool_call(tool_call)
 
-        # TODO: Handle multimodal input (images, files) from ctx.input.contents
-        # TODO: Add knowledge base retrieval context before LLM call
-        # TODO: Implement tool calling loop when LLM returns tool_calls
+                        yield AgentRunResult.tool_call_completed(
+                            tool_call_id=tool_call_id,
+                            tool_name=tool_name,
+                            result=result,
+                            error=error,
+                        )
 
-        return messages
+                        tool_msg = build_tool_call_message(
+                            tool_call_id, tool_name, error if error else result, is_error=bool(error)
+                        )
+                        current_messages.append(tool_msg)
+
+                    # Call LLM again with tool results (use first model, no fallback in loop)
+                    try:
+                        response = await api.invoke_llm(
+                            llm_model_uuid=model_ids[0],
+                            messages=current_messages,
+                            funcs=[],
+                        )
+
+                        # Update pending tool calls
+                        if response.tool_calls:
+                            pending_tool_calls = [
+                                {
+                                    "id": tc.id,
+                                    "type": tc.type,
+                                    "function_name": tc.function.name if tc.function else "",
+                                    "function_arguments": tc.function.arguments if tc.function else "",
+                                }
+                                for tc in response.tool_calls
+                            ]
+                            current_messages.append(response)
+                        else:
+                            pending_tool_calls = None
+
+                    except Exception as e:
+                        yield AgentRunResult.run_failed(
+                            error=f"LLM call in tool loop failed: {e}",
+                            code="runner.tool_loop_error",
+                            retryable=True,
+                        )
+                        return
+
+                if pending_tool_calls and not tool_loop.check_iteration_limit():
+                    yield AgentRunResult.run_failed(
+                        error=f"Tool call iteration limit reached ({DEFAULT_MAX_TOOL_ITERATIONS})",
+                        code="runner.tool_loop_limit",
+                    )
+                    return
+
+                # Yield final message
+                yield AgentRunResult.message_completed(response)
+            else:
+                # No tool calls - yield completed message
+                yield AgentRunResult.message_completed(response)
+
+            yield AgentRunResult.run_completed(finish_reason="stop")
+
+        except ModelCallError as e:
+            yield AgentRunResult.run_failed(
+                error=str(e),
+                code="runner.llm_error",
+                retryable=e.retryable,
+            )
+        except Exception as e:
+            yield AgentRunResult.run_failed(
+                error=str(e),
+                code="runner.error",
+            )

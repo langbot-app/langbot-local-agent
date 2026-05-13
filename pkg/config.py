@@ -1,0 +1,128 @@
+"""Configuration parsing and validation for local-agent runner."""
+
+from __future__ import annotations
+
+import typing
+
+
+def parse_model_config(
+    model_config: typing.Any,
+    allowed_model_ids: set[str],
+) -> list[str]:
+    """Parse model configuration into ordered list of model IDs.
+
+    Supports two formats:
+    - Legacy string format: "model_uuid"
+    - New dict format: {"primary": "...", "fallbacks": [...]}
+
+    Filters out models not in allowed_model_ids.
+
+    Args:
+        model_config: Model configuration from ctx.config["model"]
+        allowed_model_ids: Set of authorized model IDs from ctx.resources
+
+    Returns:
+        Ordered list of model IDs to try (primary first, then fallbacks)
+        Empty list if no valid models configured.
+    """
+    candidates: list[str] = []
+
+    if model_config is None:
+        return candidates
+
+    # Legacy string format
+    if isinstance(model_config, str):
+        model_id = _normalize_model_id(model_config)
+        if model_id and model_id in allowed_model_ids:
+            candidates.append(model_id)
+        return candidates
+
+    # New dict format
+    if isinstance(model_config, dict):
+        # Primary model
+        primary = model_config.get("primary")
+        if primary:
+            primary_id = _normalize_model_id(primary)
+            if primary_id and primary_id in allowed_model_ids:
+                candidates.append(primary_id)
+
+        # Fallback models
+        fallbacks = model_config.get("fallbacks", [])
+        if isinstance(fallbacks, list):
+            for fb in fallbacks:
+                fb_id = _normalize_model_id(fb)
+                if fb_id and fb_id in allowed_model_ids and fb_id not in candidates:
+                    candidates.append(fb_id)
+
+        return candidates
+
+    # Unknown format
+    return candidates
+
+
+def _normalize_model_id(model_id: typing.Any) -> str | None:
+    """Normalize model ID, returning None for invalid/empty values."""
+    if not isinstance(model_id, str):
+        return None
+    model_id = model_id.strip()
+    if not model_id or model_id == "__none__":
+        return None
+    return model_id
+
+
+def get_max_round(config: dict[str, typing.Any], default: int = 10) -> int:
+    """Get max-round configuration with validation."""
+    max_round = config.get("max-round", default)
+    if not isinstance(max_round, int) or max_round < 1:
+        return default
+    return max_round
+
+
+def get_knowledge_base_ids(
+    config: dict[str, typing.Any],
+    allowed_kb_ids: set[str],
+) -> list[str]:
+    """Get knowledge base IDs from config, filtered by allowed set.
+
+    Args:
+        config: Runner configuration
+        allowed_kb_ids: Set of authorized KB IDs from ctx.resources
+
+    Returns:
+        List of KB IDs to use (intersection of config and allowed)
+    """
+    kb_ids: list[str] = []
+
+    config_kbs = config.get("knowledge-bases", [])
+    if not isinstance(config_kbs, list):
+        return kb_ids
+
+    for kb_id in config_kbs:
+        if isinstance(kb_id, str) and kb_id and kb_id != "__none__":
+            if kb_id in allowed_kb_ids and kb_id not in kb_ids:
+                kb_ids.append(kb_id)
+
+    return kb_ids
+
+
+def get_rerank_config(
+    config: dict[str, typing.Any],
+) -> tuple[str | None, int]:
+    """Get rerank model configuration.
+
+    Args:
+        config: Runner configuration
+
+    Returns:
+        Tuple of (rerank_model_id, rerank_top_k)
+        rerank_model_id is None if not configured or set to "__none__"
+    """
+    rerank_model_id = config.get("rerank-model")
+    if not isinstance(rerank_model_id, str) or not rerank_model_id or rerank_model_id == "__none__":
+        rerank_model_id = None
+
+    rerank_top_k = config.get("rerank-top-k", 5)
+    if not isinstance(rerank_top_k, int) or rerank_top_k < 1:
+        rerank_top_k = 5
+
+    return rerank_model_id, rerank_top_k
