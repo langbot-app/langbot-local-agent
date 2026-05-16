@@ -39,10 +39,17 @@ async def build_llm_tools(
     for tool_name in allowed_tools:
         try:
             detail = await api.get_tool_detail(tool_name)
+            description = detail.get('description', '')
+
+            async def _placeholder_func(**kwargs):
+                return kwargs
+
             tool = LLMTool(
                 name=detail.get('name', tool_name),
-                description=detail.get('description', ''),
+                human_desc=description,
+                description=description,
                 parameters=detail.get('parameters', {}),
+                func=_placeholder_func,
             )
             tools.append(tool)
         except Exception:

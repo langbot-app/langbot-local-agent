@@ -49,6 +49,13 @@ class FakeAgentRunAPIProxy:
         # Mock methods
         self.invoke_llm = AsyncMock()
         self.invoke_llm_stream = AsyncMock()
+        self.get_tool_detail = AsyncMock(
+            side_effect=lambda tool_name: {
+                "name": tool_name,
+                "description": f"Tool {tool_name}",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        )
         self.call_tool = AsyncMock()
         self.retrieve_knowledge = AsyncMock()
 
@@ -470,6 +477,51 @@ class TestDefaultAgentRunner:
         assert started[0].data.get("tool_name") == "allowed_tool"
         assert len(completed) == 1
         assert completed[0].data.get("error") is None  # No error
+
+    @pytest.mark.asyncio
+    async def test_authorized_tool_detail_is_fetched_and_passed_to_model(self, runner, monkeypatch):
+        """Allowed tools are resolved through get_tool_detail and passed as LLM tools."""
+        fake_api = FakeAgentRunAPIProxy(
+            models=[ModelResource(model_id="model-1")],
+            tools=[ToolResource(tool_name="allowed_tool")],
+        )
+        fake_api.get_tool_detail = AsyncMock(
+            return_value={
+                "name": "allowed_tool",
+                "description": "Allowed test tool",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"arg": {"type": "string"}},
+                },
+            }
+        )
+
+        captured_funcs = []
+
+        async def mock_stream(*args, **kwargs):
+            captured_funcs.extend(kwargs.get("funcs", []))
+            yield MessageChunk(role="assistant", content="No tools needed", is_final=True)
+
+        fake_api.invoke_llm_stream = mock_stream
+        monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
+
+        ctx = make_context(
+            config={"model": "model-1"},
+            resources=AgentResources(
+                models=[ModelResource(model_id="model-1")],
+                tools=[ToolResource(tool_name="allowed_tool")],
+            ),
+        )
+
+        results = []
+        async for result in runner.run(ctx):
+            results.append(result)
+
+        fake_api.get_tool_detail.assert_awaited_once_with("allowed_tool")
+        assert len(captured_funcs) == 1
+        assert captured_funcs[0].name == "allowed_tool"
+        assert captured_funcs[0].parameters["properties"]["arg"]["type"] == "string"
+        assert any(r.type == AgentRunResultType.MESSAGE_DELTA for r in results)
 
     @pytest.mark.asyncio
     async def test_tool_call_unauthorized_tool_fails(self, runner, monkeypatch):
