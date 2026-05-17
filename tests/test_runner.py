@@ -23,11 +23,17 @@ from langbot_plugin.api.entities.builtin.agent_runner.result import (
 )
 from langbot_plugin.api.entities.builtin.agent_runner.runtime import AgentRuntimeContext
 from langbot_plugin.api.entities.builtin.agent_runner.trigger import AgentTrigger
-from langbot_plugin.api.entities.builtin.provider.message import Message, MessageChunk
+from langbot_plugin.api.entities.builtin.provider.message import (
+    ContentElement,
+    FunctionCall,
+    Message,
+    MessageChunk,
+    ToolCall,
+)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pkg.config import get_knowledge_base_ids, get_max_round, parse_model_config
+from pkg.config import get_knowledge_base_ids, get_max_round, get_rerank_config, parse_model_config
 from pkg.messages import build_messages, format_rag_results
 
 # ==================== Fixtures ====================
@@ -58,6 +64,7 @@ class FakeAgentRunAPIProxy:
         )
         self.call_tool = AsyncMock()
         self.retrieve_knowledge = AsyncMock()
+        self.invoke_rerank = AsyncMock()
 
     def get_allowed_models(self) -> list[ModelResource]:
         return self._models
@@ -74,15 +81,19 @@ def make_context(
     resources: AgentResources | None = None,
     messages: list[Message] | None = None,
     input_text: str = "test input",
+    input_contents: list[ContentElement] | None = None,
+    prompt: list[Message] | None = None,
+    runtime_metadata: dict[str, Any] | None = None,
 ) -> AgentRunContext:
     """Create a test AgentRunContext."""
     return AgentRunContext(
         run_id="test-run-id",
         trigger=AgentTrigger(type="message.received"),
         messages=messages or [],
-        input=AgentInput(text=input_text),
+        prompt=prompt or [],
+        input=AgentInput(text=input_text, contents=input_contents or []),
         resources=resources or AgentResources(),
-        runtime=AgentRuntimeContext(query_id=1),
+        runtime=AgentRuntimeContext(query_id=1, metadata=runtime_metadata or {}),
         config=config or {},
     )
 
@@ -219,6 +230,34 @@ class TestGetKnowledgeBaseIds:
         )
         assert result == ["kb-1"]
 
+    def test_legacy_single_knowledge_base(self):
+        """Legacy singular knowledge-base config is still supported."""
+        result = get_knowledge_base_ids(
+            {"knowledge-base": "kb-1"},
+            {"kb-1", "kb-2"},
+        )
+        assert result == ["kb-1"]
+
+
+class TestGetRerankConfig:
+    """Tests for rerank configuration parsing."""
+
+    def test_empty_config(self):
+        """Empty config disables rerank and keeps default top-k."""
+        assert get_rerank_config({}) == (None, 5)
+
+    def test_valid_config(self):
+        """Valid rerank model and top-k are returned."""
+        assert get_rerank_config({"rerank-model": "rerank-1", "rerank-top-k": 2}) == ("rerank-1", 2)
+
+    def test_none_model_disables_rerank(self):
+        """__none__ disables rerank."""
+        assert get_rerank_config({"rerank-model": "__none__", "rerank-top-k": 2}) == (None, 2)
+
+    def test_invalid_top_k_uses_default(self):
+        """Invalid rerank top-k falls back to default."""
+        assert get_rerank_config({"rerank-model": "rerank-1", "rerank-top-k": 0}) == ("rerank-1", 5)
+
 
 # ==================== Message Building Tests ====================
 
@@ -279,6 +318,57 @@ class TestBuildMessages:
         assert "[1] X is a variable." in messages[0].content
         assert "<user_message>" in messages[0].content
         assert "What is X?" in messages[0].content
+
+    def test_effective_prompt_messages_override_static_config(self):
+        """Host-provided effective prompt is preferred over static config."""
+        messages = build_messages(
+            prompt_config=[{"role": "system", "content": "Static prompt"}],
+            prompt_messages=[Message(role="system", content="Effective prompt")],
+            history_messages=[],
+            user_text="Hello",
+            max_round=10,
+        )
+
+        assert messages[0].content == "Effective prompt"
+
+    def test_multimodal_input_contents_are_preserved(self):
+        """Structured input contents are preserved in the current user message."""
+        contents = [
+            ContentElement.from_text("Look at this"),
+            ContentElement.from_image_base64("base64-image"),
+        ]
+
+        messages = build_messages(
+            prompt_config=[],
+            history_messages=[],
+            user_text="Look at this",
+            input_contents=contents,
+            max_round=10,
+        )
+
+        assert isinstance(messages[0].content, list)
+        assert messages[0].content[0].text == "Look at this"
+        assert messages[0].content[1].type == "image_base64"
+
+    def test_rag_context_replaces_text_and_preserves_multimodal_parts(self):
+        """RAG modifies only the text content and keeps attachments."""
+        contents = [
+            ContentElement.from_text("What is in this image?"),
+            ContentElement.from_image_base64("base64-image"),
+        ]
+
+        messages = build_messages(
+            prompt_config=[],
+            history_messages=[],
+            user_text="What is in this image?",
+            input_contents=contents,
+            rag_context="[1] Image metadata",
+            max_round=10,
+        )
+
+        assert isinstance(messages[0].content, list)
+        assert "<context>" in messages[0].content[0].text
+        assert messages[0].content[1].type == "image_base64"
 
 
 class TestFormatRagResults:
@@ -524,6 +614,55 @@ class TestDefaultAgentRunner:
         assert any(r.type == AgentRunResultType.MESSAGE_DELTA for r in results)
 
     @pytest.mark.asyncio
+    async def test_streaming_tool_loop_preserves_visible_prefix_and_tools(self, runner, monkeypatch):
+        """Tool follow-up chunks keep earlier visible content and available tools."""
+        fake_api = FakeAgentRunAPIProxy(
+            models=[ModelResource(model_id="model-1")],
+            tools=[ToolResource(tool_name="allowed_tool")],
+        )
+        fake_api.call_tool = AsyncMock(return_value={"result": "success"})
+
+        stream_funcs: list[list[Any]] = []
+
+        async def mock_stream(*args, **kwargs):
+            stream_funcs.append(kwargs.get("funcs", []))
+            if len(stream_funcs) == 1:
+                yield MessageChunk(role="assistant", content="before ", is_final=False)
+                yield MessageChunk(
+                    role="assistant",
+                    content="",
+                    is_final=True,
+                    tool_calls=[
+                        ToolCall(
+                            id="call-1",
+                            type="function",
+                            function=FunctionCall(name="allowed_tool", arguments="{}"),
+                        )
+                    ],
+                )
+            else:
+                yield MessageChunk(role="assistant", content="after", is_final=True)
+
+        fake_api.invoke_llm_stream = mock_stream
+        monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
+
+        ctx = make_context(
+            config={"model": "model-1"},
+            resources=AgentResources(
+                models=[ModelResource(model_id="model-1")],
+                tools=[ToolResource(tool_name="allowed_tool")],
+            ),
+        )
+
+        results = []
+        async for result in runner.run(ctx):
+            results.append(result)
+
+        deltas = [r.data.get("chunk", {}).get("content") for r in results if r.type == AgentRunResultType.MESSAGE_DELTA]
+        assert deltas == ["before ", "before after"]
+        assert stream_funcs[1], "tool follow-up stream should keep tools available"
+
+    @pytest.mark.asyncio
     async def test_tool_call_unauthorized_tool_fails(self, runner, monkeypatch):
         """Tool call to unauthorized tool returns error."""
         fake_api = FakeAgentRunAPIProxy(
@@ -643,6 +782,65 @@ class TestDefaultAgentRunner:
         assert fake_api.retrieve_knowledge.call_count == 0
 
     @pytest.mark.asyncio
+    async def test_rag_uses_authorized_rerank_model(self, runner, monkeypatch):
+        """RAG retrieval invokes configured rerank model and uses its order."""
+        fake_api = FakeAgentRunAPIProxy(
+            models=[
+                ModelResource(model_id="model-1"),
+                ModelResource(model_id="rerank-1", model_type="rerank"),
+            ],
+            knowledge_bases=[KnowledgeBaseResource(kb_id="kb-1")],
+        )
+        fake_api.retrieve_knowledge = AsyncMock(
+            return_value=[
+                {"content": [{"type": "text", "text": "low relevance"}]},
+                {"content": [{"type": "text", "text": "high relevance sentinel"}]},
+            ]
+        )
+        fake_api.invoke_rerank = AsyncMock(
+            return_value=[{"index": 1, "relevance_score": 0.99}]
+        )
+        captured_messages: list[Message] = []
+
+        async def mock_stream(*args, **kwargs):
+            captured_messages.extend(kwargs["messages"])
+            yield MessageChunk(role="assistant", content="Response", is_final=True)
+
+        fake_api.invoke_llm_stream = mock_stream
+        monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
+
+        ctx = make_context(
+            config={
+                "model": "model-1",
+                "knowledge-bases": ["kb-1"],
+                "rerank-model": "rerank-1",
+                "rerank-top-k": 1,
+            },
+            resources=AgentResources(
+                models=[
+                    ModelResource(model_id="model-1"),
+                    ModelResource(model_id="rerank-1", model_type="rerank"),
+                ],
+                knowledge_bases=[KnowledgeBaseResource(kb_id="kb-1")],
+            ),
+            input_text="find sentinel",
+        )
+
+        results = []
+        async for result in runner.run(ctx):
+            results.append(result)
+
+        fake_api.invoke_rerank.assert_awaited_once_with(
+            rerank_model_uuid="rerank-1",
+            query="find sentinel",
+            documents=["low relevance", "high relevance sentinel"],
+            top_k=1,
+        )
+        assert any(r.type == AgentRunResultType.RUN_COMPLETED for r in results)
+        assert "high relevance sentinel" in captured_messages[-1].content
+        assert "low relevance" not in captured_messages[-1].content
+
+    @pytest.mark.asyncio
     async def test_streaming_failure_after_first_chunk_no_fallback(self, runner, monkeypatch):
         """Streaming: model fails after first chunk, should NOT fallback to next model.
 
@@ -705,6 +903,53 @@ class TestDefaultAgentRunner:
         assert "no fallback possible" in failed[0].data.get("error", "").lower()
 
     @pytest.mark.asyncio
+    async def test_streaming_tool_loop_stops_at_iteration_limit(self, runner, monkeypatch):
+        """Repeated tool requests stop with runner.tool_loop_limit."""
+        fake_api = FakeAgentRunAPIProxy(
+            models=[ModelResource(model_id="model-1")],
+            tools=[ToolResource(tool_name="allowed_tool")],
+        )
+        fake_api.call_tool = AsyncMock(return_value={"result": "again"})
+        stream_call_count = 0
+
+        async def mock_stream(*args, **kwargs):
+            nonlocal stream_call_count
+            stream_call_count += 1
+            yield MessageChunk(
+                role="assistant",
+                content="",
+                is_final=True,
+                tool_calls=[
+                    ToolCall(
+                        id=f"call-{stream_call_count}",
+                        type="function",
+                        function=FunctionCall(name="allowed_tool", arguments="{}"),
+                    )
+                ],
+            )
+
+        fake_api.invoke_llm_stream = mock_stream
+        monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
+
+        ctx = make_context(
+            config={"model": "model-1"},
+            resources=AgentResources(
+                models=[ModelResource(model_id="model-1")],
+                tools=[ToolResource(tool_name="allowed_tool")],
+            ),
+        )
+
+        results = []
+        async for result in runner.run(ctx):
+            results.append(result)
+
+        failed = [r for r in results if r.type == AgentRunResultType.RUN_FAILED]
+        assert len(failed) == 1
+        assert failed[0].data.get("code") == "runner.tool_loop_limit"
+        assert fake_api.call_tool.await_count == 10
+        assert stream_call_count == 11
+
+    @pytest.mark.asyncio
     async def test_non_streaming_mode_uses_invoke_llm(self, runner, monkeypatch):
         """Non-streaming mode uses invoke_llm and yields message.completed."""
         fake_api = FakeAgentRunAPIProxy(
@@ -737,6 +982,32 @@ class TestDefaultAgentRunner:
         assert len(completed) == 1
         assert completed[0].data.get("message", {}).get("content") == "Non-streaming response"
         assert len(run_completed) == 1
+
+    @pytest.mark.asyncio
+    async def test_runtime_metadata_can_disable_default_streaming(self, runner, monkeypatch):
+        """When config omits streaming, host adapter capability decides the mode."""
+        fake_api = FakeAgentRunAPIProxy(
+            models=[ModelResource(model_id="model-1")],
+        )
+        fake_api.invoke_llm = AsyncMock(
+            return_value=Message(role="assistant", content="Adapter cannot stream")
+        )
+        monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
+
+        ctx = make_context(
+            config={"model": "model-1"},
+            resources=AgentResources(models=[ModelResource(model_id="model-1")]),
+            runtime_metadata={"streaming_supported": False},
+        )
+
+        results = []
+        async for result in runner.run(ctx):
+            results.append(result)
+
+        fake_api.invoke_llm.assert_awaited_once()
+        assert fake_api.invoke_llm_stream.call_count == 0
+        completed = [r for r in results if r.type == AgentRunResultType.MESSAGE_COMPLETED]
+        assert completed[0].data.get("message", {}).get("content") == "Adapter cannot stream"
 
     @pytest.mark.asyncio
     async def test_non_streaming_fallback(self, runner, monkeypatch):
@@ -780,3 +1051,58 @@ class TestDefaultAgentRunner:
         completed = [r for r in results if r.type == AgentRunResultType.MESSAGE_COMPLETED]
         assert len(completed) == 1
         assert completed[0].data.get("message", {}).get("content") == "Fallback response"
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_tool_loop_uses_committed_fallback_model(self, runner, monkeypatch):
+        """Tool loop continues with the model that succeeded during fallback."""
+        fake_api = FakeAgentRunAPIProxy(
+            models=[
+                ModelResource(model_id="model-1"),
+                ModelResource(model_id="model-2"),
+            ],
+            tools=[ToolResource(tool_name="allowed_tool")],
+        )
+        fake_api.call_tool = AsyncMock(return_value={"result": "success"})
+
+        calls: list[tuple[str, list[Any]]] = []
+
+        async def mock_invoke_llm(llm_model_uuid, *args, **kwargs):
+            calls.append((llm_model_uuid, kwargs.get("funcs", [])))
+            if llm_model_uuid == "model-1":
+                raise Exception("Primary model error")
+            if len(calls) == 2:
+                return Message(
+                    role="assistant",
+                    content="",
+                    tool_calls=[
+                        ToolCall(
+                            id="call-1",
+                            type="function",
+                            function=FunctionCall(name="allowed_tool", arguments="{}"),
+                        )
+                    ],
+                )
+            return Message(role="assistant", content="Done")
+
+        fake_api.invoke_llm = mock_invoke_llm
+        monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
+
+        ctx = make_context(
+            config={"model": {"primary": "model-1", "fallbacks": ["model-2"]}, "streaming": False},
+            resources=AgentResources(
+                models=[
+                    ModelResource(model_id="model-1"),
+                    ModelResource(model_id="model-2"),
+                ],
+                tools=[ToolResource(tool_name="allowed_tool")],
+            ),
+        )
+
+        results = []
+        async for result in runner.run(ctx):
+            results.append(result)
+
+        assert [model_id for model_id, _ in calls] == ["model-1", "model-2", "model-2"]
+        assert calls[-1][1], "tool loop should keep tools available for multi-step calls"
+        completed = [r for r in results if r.type == AgentRunResultType.MESSAGE_COMPLETED]
+        assert completed[0].data.get("message", {}).get("content") == "Done"

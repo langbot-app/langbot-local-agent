@@ -20,7 +20,7 @@ from langbot_plugin.api.entities.builtin.agent_runner import (
     AgentRunnerPermissions,
     AgentRunResult,
 )
-from langbot_plugin.api.entities.builtin.provider.message import Message
+from langbot_plugin.api.entities.builtin.provider.message import FunctionCall, Message, ToolCall
 
 from pkg.config import get_knowledge_base_ids, get_max_round, get_rerank_config, parse_model_config
 from pkg.messages import build_messages
@@ -36,6 +36,28 @@ from pkg.tool_loop import (
     DEFAULT_MAX_TOOL_ITERATIONS,
     ToolCallLoop,
 )
+
+
+def _build_assistant_tool_call_message(
+    content: str,
+    tool_calls: list[dict[str, Any]],
+) -> Message:
+    """Build an assistant message that preserves tool call IDs for tool results."""
+    return Message(
+        role="assistant",
+        content=content,
+        tool_calls=[
+            ToolCall(
+                id=tc["id"],
+                type=tc.get("type", "function"),
+                function=FunctionCall(
+                    name=tc.get("function_name", ""),
+                    arguments=tc.get("function_arguments", ""),
+                ),
+            )
+            for tc in tool_calls
+        ],
+    )
 
 
 class DefaultAgentRunner(AgentRunner):
@@ -128,8 +150,10 @@ class DefaultAgentRunner(AgentRunner):
         prompt_config = ctx.config.get("prompt", [])
         messages = build_messages(
             prompt_config=prompt_config,
+            prompt_messages=ctx.prompt,
             history_messages=ctx.messages,
             user_text=user_text,
+            input_contents=ctx.input.contents,
             max_round=max_round,
             rag_context=rag_context if rag_context else None,
         )
@@ -137,9 +161,11 @@ class DefaultAgentRunner(AgentRunner):
         # Get allowed tools for tool calling
         allowed_tools = set(t.tool_name for t in api.get_allowed_tools())
 
-        # Check if streaming is requested (default to streaming)
-        # Streaming can be disabled via ctx.config["streaming"] = false
-        use_streaming = ctx.config.get("streaming", True)
+        # Prefer host runtime capability so non-streaming adapters keep the
+        # same behavior as the original built-in local-agent runner.
+        use_streaming = ctx.config.get("streaming")
+        if use_streaming is None:
+            use_streaming = ctx.runtime.metadata.get("streaming_supported", True)
 
         if use_streaming:
             async for result in self._run_streaming(
@@ -198,24 +224,9 @@ class DefaultAgentRunner(AgentRunner):
                 accumulated_content = caller.get_accumulated_content()
 
                 # Add assistant message with tool calls to messages
-                from langbot_plugin.api.entities.builtin.provider.message import (
-                    FunctionCall,
-                    ToolCall,
-                )
-                assistant_msg = Message(
-                    role="assistant",
-                    content=accumulated_content,
-                    tool_calls=[
-                        ToolCall(
-                            id=tc["id"],
-                            type=tc.get("type", "function"),
-                            function=FunctionCall(
-                                name=tc.get("function_name", ""),
-                                arguments=tc.get("function_arguments", ""),
-                            ),
-                        )
-                        for tc in tool_calls
-                    ],
+                assistant_msg = _build_assistant_tool_call_message(
+                    accumulated_content,
+                    tool_calls,
                 )
                 updated_messages = messages + [assistant_msg]
 
@@ -228,6 +239,7 @@ class DefaultAgentRunner(AgentRunner):
 
                 pending_tool_calls = tool_calls
                 current_messages = updated_messages
+                visible_content_prefix = accumulated_content
 
                 while pending_tool_calls and tool_loop.check_iteration_limit():
                     tool_loop.increment_iteration()
@@ -273,21 +285,25 @@ class DefaultAgentRunner(AgentRunner):
                             api=api,
                             model_ids=[committed_model_id],
                             messages=current_messages,
-                            tools=[],
+                            tools=llm_tools,
                         )
 
                         async for chunk, is_delta in tool_caller.stream():
                             if chunk.content:
+                                chunk = chunk.model_copy(deep=True)
+                                if isinstance(chunk.content, str):
+                                    chunk.content = visible_content_prefix + chunk.content
                                 yield AgentRunResult.message_delta(chunk)
 
                         # Check for more tool calls
                         pending_tool_calls = tool_caller.get_tool_calls()
+                        visible_content_prefix += tool_caller.get_accumulated_content()
                         if pending_tool_calls:
                             # Update messages with assistant response
                             current_messages.append(
-                                Message(
-                                    role="assistant",
-                                    content=tool_caller.get_accumulated_content(),
+                                _build_assistant_tool_call_message(
+                                    tool_caller.get_accumulated_content(),
+                                    pending_tool_calls,
                                 )
                             )
 
@@ -335,7 +351,7 @@ class DefaultAgentRunner(AgentRunner):
 
         try:
             # Non-streaming invocation with fallback
-            response = await invoke_with_fallback(
+            response, committed_model_id = await invoke_with_fallback(
                 api=api,
                 model_ids=model_ids,
                 messages=messages,
@@ -399,12 +415,13 @@ class DefaultAgentRunner(AgentRunner):
                         )
                         current_messages.append(tool_msg)
 
-                    # Call LLM again with tool results (use first model, no fallback in loop)
+                    # Call LLM again with tool results using the committed
+                    # model from the successful first call.
                     try:
                         response = await api.invoke_llm(
-                            llm_model_uuid=model_ids[0],
+                            llm_model_uuid=committed_model_id,
                             messages=current_messages,
-                            funcs=[],
+                            funcs=llm_tools,
                         )
 
                         # Update pending tool calls

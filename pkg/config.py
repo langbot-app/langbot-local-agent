@@ -94,6 +94,10 @@ def get_knowledge_base_ids(
     kb_ids: list[str] = []
 
     config_kbs = config.get("knowledge-bases", [])
+    if not config_kbs:
+        legacy_kb = config.get("knowledge-base", "")
+        if isinstance(legacy_kb, str) and legacy_kb and legacy_kb != "__none__":
+            config_kbs = [legacy_kb]
     if not isinstance(config_kbs, list):
         return kb_ids
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import typing
 
-from langbot_plugin.api.entities.builtin.provider.message import Message
+from langbot_plugin.api.entities.builtin.provider.message import ContentElement, Message
 
 
 def build_messages(
@@ -13,6 +13,8 @@ def build_messages(
     user_text: str,
     max_round: int,
     rag_context: str | None = None,
+    prompt_messages: list[Message] | None = None,
+    input_contents: list[ContentElement] | None = None,
 ) -> list[Message]:
     """Build messages list for LLM invocation.
 
@@ -33,8 +35,11 @@ def build_messages(
     """
     messages: list[Message] = []
 
-    # Add system prompt from config
-    if prompt_config:
+    # Prefer the effective host-provided prompt. It includes changes made by
+    # host preprocessing and prompt-related plugin events.
+    if prompt_messages:
+        messages.extend([msg.model_copy(deep=True) for msg in prompt_messages])
+    elif prompt_config:
         for prompt_item in prompt_config:
             if isinstance(prompt_item, dict):
                 role = prompt_item.get("role", "system")
@@ -42,23 +47,63 @@ def build_messages(
                 if content and isinstance(content, str):
                     messages.append(Message(role=role, content=content))
 
-    # Truncate history if exceeds max-round
-    # Each round = 1 user + 1 assistant message
-    truncated_history = history_messages
-    if len(history_messages) > max_round * 2:
-        truncated_history = history_messages[-(max_round * 2):]
+    truncated_history = _truncate_history_by_round(history_messages, max_round)
 
     messages.extend(truncated_history)
 
-    # Add current user input
-    final_user_text = user_text
-    if rag_context:
-        final_user_text = _build_rag_prompt(rag_context, user_text)
-
-    if final_user_text:
-        messages.append(Message(role="user", content=final_user_text))
+    user_message = build_user_message(
+        user_text=user_text,
+        input_contents=input_contents,
+        rag_context=rag_context,
+    )
+    if user_message is not None:
+        messages.append(user_message)
 
     return messages
+
+
+def build_user_message(
+    user_text: str,
+    input_contents: list[ContentElement] | None = None,
+    rag_context: str | None = None,
+) -> Message | None:
+    """Build the current user message, preserving structured/multimodal input."""
+    final_user_text = _build_rag_prompt(rag_context, user_text) if rag_context else user_text
+
+    if input_contents:
+        contents = [content.model_copy(deep=True) for content in input_contents]
+        if rag_context:
+            for content in contents:
+                if content.type == "text":
+                    content.text = final_user_text
+                    break
+            else:
+                contents.insert(0, ContentElement.from_text(final_user_text))
+        return Message(role="user", content=contents)
+
+    if final_user_text:
+        return Message(role="user", content=final_user_text)
+
+    return None
+
+
+def _truncate_history_by_round(history_messages: list[Message], max_round: int) -> list[Message]:
+    """Truncate history using the same user-round semantics as LangBot host."""
+    if max_round < 1:
+        return history_messages
+
+    temp_messages: list[Message] = []
+    current_round = 0
+
+    for msg in reversed(history_messages):
+        if current_round < max_round:
+            temp_messages.append(msg)
+            if msg.role == "user":
+                current_round += 1
+        else:
+            break
+
+    return list(reversed(temp_messages))
 
 
 def _build_rag_prompt(rag_context: str, user_text: str) -> str:

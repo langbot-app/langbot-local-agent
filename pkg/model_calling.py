@@ -64,7 +64,7 @@ async def invoke_with_fallback(
     model_ids: list[str],
     messages: list[Message],
     tools: list[LLMTool] | None = None,
-) -> Message:
+) -> tuple[Message, str]:
     """Invoke LLM with sequential fallback on failure.
 
     Args:
@@ -74,7 +74,7 @@ async def invoke_with_fallback(
         tools: Optional tools for function calling
 
     Returns:
-        Message from first successful model
+        Tuple of (message from first successful model, committed model ID)
 
     Raises:
         ModelCallError: All models failed
@@ -85,11 +85,12 @@ async def invoke_with_fallback(
     last_error: Exception | None = None
     for model_id in model_ids:
         try:
-            return await api.invoke_llm(
+            response = await api.invoke_llm(
                 llm_model_uuid=model_id,
                 messages=messages,
                 funcs=tools or [],
             )
+            return response, model_id
         except Exception as e:
             last_error = e
             # Log and continue to next model
