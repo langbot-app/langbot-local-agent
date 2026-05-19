@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 
 # Import modules to test
@@ -77,6 +78,7 @@ class FakeAgentRunAPIProxy:
 
 
 def make_context(
+    run_id: str = "test-run-id",
     config: dict[str, Any] | None = None,
     resources: AgentResources | None = None,
     messages: list[Message] | None = None,
@@ -87,7 +89,7 @@ def make_context(
 ) -> AgentRunContext:
     """Create a test AgentRunContext."""
     return AgentRunContext(
-        run_id="test-run-id",
+        run_id=run_id,
         trigger=AgentTrigger(type="message.received"),
         messages=messages or [],
         prompt=prompt or [],
@@ -463,6 +465,59 @@ class TestDefaultAgentRunner:
         # Should have message deltas and run.completed
         assert any(r.type == AgentRunResultType.MESSAGE_DELTA for r in results)
         assert any(r.type == AgentRunResultType.RUN_COMPLETED for r in results)
+
+    @pytest.mark.asyncio
+    async def test_concurrent_runs_do_not_share_per_run_state(self, runner, monkeypatch):
+        """The same runner instance can process multiple runs concurrently."""
+        api_a = FakeAgentRunAPIProxy(models=[ModelResource(model_id="model-a")])
+        api_b = FakeAgentRunAPIProxy(models=[ModelResource(model_id="model-b")])
+
+        async def stream_a(*args, **kwargs):
+            await asyncio.sleep(0.01)
+            yield MessageChunk(role="assistant", content="response-a", is_final=True)
+
+        async def stream_b(*args, **kwargs):
+            yield MessageChunk(role="assistant", content="response-b", is_final=True)
+
+        api_a.invoke_llm_stream = stream_a
+        api_b.invoke_llm_stream = stream_b
+
+        def get_api(ctx):
+            return api_a if ctx.run_id == "run-a" else api_b
+
+        monkeypatch.setattr(runner, "get_run_api", get_api)
+
+        ctx_a = make_context(
+            run_id="run-a",
+            config={"model": "model-a"},
+            resources=AgentResources(models=[ModelResource(model_id="model-a")]),
+            input_text="input a",
+        )
+        ctx_b = make_context(
+            run_id="run-b",
+            config={"model": "model-b"},
+            resources=AgentResources(models=[ModelResource(model_id="model-b")]),
+            input_text="input b",
+        )
+
+        async def collect(ctx):
+            return [result async for result in runner.run(ctx)]
+
+        results_a, results_b = await asyncio.gather(collect(ctx_a), collect(ctx_b))
+
+        chunks_a = [
+            result.data["chunk"]["content"]
+            for result in results_a
+            if result.type == AgentRunResultType.MESSAGE_DELTA
+        ]
+        chunks_b = [
+            result.data["chunk"]["content"]
+            for result in results_b
+            if result.type == AgentRunResultType.MESSAGE_DELTA
+        ]
+
+        assert chunks_a == ["response-a"]
+        assert chunks_b == ["response-b"]
 
     @pytest.mark.asyncio
     async def test_streaming_fallback_before_first_chunk(self, runner, monkeypatch):

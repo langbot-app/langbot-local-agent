@@ -15,6 +15,7 @@ moving the implementation behind the AgentRunner protocol boundary.
 | --- | --- | --- | --- | --- |
 | model | model-fallback-selector | yes | primary: '', fallbacks: [] | LLM model with fallbacks |
 | max-round | integer | yes | 10 | Maximum conversation rounds |
+| timeout | integer | no | 300 | Total runner execution timeout in seconds. Set to `0` or `null` to disable the host deadline. |
 | prompt | prompt-editor | yes | system: "You are a helpful assistant." | System prompt |
 | knowledge-bases | knowledge-base-multi-selector | no | [] | Knowledge bases for RAG |
 | rerank-model | rerank-model-selector | no | '' | Rerank model for improved retrieval |
@@ -45,10 +46,15 @@ migration and is treated as a one-item `knowledge-bases` list.
 - `ctx.input.contents`: structured current input, including text, images, and files.
 - `ctx.resources`: authorized models, tools, knowledge bases, and storage.
 - `ctx.runtime.metadata.streaming_supported`: adapter streaming capability.
+- `ctx.runtime.deadline_at`: absolute host deadline derived from `timeout`.
 
 Model, tool, knowledge-base, and rerank calls go through `AgentRunAPIProxy`, so
 LangBot can enforce run-scoped authorization and restore Query-bound behavior on
 the host side.
+
+The runner is reentrant: per-run mutable state is kept in local variables or
+per-run helper instances. The same plugin process may call one runner instance
+concurrently for multiple sessions.
 
 ## Capabilities
 
@@ -57,6 +63,10 @@ the host side.
 - `knowledge_retrieval`: yes
 - `multimodal_input`: yes
 - `stateful_session`: yes
+
+`stateful_session` means LangBot supplies conversation history and run state in
+the context. This runner does not keep cross-run mutable state on the runner
+instance.
 
 ## Legacy Runner
 

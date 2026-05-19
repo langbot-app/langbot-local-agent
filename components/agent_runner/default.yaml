@@ -27,6 +27,13 @@ spec:
       type: integer
       required: true
       default: 10
+    - name: timeout
+      label:
+        en_US: Timeout
+        zh_Hans: 执行超时
+      type: integer
+      required: false
+      default: 300
     - name: prompt
       label:
         en_US: Prompt
