@@ -1,9 +1,34 @@
 # Local Agent Runner
 
-Official LangBot AgentRunner plugin for the former built-in `local-agent` runner.
+Official LangBot AgentRunner plugin for the local, LangBot-hosted agent path.
 
-The migration goal is external behavior parity with the built-in runner, while
-moving the implementation behind the AgentRunner protocol boundary.
+This runner is a consumer of LangBot AgentRunner Protocol v1. LangBot provides
+the host infrastructure, authorization, facts, and pull APIs; the runner owns
+the model-facing agent behavior such as prompt assembly, history selection,
+tool loop, RAG orchestration, and optional context compaction.
+
+## Scope
+
+This repository does not define the LangBot host protocol. It consumes the
+Protocol v1 run context produced by LangBot:
+
+- `ctx.event`: event-first metadata for the current trigger.
+- `ctx.input`: current structured input, including text, multimodal contents,
+  and artifact/file references.
+- `ctx.context`: context handles such as history cursor, inline policy, and
+  available pull APIs.
+- `ctx.resources`: run-scoped authorized models, tools, knowledge bases, files,
+  and storage capabilities.
+- `ctx.runtime`: runtime metadata such as deadline, trace id, query id from
+  Pipeline adapter paths, and adapter capabilities.
+- `ctx.delivery`: host delivery surface and streaming/edit capabilities.
+- `ctx.bootstrap`: optional host bootstrap payload (e.g., recent messages from Pipeline adapter).
+- `ctx.adapter`: Pipeline adapter fields; not part of Protocol v1 core.
+
+LangBot does not inline full conversation history by default. When the runner
+needs more context, it should use authorized Host APIs through
+`AgentRunAPIProxy`, for example history, event, artifact, state, model, tool,
+knowledge-base, and storage APIs.
 
 ## Runner ID
 
@@ -14,47 +39,64 @@ moving the implementation behind the AgentRunner protocol boundary.
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | model | model-fallback-selector | yes | primary: '', fallbacks: [] | LLM model with fallbacks |
-| max-round | integer | yes | 10 | Maximum conversation rounds |
+| max-round | integer | yes | 10 | Pipeline adapter history/bootstrap policy input. Not a Protocol v1 field. |
 | timeout | integer | no | 300 | Total runner execution timeout in seconds. Set to `0` or `null` to disable the host deadline. |
-| prompt | prompt-editor | yes | system: "You are a helpful assistant." | System prompt |
+| prompt | prompt-editor | yes | system: "You are a helpful assistant." | Default system prompt edited in LangBot UI |
 | knowledge-bases | knowledge-base-multi-selector | no | [] | Knowledge bases for RAG |
 | rerank-model | rerank-model-selector | no | '' | Rerank model for improved retrieval |
 | rerank-top-k | integer | no | 5 | Top-K results after reranking |
 
-`prompt` remains in the static runner config for defaults and UI editing. During
-execution the runner prefers `ctx.prompt`, which is the effective prompt prepared
-by LangBot after pipeline preprocessing and `PromptPreProcessing` events. This
-matches the old built-in behavior where model calls used:
+`prompt` remains a static runner configuration field for defaults and UI
+editing. If LangBot provides an effective prompt through the Pipeline adapter,
+it appears under `ctx.adapter.extra.prompt`; it is not a Protocol v1
+top-level field.
 
-```text
-query.prompt.messages + query.messages + query.user_message
-```
+`max-round` is a Pipeline adapter configuration that may influence `ctx.bootstrap.messages`
+or the runner's own history policy before the event branch lands. It is not a Protocol v1
+host context-management primitive.
 
-The plugin runner consumes the equivalent AgentRunner context:
+The singular `knowledge-base` config key is accepted as a convenience alias
+and is treated as a one-item `knowledge-bases` list.
 
-```text
-ctx.prompt + ctx.messages + current user message from ctx.input
-```
+## Context Management
 
-The legacy singular `knowledge-base` config key is still accepted during
-migration and is treated as a one-item `knowledge-bases` list.
+The local agent should be treated as a self-managed or hybrid-context runner:
 
-## Host Context Consumed
+- LangBot inlines the current event/input and context handles.
+- LangBot may provide a small adapter bootstrap, but not full history by
+  default.
+- The runner decides whether to pull transcript history, search history, read
+  artifacts, load state, summarize, compact, or construct a model request from
+  scratch.
+- Large files, images, audio, and tool outputs should be consumed as artifact
+  references instead of large inline payloads.
 
-- `ctx.prompt`: effective host-preprocessed prompt.
-- `ctx.messages`: conversation history supplied by LangBot.
-- `ctx.input.contents`: structured current input, including text, images, and files.
-- `ctx.resources`: authorized models, tools, knowledge bases, and storage.
-- `ctx.runtime.metadata.streaming_supported`: adapter streaming capability.
-- `ctx.runtime.deadline_at`: absolute host deadline derived from `timeout`.
+Prompt and business parameters from Pipeline adapter are adapter data:
 
-Model, tool, knowledge-base, and rerank calls go through `AgentRunAPIProxy`, so
-LangBot can enforce run-scoped authorization and restore Query-bound behavior on
-the host side.
+- `ctx.adapter.extra.prompt`
+- `ctx.adapter.extra.params`
+- `ctx.bootstrap.messages`
 
-The runner is reentrant: per-run mutable state is kept in local variables or
-per-run helper instances. The same plugin process may call one runner instance
-concurrently for multiple sessions.
+New runner logic should prefer event-first context and Host APIs over long-term
+dependencies on these adapter fields.
+
+## Host APIs Consumed
+
+Model, tool, knowledge-base, artifact, history, event, state, and storage access
+go through `AgentRunAPIProxy`. LangBot validates these calls with the current
+`run_id`, runner permissions, resource policy, and caller plugin identity.
+
+Typical local-agent usage:
+
+- Invoke authorized LangBot-hosted models.
+- Call authorized tools.
+- Retrieve authorized knowledge bases and rerank results.
+- Page or search transcript history when the runner decides it is needed.
+- Read artifact metadata/content for files, images, or large tool results.
+- Save optional summary/checkpoint/session state through Host state or storage.
+
+The runner must not bypass `ctx.resources` or call host-private managers to
+access unauthorized models, tools, knowledge bases, files, or storage.
 
 ## Capabilities
 
@@ -62,25 +104,33 @@ concurrently for multiple sessions.
 - `tool_calling`: yes
 - `knowledge_retrieval`: yes
 - `multimodal_input`: yes
+- `event_context`: yes
 - `stateful_session`: yes
 
-`stateful_session` means LangBot supplies conversation history and run state in
-the context. This runner does not keep cross-run mutable state on the runner
-instance.
+`stateful_session` means the runner can participate in cross-run state through
+Host-owned state/storage or through runner-owned external state. It does not
+mean the plugin instance should keep mutable per-conversation state in memory.
+The plugin process is shared and must remain reentrant.
 
-## Legacy Runner
+## Event System Boundary
 
-Migrated from `local-agent` in LangBot. The old `RequestRunner` implementation
-may remain in LangBot during migration as the parity reference; it is not the
-long-term runtime path.
+This plugin does not implement LangBot EventGateway, event subscription, event
+notification, scheduler, or event fanout. Those systems belong to LangBot host
+or separate event-focused branches. This runner only consumes the run context
+that LangBot delivers through AgentRunner Protocol v1.
+
+## Current Boundary
+
+This plugin is the target external implementation of LangBot's local agent
+runner. LangBot's internal runner code can be used as reference material, but
+its host-private structures must not become plugin API.
 
 ## Contributing
 
-We welcome contributions! Feel free to:
+We welcome contributions. Useful areas include:
 
-- Submit issues for bugs or feature requests
-- Fork the repo and submit pull requests
-- Improve documentation or add examples
-- Share your ideas and feedback
-
-Star the repo if you find it useful!
+- Protocol v1 adapter fixes
+- history/artifact/state API consumption
+- tool loop and RAG behavior
+- multimodal input handling
+- focused tests and documentation improvements
