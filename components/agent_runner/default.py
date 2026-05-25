@@ -123,7 +123,7 @@ class DefaultAgentRunner(AgentRunner):
         """Get runner permissions for resource access."""
         return AgentRunnerPermissions(
             models=["invoke", "stream"],
-            tools=["list", "detail", "call"],
+            tools=["detail", "call"],
             knowledge_bases=["list", "retrieve"],
         )
 

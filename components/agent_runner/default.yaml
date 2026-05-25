@@ -74,8 +74,8 @@ spec:
     interrupt: false
     stateful_session: true
   permissions:
-    models: ["list", "invoke", "stream"]
-    tools: ["list", "detail", "call"]
+    models: ["invoke", "stream"]
+    tools: ["detail", "call"]
     knowledge_bases: ["list", "retrieve"]
     storage: ["plugin"]
     files: ["config", "knowledge"]
