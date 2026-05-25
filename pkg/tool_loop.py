@@ -92,6 +92,7 @@ class ToolCallLoop:
 
 
 async def run_tool_call_loop_streaming(
+    run_id: str,
     api: AgentRunAPIProxy,
     allowed_tools: set[str],
     initial_messages: list[Message],
@@ -159,6 +160,7 @@ async def run_tool_call_loop_streaming(
 
             # Yield tool.call.started
             yield None, AgentRunResult.tool_call_started(
+                run_id,
                 tool_call_id=tool_call_id,
                 tool_name=tool_name,
                 parameters=parameters,
@@ -169,6 +171,7 @@ async def run_tool_call_loop_streaming(
 
             # Yield tool.call.completed
             yield None, AgentRunResult.tool_call_completed(
+                run_id,
                 tool_call_id=tool_call_id,
                 tool_name=tool_name,
                 result=result,
@@ -209,6 +212,7 @@ async def run_tool_call_loop_streaming(
         except ModelCallError as e:
             # Tool loop failed - return error
             yield None, AgentRunResult.run_failed(
+                run_id,
                 error=str(e),
                 code="runner.tool_loop_error",
                 retryable=e.retryable,
@@ -218,6 +222,7 @@ async def run_tool_call_loop_streaming(
     # Check if we hit iteration limit
     if pending_tool_calls and not tool_loop.check_iteration_limit():
         yield None, AgentRunResult.run_failed(
+            run_id,
             error=f"Tool call iteration limit reached ({max_iterations})",
             code="runner.tool_loop_limit",
             retryable=False,

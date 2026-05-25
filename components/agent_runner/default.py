@@ -60,6 +60,41 @@ def _build_assistant_tool_call_message(
     )
 
 
+def _coerce_messages(value: Any) -> list[Message]:
+    """Coerce adapter/bootstrap message payloads into SDK Message objects."""
+    if not value:
+        return []
+
+    messages: list[Message] = []
+    for item in value:
+        if isinstance(item, Message):
+            messages.append(item.model_copy(deep=True))
+        elif isinstance(item, dict):
+            messages.append(Message.model_validate(item))
+    return messages
+
+
+def _get_adapter_extra(ctx: AgentRunContext) -> dict[str, Any]:
+    """Return adapter.extra for Pipeline adapter data."""
+    if ctx.adapter is None:
+        return {}
+    return ctx.adapter.extra or {}
+
+
+def _get_prompt_messages(ctx: AgentRunContext) -> list[Message]:
+    """Read effective prompt messages from adapter.extra.prompt."""
+    return _coerce_messages(_get_adapter_extra(ctx).get("prompt"))
+
+
+def _get_bootstrap_messages(ctx: AgentRunContext) -> list[Message]:
+    """Read bootstrap history from ctx.bootstrap, falling back to adapter messages."""
+    if ctx.bootstrap and ctx.bootstrap.messages:
+        return [msg.model_copy(deep=True) for msg in ctx.bootstrap.messages]
+    if ctx.adapter and ctx.adapter.adapter_messages:
+        return [msg.model_copy(deep=True) for msg in ctx.adapter.adapter_messages]
+    return []
+
+
 class DefaultAgentRunner(AgentRunner):
     """Default AgentRunner for Local Agent.
 
@@ -116,6 +151,7 @@ class DefaultAgentRunner(AgentRunner):
 
         if not model_ids:
             yield AgentRunResult.run_failed(
+                ctx.run_id,
                 error="No authorized model for local-agent",
                 code="runner.no_model",
             )
@@ -150,8 +186,8 @@ class DefaultAgentRunner(AgentRunner):
         prompt_config = ctx.config.get("prompt", [])
         messages = build_messages(
             prompt_config=prompt_config,
-            prompt_messages=ctx.prompt,
-            history_messages=ctx.messages,
+            prompt_messages=_get_prompt_messages(ctx),
+            history_messages=_get_bootstrap_messages(ctx),
             user_text=user_text,
             input_contents=ctx.input.contents,
             max_round=max_round,
@@ -169,6 +205,7 @@ class DefaultAgentRunner(AgentRunner):
 
         if use_streaming:
             async for result in self._run_streaming(
+                run_id=ctx.run_id,
                 api=api,
                 model_ids=model_ids,
                 messages=messages,
@@ -177,6 +214,7 @@ class DefaultAgentRunner(AgentRunner):
                 yield result
         else:
             async for result in self._run_non_streaming(
+                run_id=ctx.run_id,
                 api=api,
                 model_ids=model_ids,
                 messages=messages,
@@ -186,6 +224,7 @@ class DefaultAgentRunner(AgentRunner):
 
     async def _run_streaming(
         self,
+        run_id: str,
         api: Any,
         model_ids: list[str],
         messages: list[Message],
@@ -206,7 +245,7 @@ class DefaultAgentRunner(AgentRunner):
             # Stream LLM response
             async for chunk, is_delta in caller.stream():
                 if chunk.content:  # Only yield non-empty chunks
-                    yield AgentRunResult.message_delta(chunk)
+                    yield AgentRunResult.message_delta(run_id, chunk)
 
             # Check for tool calls after streaming
             tool_calls = caller.get_tool_calls()
@@ -216,6 +255,7 @@ class DefaultAgentRunner(AgentRunner):
                 committed_model_id = caller.get_committed_model_id()
                 if not committed_model_id:
                     yield AgentRunResult.run_failed(
+                        run_id,
                         error="No model committed for tool loop",
                         code="runner.no_model",
                     )
@@ -257,6 +297,7 @@ class DefaultAgentRunner(AgentRunner):
 
                         # Yield tool.call.started
                         yield AgentRunResult.tool_call_started(
+                            run_id,
                             tool_call_id=tool_call_id,
                             tool_name=tool_name,
                             parameters=parameters,
@@ -267,6 +308,7 @@ class DefaultAgentRunner(AgentRunner):
 
                         # Yield tool.call.completed
                         yield AgentRunResult.tool_call_completed(
+                            run_id,
                             tool_call_id=tool_call_id,
                             tool_name=tool_name,
                             result=result,
@@ -293,7 +335,7 @@ class DefaultAgentRunner(AgentRunner):
                                 chunk = chunk.model_copy(deep=True)
                                 if isinstance(chunk.content, str):
                                     chunk.content = visible_content_prefix + chunk.content
-                                yield AgentRunResult.message_delta(chunk)
+                                yield AgentRunResult.message_delta(run_id, chunk)
 
                         # Check for more tool calls
                         pending_tool_calls = tool_caller.get_tool_calls()
@@ -309,6 +351,7 @@ class DefaultAgentRunner(AgentRunner):
 
                     except ModelCallError as e:
                         yield AgentRunResult.run_failed(
+                            run_id,
                             error=str(e),
                             code="runner.tool_loop_error",
                             retryable=e.retryable,
@@ -318,28 +361,32 @@ class DefaultAgentRunner(AgentRunner):
                 # Check if we hit iteration limit
                 if pending_tool_calls and not tool_loop.check_iteration_limit():
                     yield AgentRunResult.run_failed(
+                        run_id,
                         error=f"Tool call iteration limit reached ({DEFAULT_MAX_TOOL_ITERATIONS})",
                         code="runner.tool_loop_limit",
                     )
                     return
 
             # Successful completion
-            yield AgentRunResult.run_completed(finish_reason="stop")
+            yield AgentRunResult.run_completed(run_id, finish_reason="stop")
 
         except ModelCallError as e:
             yield AgentRunResult.run_failed(
+                run_id,
                 error=str(e),
                 code="runner.llm_error",
                 retryable=e.retryable,
             )
         except Exception as e:
             yield AgentRunResult.run_failed(
+                run_id,
                 error=str(e),
                 code="runner.error",
             )
 
     async def _run_non_streaming(
         self,
+        run_id: str,
         api: Any,
         model_ids: list[str],
         messages: list[Message],
@@ -396,6 +443,7 @@ class DefaultAgentRunner(AgentRunner):
                             parameters = {}
 
                         yield AgentRunResult.tool_call_started(
+                            run_id,
                             tool_call_id=tool_call_id,
                             tool_name=tool_name,
                             parameters=parameters,
@@ -404,6 +452,7 @@ class DefaultAgentRunner(AgentRunner):
                         result, error = await tool_loop.execute_tool_call(tool_call)
 
                         yield AgentRunResult.tool_call_completed(
+                            run_id,
                             tool_call_id=tool_call_id,
                             tool_name=tool_name,
                             result=result,
@@ -441,6 +490,7 @@ class DefaultAgentRunner(AgentRunner):
 
                     except Exception as e:
                         yield AgentRunResult.run_failed(
+                            run_id,
                             error=f"LLM call in tool loop failed: {e}",
                             code="runner.tool_loop_error",
                             retryable=True,
@@ -449,27 +499,30 @@ class DefaultAgentRunner(AgentRunner):
 
                 if pending_tool_calls and not tool_loop.check_iteration_limit():
                     yield AgentRunResult.run_failed(
+                        run_id,
                         error=f"Tool call iteration limit reached ({DEFAULT_MAX_TOOL_ITERATIONS})",
                         code="runner.tool_loop_limit",
                     )
                     return
 
                 # Yield final message
-                yield AgentRunResult.message_completed(response)
+                yield AgentRunResult.message_completed(run_id, response)
             else:
                 # No tool calls - yield completed message
-                yield AgentRunResult.message_completed(response)
+                yield AgentRunResult.message_completed(run_id, response)
 
-            yield AgentRunResult.run_completed(finish_reason="stop")
+            yield AgentRunResult.run_completed(run_id, finish_reason="stop")
 
         except ModelCallError as e:
             yield AgentRunResult.run_failed(
+                run_id,
                 error=str(e),
                 code="runner.llm_error",
                 retryable=e.retryable,
             )
         except Exception as e:
             yield AgentRunResult.run_failed(
+                run_id,
                 error=str(e),
                 code="runner.error",
             )

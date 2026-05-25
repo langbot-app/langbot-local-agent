@@ -11,7 +11,10 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from langbot_plugin.api.entities.builtin.agent_runner.context import AgentRunContext
+from langbot_plugin.api.entities.builtin.agent_runner.bootstrap import BootstrapContext
+from langbot_plugin.api.entities.builtin.agent_runner.context import AgentRunContext, AdapterContext
+from langbot_plugin.api.entities.builtin.agent_runner.delivery import DeliveryContext
+from langbot_plugin.api.entities.builtin.agent_runner.event import AgentEventContext
 from langbot_plugin.api.entities.builtin.agent_runner.input import AgentInput
 from langbot_plugin.api.entities.builtin.agent_runner.resources import (
     AgentResources,
@@ -91,12 +94,21 @@ def make_context(
     return AgentRunContext(
         run_id=run_id,
         trigger=AgentTrigger(type="message.received"),
-        messages=messages or [],
-        prompt=prompt or [],
+        event=AgentEventContext(
+            event_id=f"evt-{run_id}",
+            event_type="message.received",
+            source="pipeline_adapter",
+        ),
         input=AgentInput(text=input_text, contents=input_contents or []),
+        delivery=DeliveryContext(
+            surface="pipeline",
+            supports_streaming=(runtime_metadata or {}).get("streaming_supported", True),
+        ),
         resources=resources or AgentResources(),
         runtime=AgentRuntimeContext(query_id=1, metadata=runtime_metadata or {}),
         config=config or {},
+        bootstrap=BootstrapContext(messages=messages or []),
+        adapter=AdapterContext(extra={"prompt": prompt or []}),
     )
 
 
