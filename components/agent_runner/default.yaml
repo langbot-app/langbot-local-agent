@@ -69,7 +69,7 @@ spec:
     tool_calling: true
     knowledge_retrieval: true
     multimodal_input: true
-    event_context: false
+    event_context: true
     platform_api: false
     interrupt: false
     stateful_session: true

@@ -127,6 +127,12 @@ class StreamingModelCaller:
         self._msg_idx = 0
         self._msg_sequence = 0
 
+    async def _next_non_empty_chunk(self, stream: typing.AsyncIterator[MessageChunk | None]) -> MessageChunk:
+        while True:
+            chunk = await stream.__anext__()
+            if chunk is not None:
+                return chunk
+
     async def stream(
         self,
     ) -> typing.AsyncGenerator[tuple[MessageChunk, bool], None]:
@@ -155,7 +161,7 @@ class StreamingModelCaller:
                     messages=self.messages,
                     funcs=self.tools,
                 )
-                first_chunk = await stream.__anext__()
+                first_chunk = await self._next_non_empty_chunk(stream)
                 # First chunk received - model is now committed
                 self._committed_model_id = model_id
 
@@ -185,6 +191,8 @@ class StreamingModelCaller:
         # Any failure here is terminal for the run
         try:
             async for raw_chunk in stream:
+                if raw_chunk is None:
+                    continue
                 chunk, is_final = self._process_chunk(raw_chunk)
                 yield chunk, not is_final
         except Exception as e:

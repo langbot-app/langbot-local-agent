@@ -7,12 +7,14 @@ import os
 
 # Import modules to test
 import sys
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import yaml
 from langbot_plugin.api.entities.builtin.agent_runner.bootstrap import BootstrapContext
-from langbot_plugin.api.entities.builtin.agent_runner.context import AgentRunContext, AdapterContext
+from langbot_plugin.api.entities.builtin.agent_runner.context import AdapterContext, AgentRunContext
 from langbot_plugin.api.entities.builtin.agent_runner.delivery import DeliveryContext
 from langbot_plugin.api.entities.builtin.agent_runner.event import AgentEventContext
 from langbot_plugin.api.entities.builtin.agent_runner.input import AgentInput
@@ -421,6 +423,12 @@ class TestFormatRagResults:
 class TestDefaultAgentRunner:
     """Tests for DefaultAgentRunner behavior."""
 
+    def test_manifest_declares_event_context_capability(self):
+        """The local runner consumes Protocol v1 event-first context from Host."""
+        manifest = yaml.safe_load((Path(__file__).resolve().parents[1] / "components/agent_runner/default.yaml").read_text())
+
+        assert manifest["spec"]["capabilities"]["event_context"] is True
+
     @pytest.fixture
     def runner(self):
         """Create a runner instance."""
@@ -476,6 +484,39 @@ class TestDefaultAgentRunner:
 
         # Should have message deltas and run.completed
         assert any(r.type == AgentRunResultType.MESSAGE_DELTA for r in results)
+        assert any(r.type == AgentRunResultType.RUN_COMPLETED for r in results)
+
+    @pytest.mark.asyncio
+    async def test_streaming_skips_none_chunks(self, runner, monkeypatch):
+        """Provider heartbeat/no-op chunks do not fail a committed stream."""
+        fake_api = FakeAgentRunAPIProxy(
+            models=[ModelResource(model_id="model-1")],
+        )
+
+        async def mock_stream(*args, **kwargs):
+            yield None
+            yield MessageChunk(role="assistant", content="Hello", is_final=False)
+            yield None
+            yield MessageChunk(role="assistant", content=" world", is_final=True)
+
+        fake_api.invoke_llm_stream = mock_stream
+        monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
+
+        ctx = make_context(
+            config={"model": "model-1"},
+            resources=AgentResources(models=[ModelResource(model_id="model-1")]),
+        )
+
+        results = []
+        async for result in runner.run(ctx):
+            results.append(result)
+
+        deltas = [
+            result.data["chunk"]["content"]
+            for result in results
+            if result.type == AgentRunResultType.MESSAGE_DELTA
+        ]
+        assert deltas == ["Hello world"]
         assert any(r.type == AgentRunResultType.RUN_COMPLETED for r in results)
 
     @pytest.mark.asyncio
