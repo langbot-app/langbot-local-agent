@@ -20,13 +20,6 @@ spec:
       default:
         primary: ''
         fallbacks: []
-    - name: max-round
-      label:
-        en_US: Max Round
-        zh_Hans: 最大回合数
-      type: integer
-      required: true
-      default: 10
     - name: timeout
       label:
         en_US: Timeout
@@ -77,6 +70,7 @@ spec:
     models: ["invoke", "stream"]
     tools: ["detail", "call"]
     knowledge_bases: ["list", "retrieve"]
+    history: ["page", "search"]
     storage: ["plugin"]
     files: ["config", "knowledge"]
     platform_api: []

@@ -15,14 +15,14 @@ Protocol v1 run context produced by LangBot:
 - `ctx.event`: event-first metadata for the current trigger.
 - `ctx.input`: current structured input, including text, multimodal contents,
   and artifact/file references.
-- `ctx.context`: context handles such as history cursor, inline policy, and
-  available pull APIs.
+- `ctx.context`: context handles, inline policy, and available pull APIs. Local
+  Agent uses the Host history API for conversation history instead of adapter
+  bootstrap.
 - `ctx.resources`: run-scoped authorized models, tools, knowledge bases, files,
   and storage capabilities.
 - `ctx.runtime`: runtime metadata such as deadline, trace id, query id from
   Pipeline adapter paths, and adapter capabilities.
 - `ctx.delivery`: host delivery surface and streaming/edit capabilities.
-- `ctx.bootstrap`: optional host bootstrap payload (e.g., recent messages from Pipeline adapter).
 - `ctx.adapter`: Pipeline adapter fields; not part of Protocol v1 core.
 
 LangBot does not inline full conversation history by default. When the runner
@@ -39,21 +39,14 @@ knowledge-base, and storage APIs.
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | model | model-fallback-selector | yes | primary: '', fallbacks: [] | LLM model with fallbacks |
-| max-round | integer | yes | 10 | Pipeline adapter history/bootstrap policy input. Not a Protocol v1 field. |
 | timeout | integer | no | 300 | Total runner execution timeout in seconds. Set to `0` or `null` to disable the host deadline. |
 | prompt | prompt-editor | yes | system: "You are a helpful assistant." | Default system prompt edited in LangBot UI |
 | knowledge-bases | knowledge-base-multi-selector | no | [] | Knowledge bases for RAG |
 | rerank-model | rerank-model-selector | no | '' | Rerank model for improved retrieval |
 | rerank-top-k | integer | no | 5 | Top-K results after reranking |
 
-`prompt` remains a static runner configuration field for defaults and UI
-editing. If LangBot provides an effective prompt through the Pipeline adapter,
-it appears under `ctx.adapter.extra.prompt`; it is not a Protocol v1
-top-level field.
-
-`max-round` is a Pipeline adapter configuration that may influence `ctx.bootstrap.messages`
-or the runner's own history policy before the event branch lands. It is not a Protocol v1
-host context-management primitive.
+`prompt` is a static binding configuration field for defaults and UI editing.
+Local Agent does not read Pipeline adapter prompt overrides.
 
 The singular `knowledge-base` config key is accepted as a convenience alias
 and is treated as a one-item `knowledge-bases` list.
@@ -63,22 +56,16 @@ and is treated as a one-item `knowledge-bases` list.
 The local agent should be treated as a self-managed or hybrid-context runner:
 
 - LangBot inlines the current event/input and context handles.
-- LangBot may provide a small adapter bootstrap, but not full history by
-  default.
-- The runner decides whether to pull transcript history, search history, read
+- The runner pulls transcript history through the authorized Host history API.
+- The runner decides whether to search history, read
   artifacts, load state, summarize, compact, or construct a model request from
   scratch.
 - Large files, images, audio, and tool outputs should be consumed as artifact
   references instead of large inline payloads.
 
-Prompt and business parameters from Pipeline adapter are adapter data:
-
-- `ctx.adapter.extra.prompt`
-- `ctx.adapter.extra.params`
-- `ctx.bootstrap.messages`
-
-New runner logic should prefer event-first context and Host APIs over long-term
-dependencies on these adapter fields.
+Pipeline adapter data is not part of the Local Agent behavior contract. New
+runner logic should prefer event-first context and Host APIs over adapter
+fields.
 
 ## Host APIs Consumed
 
@@ -91,7 +78,8 @@ Typical local-agent usage:
 - Invoke authorized LangBot-hosted models.
 - Call authorized tools.
 - Retrieve authorized knowledge bases and rerank results.
-- Page or search transcript history when the runner decides it is needed.
+- Page transcript history for the model request and search history when the
+  runner decides it is needed.
 - Read artifact metadata/content for files, images, or large tool results.
 - Save optional summary/checkpoint/session state through Host state or storage.
 

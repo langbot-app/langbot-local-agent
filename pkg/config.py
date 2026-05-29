@@ -70,14 +70,6 @@ def _normalize_model_id(model_id: typing.Any) -> str | None:
     return model_id
 
 
-def get_max_round(config: dict[str, typing.Any], default: int = 10) -> int:
-    """Get max-round configuration with validation."""
-    max_round = config.get("max-round", default)
-    if not isinstance(max_round, int) or max_round < 1:
-        return default
-    return max_round
-
-
 def get_knowledge_base_ids(
     config: dict[str, typing.Any],
     allowed_kb_ids: set[str],

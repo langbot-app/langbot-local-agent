@@ -13,8 +13,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import yaml
-from langbot_plugin.api.entities.builtin.agent_runner.bootstrap import BootstrapContext
 from langbot_plugin.api.entities.builtin.agent_runner.context import AdapterContext, AgentRunContext
+from langbot_plugin.api.entities.builtin.agent_runner.context_access import (
+    ContextAccess,
+    ContextAPICapabilities,
+)
 from langbot_plugin.api.entities.builtin.agent_runner.delivery import DeliveryContext
 from langbot_plugin.api.entities.builtin.agent_runner.event import AgentEventContext
 from langbot_plugin.api.entities.builtin.agent_runner.input import AgentInput
@@ -39,7 +42,7 @@ from langbot_plugin.api.entities.builtin.provider.message import (
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pkg.config import get_knowledge_base_ids, get_max_round, get_rerank_config, parse_model_config
+from pkg.config import get_knowledge_base_ids, get_rerank_config, parse_model_config
 from pkg.messages import build_messages, format_rag_results
 
 # ==================== Fixtures ====================
@@ -71,6 +74,14 @@ class FakeAgentRunAPIProxy:
         self.call_tool = AsyncMock()
         self.retrieve_knowledge = AsyncMock()
         self.invoke_rerank = AsyncMock()
+        self.history_page = AsyncMock(
+            return_value={
+                "items": [],
+                "next_cursor": None,
+                "prev_cursor": None,
+                "has_more": False,
+            }
+        )
 
     def get_allowed_models(self) -> list[ModelResource]:
         return self._models
@@ -86,11 +97,11 @@ def make_context(
     run_id: str = "test-run-id",
     config: dict[str, Any] | None = None,
     resources: AgentResources | None = None,
-    messages: list[Message] | None = None,
     input_text: str = "test input",
     input_contents: list[ContentElement] | None = None,
-    prompt: list[Message] | None = None,
     runtime_metadata: dict[str, Any] | None = None,
+    history_available: bool = False,
+    conversation_id: str = "conv-test",
 ) -> AgentRunContext:
     """Create a test AgentRunContext."""
     return AgentRunContext(
@@ -107,10 +118,16 @@ def make_context(
             supports_streaming=(runtime_metadata or {}).get("streaming_supported", True),
         ),
         resources=resources or AgentResources(),
+        context=ContextAccess(
+            conversation_id=conversation_id,
+            available_apis=ContextAPICapabilities(
+                history_page=history_available,
+                history_search=history_available,
+            ),
+        ),
         runtime=AgentRuntimeContext(query_id=1, metadata=runtime_metadata or {}),
         config=config or {},
-        bootstrap=BootstrapContext(messages=messages or []),
-        adapter=AdapterContext(extra={"prompt": prompt or []}),
+        adapter=AdapterContext(),
     )
 
 
@@ -189,24 +206,6 @@ class TestParseModelConfig:
         """Invalid format returns empty list."""
         result = parse_model_config(123, {"model-1"})
         assert result == []
-
-
-class TestGetMaxRound:
-    """Tests for max-round configuration."""
-
-    def test_default_value(self):
-        """Default max-round is 10."""
-        assert get_max_round({}) == 10
-
-    def test_custom_value(self):
-        """Custom max-round is returned."""
-        assert get_max_round({"max-round": 20}) == 20
-
-    def test_invalid_value(self):
-        """Invalid max-round returns default."""
-        assert get_max_round({"max-round": -1}) == 10
-        assert get_max_round({"max-round": 0}) == 10
-        assert get_max_round({"max-round": "invalid"}) == 10
 
 
 class TestGetKnowledgeBaseIds:
@@ -290,7 +289,6 @@ class TestBuildMessages:
             prompt_config=prompt,
             history_messages=history,
             user_text="How are you?",
-            max_round=10,
         )
 
         assert len(messages) == 4
@@ -299,9 +297,8 @@ class TestBuildMessages:
         assert messages[-1].role == "user"
         assert messages[-1].content == "How are you?"
 
-    def test_history_truncation(self):
-        """History is truncated to max_round * 2."""
-        # Create 30 messages (15 rounds)
+    def test_history_is_preserved_as_provided(self):
+        """History selection is owned by Host APIs and runner policy."""
         history = []
         for i in range(15):
             history.append(Message(role="user", content=f"User {i}"))
@@ -311,13 +308,12 @@ class TestBuildMessages:
             prompt_config=[],
             history_messages=history,
             user_text="New message",
-            max_round=5,  # Should keep only 10 history messages
         )
 
-        # 10 history + 1 user = 11
-        assert len(messages) == 11
-        # Should keep last 5 rounds (messages 10-19 from history)
-        assert "User 10" in messages[0].content
+        assert len(messages) == 31
+        assert messages[0].content == "User 0"
+        assert messages[-2].content == "Assistant 14"
+        assert messages[-1].content == "New message"
 
     def test_rag_context(self):
         """RAG context is prepended to user message."""
@@ -325,7 +321,6 @@ class TestBuildMessages:
             prompt_config=[],
             history_messages=[],
             user_text="What is X?",
-            max_round=10,
             rag_context="[1] X is a variable.",
         )
 
@@ -335,17 +330,15 @@ class TestBuildMessages:
         assert "<user_message>" in messages[0].content
         assert "What is X?" in messages[0].content
 
-    def test_effective_prompt_messages_override_static_config(self):
-        """Host-provided effective prompt is preferred over static config."""
+    def test_static_prompt_config_is_used(self):
+        """Static binding prompt config is used for system prompt."""
         messages = build_messages(
             prompt_config=[{"role": "system", "content": "Static prompt"}],
-            prompt_messages=[Message(role="system", content="Effective prompt")],
             history_messages=[],
             user_text="Hello",
-            max_round=10,
         )
 
-        assert messages[0].content == "Effective prompt"
+        assert messages[0].content == "Static prompt"
 
     def test_multimodal_input_contents_are_preserved(self):
         """Structured input contents are preserved in the current user message."""
@@ -359,7 +352,6 @@ class TestBuildMessages:
             history_messages=[],
             user_text="Look at this",
             input_contents=contents,
-            max_round=10,
         )
 
         assert isinstance(messages[0].content, list)
@@ -379,7 +371,6 @@ class TestBuildMessages:
             user_text="What is in this image?",
             input_contents=contents,
             rag_context="[1] Image metadata",
-            max_round=10,
         )
 
         assert isinstance(messages[0].content, list)
@@ -428,6 +419,7 @@ class TestDefaultAgentRunner:
         manifest = yaml.safe_load((Path(__file__).resolve().parents[1] / "components/agent_runner/default.yaml").read_text())
 
         assert manifest["spec"]["capabilities"]["event_context"] is True
+        assert manifest["spec"]["permissions"]["history"] == ["page", "search"]
 
     @pytest.fixture
     def runner(self):
@@ -485,6 +477,72 @@ class TestDefaultAgentRunner:
         # Should have message deltas and run.completed
         assert any(r.type == AgentRunResultType.MESSAGE_DELTA for r in results)
         assert any(r.type == AgentRunResultType.RUN_COMPLETED for r in results)
+        fake_api.history_page.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_history_is_pulled_from_host_api(self, runner, monkeypatch):
+        """Conversation history comes from Host history API, not adapter bootstrap."""
+        fake_api = FakeAgentRunAPIProxy(
+            models=[ModelResource(model_id="model-1")],
+        )
+        fake_api.history_page = AsyncMock(
+            return_value={
+                "items": [
+                    {
+                        "event_id": "evt-run-history",
+                        "role": "user",
+                        "content": "current input",
+                    },
+                    {
+                        "event_id": "evt-old-assistant",
+                        "content_json": {"role": "assistant", "content": "previous answer"},
+                    },
+                    {
+                        "event_id": "evt-old-user",
+                        "role": "user",
+                        "content": "previous question",
+                    },
+                ],
+                "next_cursor": None,
+                "prev_cursor": None,
+                "has_more": False,
+            }
+        )
+        captured_messages: list[Message] = []
+
+        async def mock_stream(*args, **kwargs):
+            captured_messages.extend(kwargs["messages"])
+            yield MessageChunk(role="assistant", content="Response", is_final=True)
+
+        fake_api.invoke_llm_stream = mock_stream
+        monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
+
+        ctx = make_context(
+            run_id="run-history",
+            config={
+                "model": "model-1",
+                "prompt": [{"role": "system", "content": "Static prompt"}],
+            },
+            resources=AgentResources(models=[ModelResource(model_id="model-1")]),
+            input_text="current input",
+            history_available=True,
+        )
+
+        results = [result async for result in runner.run(ctx)]
+
+        assert any(r.type == AgentRunResultType.RUN_COMPLETED for r in results)
+        fake_api.history_page.assert_awaited_once_with(
+            conversation_id="conv-test",
+            limit=50,
+            direction="backward",
+            include_artifacts=True,
+        )
+        assert [(msg.role, msg.content) for msg in captured_messages] == [
+            ("system", "Static prompt"),
+            ("user", "previous question"),
+            ("assistant", "previous answer"),
+            ("user", "current input"),
+        ]
 
     @pytest.mark.asyncio
     async def test_streaming_skips_none_chunks(self, runner, monkeypatch):

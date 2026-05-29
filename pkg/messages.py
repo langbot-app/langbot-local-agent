@@ -11,23 +11,20 @@ def build_messages(
     prompt_config: list[dict[str, typing.Any]] | None,
     history_messages: list[Message],
     user_text: str,
-    max_round: int,
     rag_context: str | None = None,
-    prompt_messages: list[Message] | None = None,
     input_contents: list[ContentElement] | None = None,
 ) -> list[Message]:
     """Build messages list for LLM invocation.
 
     Structure:
     1. System prompt from config.prompt
-    2. Historical messages (truncated by max-round)
+    2. Historical messages pulled from Host history API
     3. Current user input (with RAG context if provided)
 
     Args:
         prompt_config: System prompt configuration
         history_messages: Conversation history
         user_text: Current user input text
-        max_round: Maximum conversation rounds to keep
         rag_context: Optional RAG context to prepend to user message
 
     Returns:
@@ -35,11 +32,7 @@ def build_messages(
     """
     messages: list[Message] = []
 
-    # Prefer the effective host-provided prompt. It includes changes made by
-    # host preprocessing and prompt-related plugin events.
-    if prompt_messages:
-        messages.extend([msg.model_copy(deep=True) for msg in prompt_messages])
-    elif prompt_config:
+    if prompt_config:
         for prompt_item in prompt_config:
             if isinstance(prompt_item, dict):
                 role = prompt_item.get("role", "system")
@@ -47,9 +40,7 @@ def build_messages(
                 if content and isinstance(content, str):
                     messages.append(Message(role=role, content=content))
 
-    truncated_history = _truncate_history_by_round(history_messages, max_round)
-
-    messages.extend(truncated_history)
+    messages.extend([msg.model_copy(deep=True) for msg in history_messages])
 
     user_message = build_user_message(
         user_text=user_text,
@@ -85,25 +76,6 @@ def build_user_message(
         return Message(role="user", content=final_user_text)
 
     return None
-
-
-def _truncate_history_by_round(history_messages: list[Message], max_round: int) -> list[Message]:
-    """Truncate history using the same user-round semantics as LangBot host."""
-    if max_round < 1:
-        return history_messages
-
-    temp_messages: list[Message] = []
-    current_round = 0
-
-    for msg in reversed(history_messages):
-        if current_round < max_round:
-            temp_messages.append(msg)
-            if msg.role == "user":
-                current_round += 1
-        else:
-            break
-
-    return list(reversed(temp_messages))
 
 
 def _build_rag_prompt(rag_context: str, user_text: str) -> str:
