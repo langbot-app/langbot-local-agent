@@ -426,9 +426,10 @@ class TestDefaultAgentRunner:
         """Create a runner instance."""
         from components.agent_runner.default import DefaultAgentRunner
         runner = DefaultAgentRunner()
-        # Mock plugin reference
-        runner.plugin = MagicMock()
-        runner.plugin.plugin_runtime_handler = MagicMock()
+        runner.bind_runtime(
+            plugin_runtime_handler=MagicMock(),
+            plugin_identity="langbot/local-agent",
+        )
         return runner
 
     @pytest.mark.asyncio

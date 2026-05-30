@@ -30,6 +30,10 @@ needs more context, it should use authorized Host APIs through
 `AgentRunAPIProxy`, for example history, event, artifact, state, model, tool,
 knowledge-base, and storage APIs.
 
+AgentRunner components should obtain that proxy with `self.get_run_api(ctx)`.
+They should not use the legacy `self.plugin` proxy that regular non-runner
+plugin components use.
+
 ## Runner ID
 
 `plugin:langbot/local-agent/default`
