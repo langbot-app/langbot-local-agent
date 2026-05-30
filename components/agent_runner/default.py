@@ -23,7 +23,7 @@ from langbot_plugin.api.entities.builtin.agent_runner import (
 from langbot_plugin.api.entities.builtin.provider.message import FunctionCall, Message, ToolCall
 
 from pkg.config import get_knowledge_base_ids, get_rerank_config, parse_model_config
-from pkg.messages import build_messages
+from pkg.messages import build_messages, get_effective_prompt_config
 from pkg.model_calling import (
     ModelCallError,
     StreamingModelCaller,
@@ -197,8 +197,9 @@ class DefaultAgentRunner(AgentRunner):
 
         history_messages = await _get_history_messages(api, ctx)
 
-        # Build messages for LLM
-        prompt_config = ctx.config.get("prompt", [])
+        # Build messages for LLM. Pipeline adapter runs provide the host
+        # effective prompt after PromptPreProcessing in adapter.extra.prompt.
+        prompt_config = get_effective_prompt_config(ctx)
         messages = build_messages(
             prompt_config=prompt_config,
             history_messages=history_messages,

@@ -43,7 +43,7 @@ from langbot_plugin.api.entities.builtin.provider.message import (
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pkg.config import get_knowledge_base_ids, get_rerank_config, parse_model_config
-from pkg.messages import build_messages, format_rag_results
+from pkg.messages import build_messages, format_rag_results, get_effective_prompt_config
 
 # ==================== Fixtures ====================
 
@@ -100,6 +100,7 @@ def make_context(
     input_text: str = "test input",
     input_contents: list[ContentElement] | None = None,
     runtime_metadata: dict[str, Any] | None = None,
+    adapter_extra: dict[str, Any] | None = None,
     history_available: bool = False,
     conversation_id: str = "conv-test",
 ) -> AgentRunContext:
@@ -127,7 +128,7 @@ def make_context(
         ),
         runtime=AgentRuntimeContext(query_id=1, metadata=runtime_metadata or {}),
         config=config or {},
-        adapter=AdapterContext(),
+        adapter=AdapterContext(extra=adapter_extra or {}),
     )
 
 
@@ -340,6 +341,37 @@ class TestBuildMessages:
 
         assert messages[0].content == "Static prompt"
 
+    def test_effective_prompt_prefers_host_adapter_prompt(self):
+        """Host effective prompt replaces static runner prompt."""
+        ctx = make_context(
+            config={"prompt": [{"role": "system", "content": "Static prompt"}]},
+            adapter_extra={"prompt": [{"role": "system", "content": "Host effective prompt"}]},
+        )
+
+        assert get_effective_prompt_config(ctx) == [
+            {"role": "system", "content": "Host effective prompt"}
+        ]
+
+    def test_effective_prompt_allows_host_to_clear_prompt(self):
+        """An explicit empty host prompt should not fall back to static config."""
+        ctx = make_context(
+            config={"prompt": [{"role": "system", "content": "Static prompt"}]},
+            adapter_extra={"prompt": []},
+        )
+
+        assert get_effective_prompt_config(ctx) == []
+
+    def test_effective_prompt_falls_back_to_static_config_without_adapter_prompt(self):
+        """Static runner config is still used outside Pipeline adapter prompt handoff."""
+        ctx = make_context(
+            config={"prompt": [{"role": "system", "content": "Static prompt"}]},
+            adapter_extra={"params": {"public": "value"}},
+        )
+
+        assert get_effective_prompt_config(ctx) == [
+            {"role": "system", "content": "Static prompt"}
+        ]
+
     def test_multimodal_input_contents_are_preserved(self):
         """Structured input contents are preserved in the current user message."""
         contents = [
@@ -543,6 +575,41 @@ class TestDefaultAgentRunner:
             ("user", "previous question"),
             ("assistant", "previous answer"),
             ("user", "current input"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_pipeline_effective_prompt_replaces_static_prompt(self, runner, monkeypatch):
+        """PromptPreProcessing output from Host is the model-facing prompt."""
+        fake_api = FakeAgentRunAPIProxy(
+            models=[ModelResource(model_id="model-1")],
+        )
+        captured_messages: list[Message] = []
+
+        async def mock_stream(*args, **kwargs):
+            captured_messages.extend(kwargs["messages"])
+            yield MessageChunk(role="assistant", content="Response", is_final=True)
+
+        fake_api.invoke_llm_stream = mock_stream
+        monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
+
+        ctx = make_context(
+            config={
+                "model": "model-1",
+                "prompt": [{"role": "system", "content": "Static prompt"}],
+            },
+            adapter_extra={
+                "prompt": [{"role": "system", "content": "Host effective prompt"}],
+            },
+            resources=AgentResources(models=[ModelResource(model_id="model-1")]),
+            input_text="qa-effective-prompt",
+        )
+
+        results = [result async for result in runner.run(ctx)]
+
+        assert any(r.type == AgentRunResultType.RUN_COMPLETED for r in results)
+        assert [(msg.role, msg.content) for msg in captured_messages] == [
+            ("system", "Host effective prompt"),
+            ("user", "qa-effective-prompt"),
         ]
 
     @pytest.mark.asyncio

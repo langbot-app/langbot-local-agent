@@ -49,8 +49,16 @@ plugin components use.
 | rerank-model | rerank-model-selector | no | '' | Rerank model for improved retrieval |
 | rerank-top-k | integer | no | 5 | Top-K results after reranking |
 
-`prompt` is a static binding configuration field for defaults and UI editing.
-Local Agent does not read Pipeline adapter prompt overrides.
+`prompt` is the static binding default. When the run enters through the
+Pipeline adapter, LangBot passes the post-preprocessing effective prompt in
+`ctx.adapter.extra.prompt`; Local Agent uses that host effective prompt instead
+of the static default so `PromptPreProcessing` changes are preserved. If the
+adapter prompt is absent or invalid, Local Agent falls back to `ctx.config.prompt`.
+
+TODO: This Pipeline prompt handoff is a bridge for behavior parity with the old
+Pipeline-based local-agent path, not the final agent product contract. When
+Pipeline is replaced, LangBot still needs an explicit design for how user
+plugins or host-level hooks can influence agent behavior.
 
 The singular `knowledge-base` config key is accepted as a convenience alias
 and is treated as a one-item `knowledge-bases` list.
@@ -67,9 +75,11 @@ The local agent should be treated as a self-managed or hybrid-context runner:
 - Large files, images, audio, and tool outputs should be consumed as artifact
   references instead of large inline payloads.
 
-Pipeline adapter data is not part of the Local Agent behavior contract. New
-runner logic should prefer event-first context and Host APIs over adapter
-fields.
+Pipeline adapter data is intentionally narrow. Local Agent consumes
+`ctx.adapter.extra.prompt` for the host effective prompt, while new runner logic
+should otherwise prefer event-first context and Host APIs over adapter fields.
+That prompt bridge should be revisited when the agent runtime no longer enters
+through Pipeline.
 
 ## Host APIs Consumed
 

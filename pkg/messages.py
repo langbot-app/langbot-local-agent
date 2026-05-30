@@ -7,6 +7,33 @@ import typing
 from langbot_plugin.api.entities.builtin.provider.message import ContentElement, Message
 
 
+def get_effective_prompt_config(ctx: typing.Any) -> list[dict[str, typing.Any]]:
+    """Return the prompt that should be sent to the model.
+
+    Pipeline adapter entries provide the post-preprocessing prompt in
+    ctx.adapter.extra.prompt. That prompt is already the full effective prompt,
+    so it replaces the static runner config instead of being appended to it.
+    """
+    # TODO(agent-protocol): This is a Pipeline bridge for old local-agent
+    # behavior, not the final agent product contract. When Pipeline is replaced,
+    # define how user plugins or host hooks can intentionally influence agent
+    # behavior without depending on adapter.extra.prompt.
+    adapter = getattr(ctx, "adapter", None)
+    extra = getattr(adapter, "extra", None) if adapter is not None else None
+    if isinstance(extra, dict) and "prompt" in extra:
+        prompt = extra.get("prompt")
+        if isinstance(prompt, list):
+            return prompt
+
+    config = getattr(ctx, "config", None)
+    if isinstance(config, dict):
+        prompt = config.get("prompt", [])
+        if isinstance(prompt, list):
+            return prompt
+
+    return []
+
+
 def build_messages(
     prompt_config: list[dict[str, typing.Any]] | None,
     history_messages: list[Message],
@@ -17,7 +44,7 @@ def build_messages(
     """Build messages list for LLM invocation.
 
     Structure:
-    1. System prompt from config.prompt
+    1. Effective system prompt from Host adapter or static config
     2. Historical messages pulled from Host history API
     3. Current user input (with RAG context if provided)
 
