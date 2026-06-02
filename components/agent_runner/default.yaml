@@ -57,6 +57,34 @@ spec:
       type: integer
       required: false
       default: 5
+    - name: context-window-chars
+      label:
+        en_US: Context Window Characters
+        zh_Hans: 上下文窗口字符数
+      type: integer
+      required: false
+      default: 32000
+    - name: context-reserve-chars
+      label:
+        en_US: Reserved Output Characters
+        zh_Hans: 输出保留字符数
+      type: integer
+      required: false
+      default: 8000
+    - name: context-keep-recent-chars
+      label:
+        en_US: Recent Context Characters
+        zh_Hans: 最近上下文字符数
+      type: integer
+      required: false
+      default: 12000
+    - name: context-summary-chars
+      label:
+        en_US: Summary Characters
+        zh_Hans: 摘要字符数
+      type: integer
+      required: false
+      default: 4000
   capabilities:
     streaming: true
     tool_calling: true

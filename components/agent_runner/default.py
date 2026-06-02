@@ -28,57 +28,10 @@ from pkg.agent_core import (
     LangBotModelAdapter,
     LangBotToolExecutor,
 )
-from pkg.config import get_knowledge_base_ids, get_rerank_config, parse_model_config
-from pkg.messages import build_messages, get_effective_prompt_config
+from pkg.config import parse_model_config
+from pkg.context_pipeline import ContextAssembler
 from pkg.model_calling import build_llm_tools
-from pkg.rag import retrieve_from_knowledge_bases
 from pkg.tool_loop import DEFAULT_MAX_TOOL_ITERATIONS
-
-DEFAULT_HISTORY_LIMIT = 50
-
-
-def _message_from_transcript_item(item: dict[str, Any], current_event_id: str) -> Message | None:
-    """Convert one Host transcript item into a model message."""
-    if item.get("event_id") == current_event_id:
-        return None
-
-    content_json = item.get("content_json")
-    if isinstance(content_json, dict):
-        try:
-            return Message.model_validate(content_json)
-        except Exception:
-            pass
-
-    role = item.get("role")
-    content = item.get("content")
-    if isinstance(role, str) and isinstance(content, str) and content:
-        return Message(role=role, content=content)
-
-    return None
-
-
-async def _get_history_messages(api: Any, ctx: AgentRunContext) -> list[Message]:
-    """Pull conversation history from Host APIs when authorized."""
-    context = ctx.context
-    if not context.available_apis.history_page or not context.conversation_id:
-        return []
-
-    page = await api.history_page(
-        conversation_id=context.conversation_id,
-        limit=DEFAULT_HISTORY_LIMIT,
-        direction="backward",
-        include_artifacts=True,
-    )
-
-    messages: list[Message] = []
-    for item in reversed(page.get("items", [])):
-        if not isinstance(item, dict):
-            continue
-        message = _message_from_transcript_item(item, ctx.event.event_id)
-        if message is not None:
-            messages.append(message)
-
-    return messages
 
 
 class DefaultAgentRunner(AgentRunner):
@@ -147,40 +100,9 @@ class DefaultAgentRunner(AgentRunner):
         # Get allowed tools for tool calling.
         allowed_tools = set(t.tool_name for t in api.get_allowed_tools())
 
-        # Get allowed KB IDs from config (intersection with authorized)
-        allowed_kb_ids = set(kb.kb_id for kb in api.get_allowed_knowledge_bases())
-        kb_ids = get_knowledge_base_ids(ctx.config, allowed_kb_ids)
-
-        # Get rerank configuration
-        rerank_model_id, rerank_top_k = get_rerank_config(ctx.config)
-
-        # Get user input text
-        user_text = ctx.input.to_text()
-
-        # Retrieve from knowledge bases if configured
-        rag_context = ""
-        if kb_ids and user_text:
-            rag_context = await retrieve_from_knowledge_bases(
-                api=api,
-                kb_ids=kb_ids,
-                query_text=user_text,
-                top_k=5,
-                rerank_model_id=rerank_model_id,
-                rerank_top_k=rerank_top_k,
-            )
-
-        history_messages = await _get_history_messages(api, ctx)
-
-        # Build messages for LLM. Pipeline adapter runs provide the host
-        # effective prompt after PromptPreProcessing in adapter.extra.prompt.
-        prompt_config = get_effective_prompt_config(ctx)
-        messages = build_messages(
-            prompt_config=prompt_config,
-            history_messages=history_messages,
-            user_text=user_text,
-            input_contents=ctx.input.contents,
-            rag_context=rag_context if rag_context else None,
-        )
+        # Build the model context through the runner-owned context pipeline.
+        context_assembly = await ContextAssembler(api, ctx).assemble()
+        messages = context_assembly.messages
 
         # Prefer host runtime capability so non-streaming adapters keep the
         # same behavior as the original built-in local-agent runner.

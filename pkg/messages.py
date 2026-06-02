@@ -57,15 +57,7 @@ def build_messages(
     Returns:
         List of Message objects ready for LLM
     """
-    messages: list[Message] = []
-
-    if prompt_config:
-        for prompt_item in prompt_config:
-            if isinstance(prompt_item, dict):
-                role = prompt_item.get("role", "system")
-                content = prompt_item.get("content", "")
-                if content and isinstance(content, str):
-                    messages.append(Message(role=role, content=content))
+    messages = build_prompt_messages(prompt_config)
 
     messages.extend([msg.model_copy(deep=True) for msg in history_messages])
 
@@ -76,6 +68,23 @@ def build_messages(
     )
     if user_message is not None:
         messages.append(user_message)
+
+    return messages
+
+
+def build_prompt_messages(
+    prompt_config: list[dict[str, typing.Any]] | None,
+) -> list[Message]:
+    """Build model prompt messages from runner/host prompt config."""
+    messages: list[Message] = []
+
+    if prompt_config:
+        for prompt_item in prompt_config:
+            if isinstance(prompt_item, dict):
+                role = prompt_item.get("role", "system")
+                content = prompt_item.get("content", "")
+                if content and isinstance(content, str):
+                    messages.append(Message(role=role, content=content))
 
     return messages
 

@@ -43,6 +43,7 @@ from langbot_plugin.api.entities.builtin.provider.message import (
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pkg.config import get_knowledge_base_ids, get_rerank_config, parse_model_config
+from pkg.context_pipeline import ContextBudget, ContextCompactor
 from pkg.messages import build_messages, format_rag_results, get_effective_prompt_config
 
 # ==================== Fixtures ====================
@@ -410,6 +411,58 @@ class TestBuildMessages:
         assert messages[0].content[1].type == "image_base64"
 
 
+class TestContextCompaction:
+    """Tests for runner-owned context budgeting and compaction."""
+
+    def test_budget_from_config_uses_character_fields(self):
+        """Context budget uses character limits instead of round counts."""
+        budget = ContextBudget.from_config(
+            {
+                "context-window-chars": 300,
+                "context-reserve-chars": 60,
+                "context-keep-recent-chars": 80,
+                "context-summary-chars": 120,
+            }
+        )
+
+        assert budget.window_chars == 300
+        assert budget.input_chars == 240
+        assert budget.keep_recent_chars == 80
+        assert budget.summary_chars == 120
+
+    def test_compactor_summarizes_old_history_and_keeps_recent_tail(self):
+        """Older history is summarized while recent context and current input remain."""
+        history = [
+            Message(role="user", content="old user " + "u" * 220),
+            Message(role="assistant", content="old assistant " + "a" * 220),
+            Message(role="user", content="recent user sentinel"),
+            Message(role="assistant", content="recent assistant sentinel"),
+        ]
+        current = [Message(role="user", content="current request")]
+        budget = ContextBudget(
+            window_chars=320,
+            reserve_chars=60,
+            keep_recent_chars=100,
+            summary_chars=120,
+        )
+
+        assembly = ContextCompactor(budget).compact(
+            prompt_messages=[Message(role="system", content="Static prompt")],
+            history_messages=history,
+            current_messages=current,
+        )
+
+        assert assembly.compacted is True
+        assert assembly.summary_message is not None
+        assert assembly.messages[0].content == "Static prompt"
+        assert "<conversation_summary>" in assembly.summary_message.content
+        assert "old user" in assembly.summary_message.content
+        contents = [message.content for message in assembly.messages]
+        assert "recent user sentinel" in contents
+        assert "recent assistant sentinel" in contents
+        assert contents[-1] == "current request"
+
+
 class TestFormatRagResults:
     """Tests for RAG result formatting."""
 
@@ -452,6 +505,9 @@ class TestDefaultAgentRunner:
 
         assert manifest["spec"]["capabilities"]["event_context"] is True
         assert manifest["spec"]["permissions"]["history"] == ["page", "search"]
+        config_names = {item["name"] for item in manifest["spec"]["config"]}
+        assert "context-window-chars" in config_names
+        assert "context-keep-recent-chars" in config_names
 
     @pytest.fixture
     def runner(self):
@@ -611,6 +667,82 @@ class TestDefaultAgentRunner:
             ("system", "Host effective prompt"),
             ("user", "qa-effective-prompt"),
         ]
+
+    @pytest.mark.asyncio
+    async def test_context_compaction_runs_before_model_call(self, runner, monkeypatch):
+        """Long host history is compacted by budget, not by a max-round setting."""
+        fake_api = FakeAgentRunAPIProxy(
+            models=[ModelResource(model_id="model-1")],
+        )
+        fake_api.history_page = AsyncMock(
+            return_value={
+                "items": [
+                    {
+                        "event_id": "evt-run-compact",
+                        "role": "user",
+                        "content": "current compact request",
+                    },
+                    {
+                        "event_id": "evt-recent-assistant",
+                        "role": "assistant",
+                        "content": "recent assistant sentinel",
+                    },
+                    {
+                        "event_id": "evt-recent-user",
+                        "role": "user",
+                        "content": "recent user sentinel",
+                    },
+                    {
+                        "event_id": "evt-old-assistant",
+                        "role": "assistant",
+                        "content": "old assistant " + "a" * 220,
+                    },
+                    {
+                        "event_id": "evt-old-user",
+                        "role": "user",
+                        "content": "old user " + "u" * 220,
+                    },
+                ],
+                "next_cursor": None,
+                "prev_cursor": None,
+                "has_more": False,
+            }
+        )
+        captured_messages: list[Message] = []
+
+        async def mock_stream(*args, **kwargs):
+            captured_messages.extend(kwargs["messages"])
+            yield MessageChunk(role="assistant", content="Response", is_final=True)
+
+        fake_api.invoke_llm_stream = mock_stream
+        monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
+
+        ctx = make_context(
+            run_id="run-compact",
+            config={
+                "model": "model-1",
+                "prompt": [{"role": "system", "content": "Static prompt"}],
+                "context-window-chars": 340,
+                "context-reserve-chars": 80,
+                "context-keep-recent-chars": 90,
+                "context-summary-chars": 120,
+            },
+            resources=AgentResources(models=[ModelResource(model_id="model-1")]),
+            input_text="current compact request",
+            history_available=True,
+        )
+
+        results = [result async for result in runner.run(ctx)]
+
+        assert any(r.type == AgentRunResultType.RUN_COMPLETED for r in results)
+        assert captured_messages[0].content == "Static prompt"
+        assert captured_messages[1].role == "system"
+        assert "<conversation_summary>" in captured_messages[1].content
+        assert "old user" in captured_messages[1].content
+        contents = [message.content for message in captured_messages]
+        assert "recent user sentinel" in contents
+        assert "recent assistant sentinel" in contents
+        assert contents[-1] == "current compact request"
 
     @pytest.mark.asyncio
     async def test_streaming_skips_none_chunks(self, runner, monkeypatch):

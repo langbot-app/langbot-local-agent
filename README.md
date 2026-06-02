@@ -48,6 +48,10 @@ plugin components use.
 | knowledge-bases | knowledge-base-multi-selector | no | [] | Knowledge bases for RAG |
 | rerank-model | rerank-model-selector | no | '' | Rerank model for improved retrieval |
 | rerank-top-k | integer | no | 5 | Top-K results after reranking |
+| context-window-chars | integer | no | 32000 | Approximate input/output context window in characters. Set `0` to disable compaction. |
+| context-reserve-chars | integer | no | 8000 | Approximate characters reserved for the model response and provider overhead. |
+| context-keep-recent-chars | integer | no | 12000 | Approximate recent history characters to retain when compaction triggers. |
+| context-summary-chars | integer | no | 4000 | Maximum deterministic summary characters inserted for compacted older history. |
 
 `prompt` is the static binding default. When the run enters through the
 Pipeline adapter, LangBot passes the post-preprocessing effective prompt in
@@ -74,6 +78,22 @@ The local agent should be treated as a self-managed or hybrid-context runner:
   scratch.
 - Large files, images, audio, and tool outputs should be consumed as artifact
   references instead of large inline payloads.
+
+Local Agent currently uses a runner-owned context pipeline:
+
+1. Assemble effective prompt, host transcript history, RAG context, and current
+   structured input.
+2. Estimate context size with a conservative character heuristic while LangBot
+   does not yet expose model context-window metadata to runner plugins.
+3. When the assembled context exceeds `context-window-chars - context-reserve-chars`,
+   replace older history with a `system` message containing
+   `<conversation_summary>...</conversation_summary>` and keep a recent history
+   tail bounded by `context-keep-recent-chars`.
+
+This is not `max-round` behavior. History is not selected by number of rounds;
+the runner budgets prompt, current input, summary, and recent history together.
+Future iterations can replace the deterministic summary generator with an LLM
+summary and persist compaction checkpoints through Host state/storage.
 
 Pipeline adapter data is intentionally narrow. Local Agent consumes
 `ctx.adapter.extra.prompt` for the host effective prompt, while new runner logic
