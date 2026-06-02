@@ -14,10 +14,9 @@ def get_effective_prompt_config(ctx: typing.Any) -> list[dict[str, typing.Any]]:
     ctx.adapter.extra.prompt. That prompt is already the full effective prompt,
     so it replaces the static runner config instead of being appended to it.
     """
-    # TODO(agent-protocol): This is a Pipeline bridge for old local-agent
-    # behavior, not the final agent product contract. When Pipeline is replaced,
-    # define how user plugins or host hooks can intentionally influence agent
-    # behavior without depending on adapter.extra.prompt.
+    # TODO(agent-protocol): This Pipeline bridge preserves old local-agent
+    # behavior. Replace it with a Host-owned prompt/instruction package pull API
+    # once ctx.context.available_apis.prompt_get is implemented.
     adapter = getattr(ctx, "adapter", None)
     extra = getattr(adapter, "extra", None) if adapter is not None else None
     if isinstance(extra, dict) and "prompt" in extra:

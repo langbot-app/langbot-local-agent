@@ -42,8 +42,21 @@ from langbot_plugin.api.entities.builtin.provider.message import (
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pkg.config import get_knowledge_base_ids, get_rerank_config, parse_model_config
-from pkg.context_pipeline import ContextBudget, ContextCompactor
+from pkg.config import (
+    get_knowledge_base_ids,
+    get_max_tool_iterations,
+    get_rerank_config,
+    get_retrieval_top_k,
+    parse_model_config,
+)
+from pkg.context_pipeline import (
+    DEFAULT_CONTEXT_KEEP_RECENT_TOKENS,
+    DEFAULT_CONTEXT_RESERVE_TOKENS,
+    DEFAULT_CONTEXT_SUMMARY_TOKENS,
+    DEFAULT_CONTEXT_WINDOW_TOKENS,
+    ContextBudget,
+    ContextCompactor,
+)
 from pkg.messages import build_messages, format_rag_results, get_effective_prompt_config
 
 # ==================== Fixtures ====================
@@ -247,13 +260,13 @@ class TestGetKnowledgeBaseIds:
         )
         assert result == ["kb-1"]
 
-    def test_legacy_single_knowledge_base(self):
-        """Legacy singular knowledge-base config is still supported."""
+    def test_single_knowledge_base_key_is_not_a_runtime_alias(self):
+        """Legacy singular knowledge-base config must be migrated before runner execution."""
         result = get_knowledge_base_ids(
             {"knowledge-base": "kb-1"},
             {"kb-1", "kb-2"},
         )
-        assert result == ["kb-1"]
+        assert result == []
 
 
 class TestGetRerankConfig:
@@ -274,6 +287,18 @@ class TestGetRerankConfig:
     def test_invalid_top_k_uses_default(self):
         """Invalid rerank top-k falls back to default."""
         assert get_rerank_config({"rerank-model": "rerank-1", "rerank-top-k": 0}) == ("rerank-1", 5)
+
+
+class TestRunnerBehaviorConfig:
+    """Tests for runner behavior configuration parsing."""
+
+    def test_retrieval_top_k(self):
+        assert get_retrieval_top_k({"retrieval-top-k": 3}) == 3
+        assert get_retrieval_top_k({"retrieval-top-k": 0}) == 5
+
+    def test_max_tool_iterations(self):
+        assert get_max_tool_iterations({"max-tool-iterations": 2}) == 2
+        assert get_max_tool_iterations({"max-tool-iterations": 0}) == 10
 
 
 # ==================== Message Building Tests ====================
@@ -349,9 +374,7 @@ class TestBuildMessages:
             adapter_extra={"prompt": [{"role": "system", "content": "Host effective prompt"}]},
         )
 
-        assert get_effective_prompt_config(ctx) == [
-            {"role": "system", "content": "Host effective prompt"}
-        ]
+        assert get_effective_prompt_config(ctx) == [{"role": "system", "content": "Host effective prompt"}]
 
     def test_effective_prompt_allows_host_to_clear_prompt(self):
         """An explicit empty host prompt should not fall back to static config."""
@@ -369,9 +392,7 @@ class TestBuildMessages:
             adapter_extra={"params": {"public": "value"}},
         )
 
-        assert get_effective_prompt_config(ctx) == [
-            {"role": "system", "content": "Static prompt"}
-        ]
+        assert get_effective_prompt_config(ctx) == [{"role": "system", "content": "Static prompt"}]
 
     def test_multimodal_input_contents_are_preserved(self):
         """Structured input contents are preserved in the current user message."""
@@ -414,8 +435,35 @@ class TestBuildMessages:
 class TestContextCompaction:
     """Tests for runner-owned context budgeting and compaction."""
 
-    def test_budget_from_config_uses_character_fields(self):
-        """Context budget uses character limits instead of round counts."""
+    def test_budget_from_config_uses_token_fields(self):
+        """Context budget uses token limits instead of round counts."""
+        budget = ContextBudget.from_config(
+            {
+                "context-window-tokens": 300,
+                "context-reserve-tokens": 60,
+                "context-keep-recent-tokens": 80,
+                "context-summary-tokens": 120,
+            }
+        )
+
+        assert budget.window_tokens == 300
+        assert budget.input_tokens == 240
+        assert budget.keep_recent_tokens == 80
+        assert budget.summary_tokens == 120
+
+    def test_budget_from_context_prefers_host_window_metadata(self):
+        """Host model metadata can provide the effective context window."""
+        ctx = make_context(
+            config={"context-window-tokens": 300},
+            runtime_metadata={"context_window_tokens": 512},
+        )
+
+        budget = ContextBudget.from_context(ctx)
+
+        assert budget.window_tokens == 512
+
+    def test_budget_ignores_unpublished_character_fields(self):
+        """Unpublished character-based config keys are not compatibility aliases."""
         budget = ContextBudget.from_config(
             {
                 "context-window-chars": 300,
@@ -425,10 +473,10 @@ class TestContextCompaction:
             }
         )
 
-        assert budget.window_chars == 300
-        assert budget.input_chars == 240
-        assert budget.keep_recent_chars == 80
-        assert budget.summary_chars == 120
+        assert budget.window_tokens == DEFAULT_CONTEXT_WINDOW_TOKENS
+        assert budget.reserve_tokens == DEFAULT_CONTEXT_RESERVE_TOKENS
+        assert budget.keep_recent_tokens == DEFAULT_CONTEXT_KEEP_RECENT_TOKENS
+        assert budget.summary_tokens == DEFAULT_CONTEXT_SUMMARY_TOKENS
 
     def test_compactor_summarizes_old_history_and_keeps_recent_tail(self):
         """Older history is summarized while recent context and current input remain."""
@@ -440,10 +488,10 @@ class TestContextCompaction:
         ]
         current = [Message(role="user", content="current request")]
         budget = ContextBudget(
-            window_chars=320,
-            reserve_chars=60,
-            keep_recent_chars=100,
-            summary_chars=120,
+            window_tokens=80,
+            reserve_tokens=15,
+            keep_recent_tokens=25,
+            summary_tokens=30,
         )
 
         assembly = ContextCompactor(budget).compact(
@@ -501,18 +549,24 @@ class TestDefaultAgentRunner:
 
     def test_manifest_declares_event_context_capability(self):
         """The local runner consumes Protocol v1 event-first context from Host."""
-        manifest = yaml.safe_load((Path(__file__).resolve().parents[1] / "components/agent_runner/default.yaml").read_text())
+        manifest = yaml.safe_load(
+            (Path(__file__).resolve().parents[1] / "components/agent_runner/default.yaml").read_text()
+        )
 
         assert manifest["spec"]["capabilities"]["event_context"] is True
         assert manifest["spec"]["permissions"]["history"] == ["page", "search"]
         config_names = {item["name"] for item in manifest["spec"]["config"]}
-        assert "context-window-chars" in config_names
-        assert "context-keep-recent-chars" in config_names
+        assert "context-window-tokens" in config_names
+        assert "context-keep-recent-tokens" in config_names
+        assert "context-window-chars" not in config_names
+        assert "retrieval-top-k" in config_names
+        assert "max-tool-iterations" in config_names
 
     @pytest.fixture
     def runner(self):
         """Create a runner instance."""
         from components.agent_runner.default import DefaultAgentRunner
+
         runner = DefaultAgentRunner()
         runner.bind_runtime(
             plugin_runtime_handler=MagicMock(),
@@ -722,10 +776,10 @@ class TestDefaultAgentRunner:
             config={
                 "model": "model-1",
                 "prompt": [{"role": "system", "content": "Static prompt"}],
-                "context-window-chars": 340,
-                "context-reserve-chars": 80,
-                "context-keep-recent-chars": 90,
-                "context-summary-chars": 120,
+                "context-window-tokens": 85,
+                "context-reserve-tokens": 20,
+                "context-keep-recent-tokens": 23,
+                "context-summary-tokens": 30,
             },
             resources=AgentResources(models=[ModelResource(model_id="model-1")]),
             input_text="current compact request",
@@ -770,9 +824,7 @@ class TestDefaultAgentRunner:
             results.append(result)
 
         deltas = [
-            result.data["chunk"]["content"]
-            for result in results
-            if result.type == AgentRunResultType.MESSAGE_DELTA
+            result.data["chunk"]["content"] for result in results if result.type == AgentRunResultType.MESSAGE_DELTA
         ]
         assert deltas == ["Hello world"]
         assert any(r.type == AgentRunResultType.RUN_COMPLETED for r in results)
@@ -817,14 +869,10 @@ class TestDefaultAgentRunner:
         results_a, results_b = await asyncio.gather(collect(ctx_a), collect(ctx_b))
 
         chunks_a = [
-            result.data["chunk"]["content"]
-            for result in results_a
-            if result.type == AgentRunResultType.MESSAGE_DELTA
+            result.data["chunk"]["content"] for result in results_a if result.type == AgentRunResultType.MESSAGE_DELTA
         ]
         chunks_b = [
-            result.data["chunk"]["content"]
-            for result in results_b
-            if result.type == AgentRunResultType.MESSAGE_DELTA
+            result.data["chunk"]["content"] for result in results_b if result.type == AgentRunResultType.MESSAGE_DELTA
         ]
 
         assert chunks_a == ["response-a"]
@@ -888,6 +936,7 @@ class TestDefaultAgentRunner:
                 FunctionCall,
                 ToolCall,
             )
+
             call_count[0] += 1
             if call_count[0] == 1:
                 # First call: has tool call
@@ -1100,7 +1149,11 @@ class TestDefaultAgentRunner:
         monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
 
         ctx = make_context(
-            config={"model": "model-1", "knowledge-bases": ["kb-1", "kb-2"]},  # Request kb-1 and kb-2
+            config={
+                "model": "model-1",
+                "knowledge-bases": ["kb-1", "kb-2"],
+                "retrieval-top-k": 3,
+            },
             resources=AgentResources(
                 models=[ModelResource(model_id="model-1")],
                 knowledge_bases=[KnowledgeBaseResource(kb_id="kb-1")],  # Only kb-1 authorized
@@ -1116,6 +1169,7 @@ class TestDefaultAgentRunner:
         assert fake_api.retrieve_knowledge.call_count == 1
         call_args = fake_api.retrieve_knowledge.call_args
         assert call_args.kwargs.get("kb_id") == "kb-1" or call_args.args[0] == "kb-1"
+        assert call_args.kwargs.get("top_k") == 3
 
     @pytest.mark.asyncio
     async def test_kb_not_authorized_not_called(self, runner, monkeypatch):
@@ -1163,9 +1217,7 @@ class TestDefaultAgentRunner:
                 {"content": [{"type": "text", "text": "high relevance sentinel"}]},
             ]
         )
-        fake_api.invoke_rerank = AsyncMock(
-            return_value=[{"index": 1, "relevance_score": 0.99}]
-        )
+        fake_api.invoke_rerank = AsyncMock(return_value=[{"index": 1, "relevance_score": 0.99}])
         captured_messages: list[Message] = []
 
         async def mock_stream(*args, **kwargs):
@@ -1298,7 +1350,7 @@ class TestDefaultAgentRunner:
         monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
 
         ctx = make_context(
-            config={"model": "model-1"},
+            config={"model": "model-1", "max-tool-iterations": 2},
             resources=AgentResources(
                 models=[ModelResource(model_id="model-1")],
                 tools=[ToolResource(tool_name="allowed_tool")],
@@ -1312,8 +1364,8 @@ class TestDefaultAgentRunner:
         failed = [r for r in results if r.type == AgentRunResultType.RUN_FAILED]
         assert len(failed) == 1
         assert failed[0].data.get("code") == "runner.tool_loop_limit"
-        assert fake_api.call_tool.await_count == 10
-        assert stream_call_count == 11
+        assert fake_api.call_tool.await_count == 2
+        assert stream_call_count == 3
 
     @pytest.mark.asyncio
     async def test_non_streaming_mode_uses_invoke_llm(self, runner, monkeypatch):
@@ -1323,9 +1375,7 @@ class TestDefaultAgentRunner:
         )
 
         # Mock non-streaming invoke
-        fake_api.invoke_llm = AsyncMock(
-            return_value=Message(role="assistant", content="Non-streaming response")
-        )
+        fake_api.invoke_llm = AsyncMock(return_value=Message(role="assistant", content="Non-streaming response"))
 
         monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
 
@@ -1355,9 +1405,7 @@ class TestDefaultAgentRunner:
         fake_api = FakeAgentRunAPIProxy(
             models=[ModelResource(model_id="model-1")],
         )
-        fake_api.invoke_llm = AsyncMock(
-            return_value=Message(role="assistant", content="Adapter cannot stream")
-        )
+        fake_api.invoke_llm = AsyncMock(return_value=Message(role="assistant", content="Adapter cannot stream"))
         monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
 
         ctx = make_context(

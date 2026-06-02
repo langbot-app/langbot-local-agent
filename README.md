@@ -46,12 +46,15 @@ plugin components use.
 | timeout | integer | no | 300 | Total runner execution timeout in seconds. Set to `0` or `null` to disable the host deadline. |
 | prompt | prompt-editor | yes | system: "You are a helpful assistant." | Default system prompt edited in LangBot UI |
 | knowledge-bases | knowledge-base-multi-selector | no | [] | Knowledge bases for RAG |
+| retrieval-top-k | integer | no | 5 | Retrieval results requested per knowledge base |
 | rerank-model | rerank-model-selector | no | '' | Rerank model for improved retrieval |
 | rerank-top-k | integer | no | 5 | Top-K results after reranking |
-| context-window-chars | integer | no | 32000 | Approximate input/output context window in characters. Set `0` to disable compaction. |
-| context-reserve-chars | integer | no | 8000 | Approximate characters reserved for the model response and provider overhead. |
-| context-keep-recent-chars | integer | no | 12000 | Approximate recent history characters to retain when compaction triggers. |
-| context-summary-chars | integer | no | 4000 | Maximum deterministic summary characters inserted for compacted older history. |
+| max-tool-iterations | integer | no | 10 | Maximum tool-call follow-up iterations |
+| context-history-fetch-limit | integer | no | 50 | Transcript messages pulled from the Host history API |
+| context-window-tokens | integer | no | 200000 | Approximate context window when Host model metadata is not available |
+| context-reserve-tokens | integer | no | 16384 | Tokens reserved for the model response and provider overhead |
+| context-keep-recent-tokens | integer | no | 20000 | Approximate recent history tokens to retain when compaction triggers |
+| context-summary-tokens | integer | no | 8000 | Maximum deterministic summary tokens inserted for compacted older history |
 
 `prompt` is the static binding default. When the run enters through the
 Pipeline adapter, LangBot passes the post-preprocessing effective prompt in
@@ -61,11 +64,13 @@ adapter prompt is absent or invalid, Local Agent falls back to `ctx.config.promp
 
 TODO: This Pipeline prompt handoff is a bridge for behavior parity with the old
 Pipeline-based local-agent path, not the final agent product contract. When
-Pipeline is replaced, LangBot still needs an explicit design for how user
-plugins or host-level hooks can influence agent behavior.
+Pipeline is replaced, LangBot should expose a Host-owned effective
+prompt/instruction package as a run-scoped pull API instead of pushing it
+through `ctx.adapter.extra.prompt`.
 
-The singular `knowledge-base` config key is accepted as a convenience alias
-and is treated as a one-item `knowledge-bases` list.
+Legacy singular `knowledge-base` values must be normalized by LangBot
+configuration migration before runner execution. Local Agent only reads the
+manifest-defined `knowledge-bases` binding config.
 
 ## Context Management
 
@@ -83,17 +88,22 @@ Local Agent currently uses a runner-owned context pipeline:
 
 1. Assemble effective prompt, host transcript history, RAG context, and current
    structured input.
-2. Estimate context size with a conservative character heuristic while LangBot
-   does not yet expose model context-window metadata to runner plugins.
-3. When the assembled context exceeds `context-window-chars - context-reserve-chars`,
+2. Use the Host-provided model context window from `ctx.runtime.metadata` when
+   available; otherwise use the runner binding's `context-window-tokens`,
+   which defaults to 200k tokens.
+3. Estimate message tokens with a conservative local heuristic until LangBot
+   exposes tokenizer/model usage metadata to runner plugins.
+4. When the assembled context exceeds `context-window-tokens - context-reserve-tokens`,
    replace older history with a `system` message containing
    `<conversation_summary>...</conversation_summary>` and keep a recent history
-   tail bounded by `context-keep-recent-chars`.
+   tail bounded by `context-keep-recent-tokens`.
 
 This is not `max-round` behavior. History is not selected by number of rounds;
-the runner budgets prompt, current input, summary, and recent history together.
-Future iterations can replace the deterministic summary generator with an LLM
-summary and persist compaction checkpoints through Host state/storage.
+the runner budgets prompt, current input, summary, and recent history together,
+following the Pi-style context threshold shape. Future iterations can replace
+the deterministic summary generator with an LLM summary and persist compaction
+checkpoints through Host state/storage after LangBot exposes tokenizer/model
+usage metadata from the LiteLLM model-info work.
 
 Pipeline adapter data is intentionally narrow. Local Agent consumes
 `ctx.adapter.extra.prompt` for the host effective prompt, while new runner logic

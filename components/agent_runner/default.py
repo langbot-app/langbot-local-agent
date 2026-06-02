@@ -28,10 +28,9 @@ from pkg.agent_core import (
     LangBotModelAdapter,
     LangBotToolExecutor,
 )
-from pkg.config import parse_model_config
+from pkg.config import get_max_tool_iterations, parse_model_config
 from pkg.context_pipeline import ContextAssembler
 from pkg.model_calling import build_llm_tools
-from pkg.tool_loop import DEFAULT_MAX_TOOL_ITERATIONS
 
 
 class DefaultAgentRunner(AgentRunner):
@@ -67,9 +66,7 @@ class DefaultAgentRunner(AgentRunner):
             history=["page", "search"],
         )
 
-    async def run(
-        self, ctx: AgentRunContext
-    ) -> AsyncGenerator[AgentRunResult, None]:
+    async def run(self, ctx: AgentRunContext) -> AsyncGenerator[AgentRunResult, None]:
         """Run the agent with full LLM capabilities.
 
         Implementation:
@@ -99,6 +96,7 @@ class DefaultAgentRunner(AgentRunner):
 
         # Get allowed tools for tool calling.
         allowed_tools = set(t.tool_name for t in api.get_allowed_tools())
+        max_tool_iterations = get_max_tool_iterations(ctx.config)
 
         # Build the model context through the runner-owned context pipeline.
         context_assembly = await ContextAssembler(api, ctx).assemble()
@@ -118,6 +116,7 @@ class DefaultAgentRunner(AgentRunner):
                 messages=messages,
                 allowed_tools=allowed_tools,
                 streaming=True,
+                max_tool_iterations=max_tool_iterations,
             ):
                 yield result
         else:
@@ -128,6 +127,7 @@ class DefaultAgentRunner(AgentRunner):
                 messages=messages,
                 allowed_tools=allowed_tools,
                 streaming=False,
+                max_tool_iterations=max_tool_iterations,
             ):
                 yield result
 
@@ -139,6 +139,7 @@ class DefaultAgentRunner(AgentRunner):
         messages: list[Message],
         allowed_tools: set[str],
         streaming: bool,
+        max_tool_iterations: int,
     ) -> AsyncGenerator[AgentRunResult, None]:
         """Run the LangBot-native Pi-style agent loop."""
         llm_tools = await build_llm_tools(api, allowed_tools)
@@ -149,7 +150,7 @@ class DefaultAgentRunner(AgentRunner):
             messages=messages,
             tools=llm_tools,
             streaming=streaming,
-            max_tool_iterations=DEFAULT_MAX_TOOL_ITERATIONS,
+            max_tool_iterations=max_tool_iterations,
         )
 
         final_message: Message | None = None

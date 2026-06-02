@@ -8,41 +8,85 @@ from dataclasses import dataclass
 from langbot_plugin.api.entities.builtin.agent_runner import AgentRunContext
 from langbot_plugin.api.entities.builtin.provider.message import Message
 
-from pkg.config import get_knowledge_base_ids, get_rerank_config
+from pkg.config import get_knowledge_base_ids, get_rerank_config, get_retrieval_top_k
 from pkg.messages import build_prompt_messages, build_user_message, get_effective_prompt_config
 from pkg.rag import retrieve_from_knowledge_bases
 
 DEFAULT_HISTORY_FETCH_LIMIT = 50
-DEFAULT_CONTEXT_WINDOW_CHARS = 32000
-DEFAULT_CONTEXT_RESERVE_CHARS = 8000
-DEFAULT_CONTEXT_KEEP_RECENT_CHARS = 12000
-DEFAULT_CONTEXT_SUMMARY_CHARS = 4000
+DEFAULT_CONTEXT_WINDOW_TOKENS = 200_000
+DEFAULT_CONTEXT_RESERVE_TOKENS = 16_384
+DEFAULT_CONTEXT_KEEP_RECENT_TOKENS = 20_000
+DEFAULT_CONTEXT_SUMMARY_TOKENS = 8_000
 
 ESTIMATED_ATTACHMENT_CHARS = 4800
+ESTIMATED_CHARS_PER_TOKEN = 4
 
 
 @dataclass(frozen=True)
 class ContextBudget:
-    """Character-based context budget used before token metadata is available."""
+    """Token-style context budget with conservative local estimates."""
 
-    window_chars: int = DEFAULT_CONTEXT_WINDOW_CHARS
-    reserve_chars: int = DEFAULT_CONTEXT_RESERVE_CHARS
-    keep_recent_chars: int = DEFAULT_CONTEXT_KEEP_RECENT_CHARS
-    summary_chars: int = DEFAULT_CONTEXT_SUMMARY_CHARS
+    window_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS
+    reserve_tokens: int = DEFAULT_CONTEXT_RESERVE_TOKENS
+    keep_recent_tokens: int = DEFAULT_CONTEXT_KEEP_RECENT_TOKENS
+    summary_tokens: int = DEFAULT_CONTEXT_SUMMARY_TOKENS
     history_fetch_limit: int = DEFAULT_HISTORY_FETCH_LIMIT
 
     @classmethod
-    def from_config(cls, config: dict[str, typing.Any]) -> "ContextBudget":
+    def from_context(cls, ctx: AgentRunContext) -> "ContextBudget":
+        config = ctx.config if isinstance(ctx.config, dict) else {}
+        runtime = getattr(ctx, "runtime", None)
+        metadata = getattr(runtime, "metadata", {}) if runtime is not None else {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        host_window_tokens = _runtime_context_window_tokens(metadata)
+        config_window_tokens = _config_token_value(
+            config,
+            "context-window-tokens",
+            None,
+            minimum=0,
+        )
+
+        return cls.from_config(
+            config,
+            window_tokens=host_window_tokens if host_window_tokens is not None else config_window_tokens,
+        )
+
+    @classmethod
+    def from_config(
+        cls,
+        config: dict[str, typing.Any],
+        *,
+        window_tokens: int | None = None,
+    ) -> "ContextBudget":
         return cls(
-            window_chars=_config_int(config, "context-window-chars", DEFAULT_CONTEXT_WINDOW_CHARS, minimum=0),
-            reserve_chars=_config_int(config, "context-reserve-chars", DEFAULT_CONTEXT_RESERVE_CHARS, minimum=0),
-            keep_recent_chars=_config_int(
+            window_tokens=window_tokens
+            if window_tokens is not None
+            else _config_token_value(
                 config,
-                "context-keep-recent-chars",
-                DEFAULT_CONTEXT_KEEP_RECENT_CHARS,
+                "context-window-tokens",
+                DEFAULT_CONTEXT_WINDOW_TOKENS,
                 minimum=0,
             ),
-            summary_chars=_config_int(config, "context-summary-chars", DEFAULT_CONTEXT_SUMMARY_CHARS, minimum=0),
+            reserve_tokens=_config_token_value(
+                config,
+                "context-reserve-tokens",
+                DEFAULT_CONTEXT_RESERVE_TOKENS,
+                minimum=0,
+            ),
+            keep_recent_tokens=_config_token_value(
+                config,
+                "context-keep-recent-tokens",
+                DEFAULT_CONTEXT_KEEP_RECENT_TOKENS,
+                minimum=0,
+            ),
+            summary_tokens=_config_token_value(
+                config,
+                "context-summary-tokens",
+                DEFAULT_CONTEXT_SUMMARY_TOKENS,
+                minimum=0,
+            ),
             history_fetch_limit=_config_int(
                 config,
                 "context-history-fetch-limit",
@@ -53,13 +97,13 @@ class ContextBudget:
 
     @property
     def enabled(self) -> bool:
-        return self.window_chars > 0
+        return self.window_tokens > 0
 
     @property
-    def input_chars(self) -> int:
+    def input_tokens(self) -> int:
         if not self.enabled:
             return 0
-        return max(self.window_chars - self.reserve_chars, 1)
+        return max(self.window_tokens - self.reserve_tokens, 1)
 
 
 @dataclass(frozen=True)
@@ -68,8 +112,8 @@ class ContextAssembly:
 
     messages: list[Message]
     compacted: bool
-    chars_before: int
-    chars_after: int
+    tokens_before: int
+    tokens_after: int
     summary_message: Message | None = None
 
 
@@ -84,7 +128,7 @@ class ContextAssembler:
     ):
         self.api = api
         self.ctx = ctx
-        self.budget = budget or ContextBudget.from_config(ctx.config)
+        self.budget = budget or ContextBudget.from_context(ctx)
 
     async def assemble(self) -> ContextAssembly:
         user_text = self.ctx.input.to_text()
@@ -118,7 +162,7 @@ class ContextAssembler:
             api=self.api,
             kb_ids=kb_ids,
             query_text=user_text,
-            top_k=5,
+            top_k=get_retrieval_top_k(self.ctx.config),
             rerank_model_id=rerank_model_id,
             rerank_top_k=rerank_top_k,
         )
@@ -163,24 +207,24 @@ class ContextCompactor:
         history = _copy_messages(history_messages)
         current = _copy_messages(current_messages)
         original_messages = prompt + history + current
-        chars_before = estimate_messages_chars(original_messages)
+        tokens_before = estimate_messages_tokens(original_messages)
 
-        if not self.budget.enabled or chars_before <= self.budget.input_chars:
+        if not self.budget.enabled or tokens_before <= self.budget.input_tokens:
             return ContextAssembly(
                 messages=original_messages,
                 compacted=False,
-                chars_before=chars_before,
-                chars_after=chars_before,
+                tokens_before=tokens_before,
+                tokens_after=tokens_before,
             )
 
-        history_budget = max(self.budget.input_chars - estimate_messages_chars(prompt + current), 0)
+        history_budget = max(self.budget.input_tokens - estimate_messages_tokens(prompt + current), 0)
         if not history or history_budget <= 0:
             messages = prompt + current
             return ContextAssembly(
                 messages=messages,
                 compacted=bool(history),
-                chars_before=chars_before,
-                chars_after=estimate_messages_chars(messages),
+                tokens_before=tokens_before,
+                tokens_after=estimate_messages_tokens(messages),
             )
 
         summary_budget = self._summary_budget(history_budget)
@@ -196,18 +240,18 @@ class ContextCompactor:
         return ContextAssembly(
             messages=messages,
             compacted=bool(omitted),
-            chars_before=chars_before,
-            chars_after=estimate_messages_chars(messages),
+            tokens_before=tokens_before,
+            tokens_after=estimate_messages_tokens(messages),
             summary_message=summary_message,
         )
 
     def _summary_budget(self, history_budget: int) -> int:
-        if self.budget.summary_chars <= 0:
+        if self.budget.summary_tokens <= 0:
             return 0
-        if history_budget > self.budget.keep_recent_chars:
-            return min(self.budget.summary_chars, history_budget - self.budget.keep_recent_chars)
-        if history_budget >= 120:
-            return min(self.budget.summary_chars, max(80, history_budget // 3))
+        if history_budget > self.budget.keep_recent_tokens:
+            return min(self.budget.summary_tokens, history_budget - self.budget.keep_recent_tokens)
+        if history_budget >= 30:
+            return min(self.budget.summary_tokens, max(20, history_budget // 3))
         return 0
 
     def _select_first_kept_index(self, history: list[Message], recent_budget: int) -> int:
@@ -217,12 +261,12 @@ class ContextCompactor:
         total = 0
         first_kept_index = len(history)
         for index in range(len(history) - 1, -1, -1):
-            message_chars = estimate_message_chars(history[index])
-            if first_kept_index < len(history) and total + message_chars > recent_budget:
+            message_tokens = estimate_message_tokens(history[index])
+            if first_kept_index < len(history) and total + message_tokens > recent_budget:
                 break
-            if first_kept_index == len(history) and message_chars > recent_budget:
+            if first_kept_index == len(history) and message_tokens > recent_budget:
                 break
-            total += message_chars
+            total += message_tokens
             first_kept_index = index
 
         return _move_cut_before_tool_result(history, first_kept_index)
@@ -231,7 +275,10 @@ class ContextCompactor:
         if not omitted or summary_budget <= 0:
             return None
 
-        summary = summarize_messages(omitted, summary_budget)
+        # TODO(compaction-state): after Host model usage metadata and summary
+        # storage land, replace this deterministic summary with a persisted
+        # checkpoint loaded through Host state/storage.
+        summary = summarize_messages(omitted, _tokens_to_chars(summary_budget))
         if not summary:
             return None
         return Message(role="system", content=summary)
@@ -281,6 +328,10 @@ def estimate_messages_chars(messages: list[Message]) -> int:
     return sum(estimate_message_chars(message) for message in messages)
 
 
+def estimate_messages_tokens(messages: list[Message]) -> int:
+    return sum(estimate_message_tokens(message) for message in messages)
+
+
 def estimate_message_chars(message: Message) -> int:
     chars = len(message.role) + 8
     chars += _content_chars(message.content)
@@ -294,6 +345,10 @@ def estimate_message_chars(message: Message) -> int:
             if tool_call.function:
                 chars += len(tool_call.function.name) + len(tool_call.function.arguments)
     return chars
+
+
+def estimate_message_tokens(message: Message) -> int:
+    return _chars_to_tokens(estimate_message_chars(message))
 
 
 def message_to_text(message: Message) -> str:
@@ -374,13 +429,61 @@ def _truncate_text(text: str, max_chars: int) -> str:
     return text[: max_chars - len(suffix)] + suffix
 
 
+def _runtime_context_window_tokens(metadata: dict[str, typing.Any]) -> int | None:
+    for key in (
+        "model_context_window_tokens",
+        "context_window_tokens",
+        "model_context_tokens",
+        "contextWindowTokens",
+        "context_window",
+    ):
+        value = metadata.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int) and value > 0:
+            return value
+
+    model = metadata.get("model")
+    if isinstance(model, dict):
+        for key in ("context_window_tokens", "contextWindowTokens", "context_window"):
+            value = model.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int) and value > 0:
+                return value
+
+    return None
+
+
+def _config_token_value(
+    config: dict[str, typing.Any],
+    key: str,
+    default: int | None,
+    *,
+    minimum: int,
+) -> int | None:
+    if key in config:
+        return _config_int(config, key, default, minimum=minimum)
+    return default
+
+
+def _chars_to_tokens(chars: int) -> int:
+    if chars <= 0:
+        return 0
+    return max(1, (chars + ESTIMATED_CHARS_PER_TOKEN - 1) // ESTIMATED_CHARS_PER_TOKEN)
+
+
+def _tokens_to_chars(tokens: int) -> int:
+    return max(tokens, 0) * ESTIMATED_CHARS_PER_TOKEN
+
+
 def _config_int(
     config: dict[str, typing.Any],
     key: str,
-    default: int,
+    default: int | None,
     *,
     minimum: int,
-) -> int:
+) -> int | None:
     value = config.get(key, default)
     if isinstance(value, bool):
         return default

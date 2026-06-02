@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import typing
 
+from pkg.tool_loop import DEFAULT_MAX_TOOL_ITERATIONS
+
 
 def parse_model_config(
     model_config: typing.Any,
@@ -86,10 +88,6 @@ def get_knowledge_base_ids(
     kb_ids: list[str] = []
 
     config_kbs = config.get("knowledge-bases", [])
-    if not config_kbs:
-        legacy_kb = config.get("knowledge-base", "")
-        if isinstance(legacy_kb, str) and legacy_kb and legacy_kb != "__none__":
-            config_kbs = [legacy_kb]
     if not isinstance(config_kbs, list):
         return kb_ids
 
@@ -122,3 +120,21 @@ def get_rerank_config(
         rerank_top_k = 5
 
     return rerank_model_id, rerank_top_k
+
+
+def get_retrieval_top_k(config: dict[str, typing.Any]) -> int:
+    """Get the number of retrieval results requested per knowledge base."""
+    return _positive_int(config.get("retrieval-top-k"), default=5)
+
+
+def get_max_tool_iterations(config: dict[str, typing.Any]) -> int:
+    """Get the maximum number of tool-call follow-up iterations."""
+    return _positive_int(config.get("max-tool-iterations"), default=DEFAULT_MAX_TOOL_ITERATIONS)
+
+
+def _positive_int(value: typing.Any, *, default: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return default
+    if value < 1:
+        return default
+    return value
