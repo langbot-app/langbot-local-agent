@@ -1,0 +1,211 @@
+"""Typed events and normalized tool calls for the local-agent loop."""
+
+from __future__ import annotations
+
+import json
+import typing
+from dataclasses import dataclass, field
+from enum import StrEnum
+
+from langbot_plugin.api.entities.builtin.provider.message import (
+    FunctionCall,
+    Message,
+    MessageChunk,
+    ToolCall,
+)
+
+
+class AgentLoopEventType(StrEnum):
+    AGENT_START = "agent_start"
+    AGENT_END = "agent_end"
+    TURN_START = "turn_start"
+    TURN_END = "turn_end"
+    MESSAGE_START = "message_start"
+    MESSAGE_UPDATE = "message_update"
+    MESSAGE_END = "message_end"
+    TOOL_EXECUTION_START = "tool_execution_start"
+    TOOL_EXECUTION_END = "tool_execution_end"
+    RUN_FAILED = "run_failed"
+
+
+class ModelTurnEventType(StrEnum):
+    MESSAGE_DELTA = "message_delta"
+    MESSAGE_END = "message_end"
+
+
+@dataclass(frozen=True)
+class ToolCallRequest:
+    """Provider-neutral tool call shape used by the agent loop."""
+
+    id: str
+    name: str
+    arguments: str
+    type: str = "function"
+
+    @classmethod
+    def from_raw(cls, raw: typing.Any) -> "ToolCallRequest":
+        if isinstance(raw, ToolCall):
+            return cls(
+                id=raw.id,
+                type=raw.type,
+                name=raw.function.name if raw.function else "",
+                arguments=raw.function.arguments if raw.function else "",
+            )
+
+        if isinstance(raw, dict):
+            function = raw.get("function")
+            if isinstance(function, dict):
+                name = function.get("name", "")
+                arguments = function.get("arguments", "")
+            else:
+                name = raw.get("function_name", "")
+                arguments = raw.get("function_arguments", "")
+
+            return cls(
+                id=str(raw.get("id") or hash(json.dumps(raw, sort_keys=True, default=str))),
+                type=str(raw.get("type") or "function"),
+                name=str(name or ""),
+                arguments=str(arguments or ""),
+            )
+
+        return cls(id=str(hash(str(raw))), name="", arguments="")
+
+    def to_tool_call(self) -> ToolCall:
+        return ToolCall(
+            id=self.id,
+            type=self.type,
+            function=FunctionCall(name=self.name, arguments=self.arguments),
+        )
+
+
+@dataclass(frozen=True)
+class PreparedToolCall:
+    request: ToolCallRequest
+    parameters: dict[str, typing.Any]
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class ToolExecutionOutcome:
+    request: ToolCallRequest
+    parameters: dict[str, typing.Any]
+    result: typing.Any = None
+    error: str | None = None
+    message: Message | None = None
+
+    @property
+    def is_error(self) -> bool:
+        return self.error is not None
+
+
+@dataclass(frozen=True)
+class ModelTurnResult:
+    message: Message
+    tool_calls: list[ToolCallRequest]
+    committed_model_id: str | None
+    visible_content: str = ""
+
+
+@dataclass(frozen=True)
+class ModelTurnEvent:
+    type: ModelTurnEventType
+    chunk: MessageChunk | None = None
+    result: ModelTurnResult | None = None
+
+    @classmethod
+    def message_delta(cls, chunk: MessageChunk) -> "ModelTurnEvent":
+        return cls(type=ModelTurnEventType.MESSAGE_DELTA, chunk=chunk)
+
+    @classmethod
+    def message_end(cls, result: ModelTurnResult) -> "ModelTurnEvent":
+        return cls(type=ModelTurnEventType.MESSAGE_END, result=result)
+
+
+@dataclass(frozen=True)
+class AgentLoopEvent:
+    type: AgentLoopEventType
+    message: Message | None = None
+    chunk: MessageChunk | None = None
+    tool_call_id: str | None = None
+    tool_name: str | None = None
+    parameters: dict[str, typing.Any] = field(default_factory=dict)
+    result: typing.Any = None
+    error: str | None = None
+    code: str | None = None
+    retryable: bool = False
+    tool_results: list[Message] = field(default_factory=list)
+    messages: list[Message] = field(default_factory=list)
+
+    @classmethod
+    def agent_start(cls) -> "AgentLoopEvent":
+        return cls(type=AgentLoopEventType.AGENT_START)
+
+    @classmethod
+    def agent_end(cls, messages: list[Message]) -> "AgentLoopEvent":
+        return cls(type=AgentLoopEventType.AGENT_END, messages=list(messages))
+
+    @classmethod
+    def turn_start(cls) -> "AgentLoopEvent":
+        return cls(type=AgentLoopEventType.TURN_START)
+
+    @classmethod
+    def turn_end(
+        cls,
+        message: Message,
+        tool_results: list[Message],
+    ) -> "AgentLoopEvent":
+        return cls(
+            type=AgentLoopEventType.TURN_END,
+            message=message,
+            tool_results=list(tool_results),
+        )
+
+    @classmethod
+    def message_start(cls, message: Message) -> "AgentLoopEvent":
+        return cls(type=AgentLoopEventType.MESSAGE_START, message=message)
+
+    @classmethod
+    def message_update(cls, chunk: MessageChunk) -> "AgentLoopEvent":
+        return cls(type=AgentLoopEventType.MESSAGE_UPDATE, chunk=chunk)
+
+    @classmethod
+    def message_end(cls, message: Message) -> "AgentLoopEvent":
+        return cls(type=AgentLoopEventType.MESSAGE_END, message=message)
+
+    @classmethod
+    def tool_execution_start(
+        cls,
+        request: ToolCallRequest,
+        parameters: dict[str, typing.Any],
+    ) -> "AgentLoopEvent":
+        return cls(
+            type=AgentLoopEventType.TOOL_EXECUTION_START,
+            tool_call_id=request.id,
+            tool_name=request.name,
+            parameters=dict(parameters),
+        )
+
+    @classmethod
+    def tool_execution_end(cls, outcome: ToolExecutionOutcome) -> "AgentLoopEvent":
+        return cls(
+            type=AgentLoopEventType.TOOL_EXECUTION_END,
+            tool_call_id=outcome.request.id,
+            tool_name=outcome.request.name,
+            parameters=dict(outcome.parameters),
+            result=outcome.result,
+            error=outcome.error,
+        )
+
+    @classmethod
+    def run_failed(
+        cls,
+        error: str,
+        code: str = "runner.error",
+        retryable: bool = False,
+    ) -> "AgentLoopEvent":
+        return cls(
+            type=AgentLoopEventType.RUN_FAILED,
+            error=error,
+            code=code,
+            retryable=retryable,
+        )

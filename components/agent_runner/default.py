@@ -10,7 +10,6 @@ Supports:
 
 from __future__ import annotations
 
-import json
 from typing import Any, AsyncGenerator
 
 from langbot_plugin.api.definition.components.agent_runner.runner import AgentRunner
@@ -20,45 +19,20 @@ from langbot_plugin.api.entities.builtin.agent_runner import (
     AgentRunnerPermissions,
     AgentRunResult,
 )
-from langbot_plugin.api.entities.builtin.provider.message import FunctionCall, Message, ToolCall
+from langbot_plugin.api.entities.builtin.provider.message import Message
 
+from pkg.agent_core import (
+    AgentLoop,
+    AgentLoopEvent,
+    AgentLoopEventType,
+    LangBotModelAdapter,
+    LangBotToolExecutor,
+)
 from pkg.config import get_knowledge_base_ids, get_rerank_config, parse_model_config
 from pkg.messages import build_messages, get_effective_prompt_config
-from pkg.model_calling import (
-    ModelCallError,
-    StreamingModelCaller,
-    build_llm_tools,
-    build_tool_call_message,
-    invoke_with_fallback,
-)
+from pkg.model_calling import build_llm_tools
 from pkg.rag import retrieve_from_knowledge_bases
-from pkg.tool_loop import (
-    DEFAULT_MAX_TOOL_ITERATIONS,
-    ToolCallLoop,
-)
-
-
-def _build_assistant_tool_call_message(
-    content: str,
-    tool_calls: list[dict[str, Any]],
-) -> Message:
-    """Build an assistant message that preserves tool call IDs for tool results."""
-    return Message(
-        role="assistant",
-        content=content,
-        tool_calls=[
-            ToolCall(
-                id=tc["id"],
-                type=tc.get("type", "function"),
-                function=FunctionCall(
-                    name=tc.get("function_name", ""),
-                    arguments=tc.get("function_arguments", ""),
-                ),
-            )
-            for tc in tool_calls
-        ],
-    )
-
+from pkg.tool_loop import DEFAULT_MAX_TOOL_ITERATIONS
 
 DEFAULT_HISTORY_LIMIT = 50
 
@@ -215,325 +189,102 @@ class DefaultAgentRunner(AgentRunner):
             use_streaming = ctx.runtime.metadata.get("streaming_supported", True)
 
         if use_streaming:
-            async for result in self._run_streaming(
+            async for result in self._run_agent_loop(
                 run_id=ctx.run_id,
                 api=api,
                 model_ids=model_ids,
                 messages=messages,
                 allowed_tools=allowed_tools,
+                streaming=True,
             ):
                 yield result
         else:
-            async for result in self._run_non_streaming(
+            async for result in self._run_agent_loop(
                 run_id=ctx.run_id,
                 api=api,
                 model_ids=model_ids,
                 messages=messages,
                 allowed_tools=allowed_tools,
+                streaming=False,
             ):
                 yield result
 
-    async def _run_streaming(
+    async def _run_agent_loop(
         self,
         run_id: str,
         api: Any,
         model_ids: list[str],
         messages: list[Message],
         allowed_tools: set[str],
+        streaming: bool,
     ) -> AsyncGenerator[AgentRunResult, None]:
-        """Run with streaming output and tool calling support."""
-        # Build LLM tools from allowed tool names
+        """Run the LangBot-native Pi-style agent loop."""
         llm_tools = await build_llm_tools(api, allowed_tools)
+        loop = AgentLoop(
+            model_adapter=LangBotModelAdapter(api),
+            tool_executor=LangBotToolExecutor(api, allowed_tools),
+            model_ids=model_ids,
+            messages=messages,
+            tools=llm_tools,
+            streaming=streaming,
+            max_tool_iterations=DEFAULT_MAX_TOOL_ITERATIONS,
+        )
 
-        try:
-            caller = StreamingModelCaller(
-                api=api,
-                model_ids=model_ids,
-                messages=messages,
-                tools=llm_tools,
-            )
-
-            # Stream LLM response
-            async for chunk, is_delta in caller.stream():
-                if chunk.content:  # Only yield non-empty chunks
-                    yield AgentRunResult.message_delta(run_id, chunk)
-
-            # Check for tool calls after streaming
-            tool_calls = caller.get_tool_calls()
-
-            if tool_calls:
-                # Run tool calling loop
-                committed_model_id = caller.get_committed_model_id()
-                if not committed_model_id:
-                    yield AgentRunResult.run_failed(
-                        run_id,
-                        error="No model committed for tool loop",
-                        code="runner.no_model",
-                    )
+        final_message: Message | None = None
+        async for event in loop.run():
+            result = self._loop_event_to_result(run_id, event, streaming=streaming)
+            if result is not None:
+                yield result
+                if result.type.value == "run.failed":
                     return
 
-                accumulated_content = caller.get_accumulated_content()
+            if (
+                not streaming
+                and event.type == AgentLoopEventType.MESSAGE_END
+                and event.message is not None
+                and event.message.role == "assistant"
+                and not event.message.tool_calls
+            ):
+                final_message = event.message
 
-                # Add assistant message with tool calls to messages
-                assistant_msg = _build_assistant_tool_call_message(
-                    accumulated_content,
-                    tool_calls,
-                )
-                updated_messages = messages + [assistant_msg]
+            if event.type == AgentLoopEventType.AGENT_END:
+                if not streaming and final_message is not None:
+                    yield AgentRunResult.message_completed(run_id, final_message)
+                yield AgentRunResult.run_completed(run_id, finish_reason="stop")
 
-                # Execute tool calls
-                tool_loop = ToolCallLoop(
-                    api=api,
-                    allowed_tools=allowed_tools,
-                    max_iterations=DEFAULT_MAX_TOOL_ITERATIONS,
-                )
-
-                pending_tool_calls = tool_calls
-                current_messages = updated_messages
-                visible_content_prefix = accumulated_content
-
-                while pending_tool_calls and tool_loop.check_iteration_limit():
-                    tool_loop.increment_iteration()
-
-                    # Execute each tool call
-                    for tool_call in pending_tool_calls:
-                        tool_call_id = tool_call.get("id", "")
-                        tool_name = tool_call.get("function_name", "")
-                        parameters = {}
-                        try:
-                            args_str = tool_call.get("function_arguments", "{}")
-                            parameters = json.loads(args_str) if args_str else {}
-                        except json.JSONDecodeError:
-                            parameters = {}
-
-                        # Yield tool.call.started
-                        yield AgentRunResult.tool_call_started(
-                            run_id,
-                            tool_call_id=tool_call_id,
-                            tool_name=tool_name,
-                            parameters=parameters,
-                        )
-
-                        # Execute tool
-                        result, error = await tool_loop.execute_tool_call(tool_call)
-
-                        # Yield tool.call.completed
-                        yield AgentRunResult.tool_call_completed(
-                            run_id,
-                            tool_call_id=tool_call_id,
-                            tool_name=tool_name,
-                            result=result,
-                            error=error,
-                        )
-
-                        # Build tool result message
-                        tool_msg = build_tool_call_message(
-                            tool_call_id, tool_name, error if error else result, is_error=bool(error)
-                        )
-                        current_messages.append(tool_msg)
-
-                    # Call LLM again with tool results
-                    try:
-                        tool_caller = StreamingModelCaller(
-                            api=api,
-                            model_ids=[committed_model_id],
-                            messages=current_messages,
-                            tools=llm_tools,
-                        )
-
-                        async for chunk, is_delta in tool_caller.stream():
-                            if chunk.content:
-                                chunk = chunk.model_copy(deep=True)
-                                if isinstance(chunk.content, str):
-                                    chunk.content = visible_content_prefix + chunk.content
-                                yield AgentRunResult.message_delta(run_id, chunk)
-
-                        # Check for more tool calls
-                        pending_tool_calls = tool_caller.get_tool_calls()
-                        visible_content_prefix += tool_caller.get_accumulated_content()
-                        if pending_tool_calls:
-                            # Update messages with assistant response
-                            current_messages.append(
-                                _build_assistant_tool_call_message(
-                                    tool_caller.get_accumulated_content(),
-                                    pending_tool_calls,
-                                )
-                            )
-
-                    except ModelCallError as e:
-                        yield AgentRunResult.run_failed(
-                            run_id,
-                            error=str(e),
-                            code="runner.tool_loop_error",
-                            retryable=e.retryable,
-                        )
-                        return
-
-                # Check if we hit iteration limit
-                if pending_tool_calls and not tool_loop.check_iteration_limit():
-                    yield AgentRunResult.run_failed(
-                        run_id,
-                        error=f"Tool call iteration limit reached ({DEFAULT_MAX_TOOL_ITERATIONS})",
-                        code="runner.tool_loop_limit",
-                    )
-                    return
-
-            # Successful completion
-            yield AgentRunResult.run_completed(run_id, finish_reason="stop")
-
-        except ModelCallError as e:
-            yield AgentRunResult.run_failed(
-                run_id,
-                error=str(e),
-                code="runner.llm_error",
-                retryable=e.retryable,
-            )
-        except Exception as e:
-            yield AgentRunResult.run_failed(
-                run_id,
-                error=str(e),
-                code="runner.error",
-            )
-
-    async def _run_non_streaming(
+    def _loop_event_to_result(
         self,
         run_id: str,
-        api: Any,
-        model_ids: list[str],
-        messages: list[Message],
-        allowed_tools: set[str],
-    ) -> AsyncGenerator[AgentRunResult, None]:
-        """Run with non-streaming output and tool calling support."""
-        # Build LLM tools from allowed tool names
-        llm_tools = await build_llm_tools(api, allowed_tools)
+        event: AgentLoopEvent,
+        *,
+        streaming: bool,
+    ) -> AgentRunResult | None:
+        if event.type == AgentLoopEventType.MESSAGE_UPDATE and streaming and event.chunk is not None:
+            return AgentRunResult.message_delta(run_id, event.chunk)
 
-        try:
-            # Non-streaming invocation with fallback
-            response, committed_model_id = await invoke_with_fallback(
-                api=api,
-                model_ids=model_ids,
-                messages=messages,
-                tools=llm_tools,
-            )
-
-            # Check for tool calls
-            tool_calls = response.tool_calls
-
-            if tool_calls:
-                # Convert to internal format
-                pending_tool_calls = [
-                    {
-                        "id": tc.id,
-                        "type": tc.type,
-                        "function_name": tc.function.name if tc.function else "",
-                        "function_arguments": tc.function.arguments if tc.function else "",
-                    }
-                    for tc in tool_calls
-                ]
-
-                current_messages = messages + [response]
-
-                # Execute tool calls in a loop
-                tool_loop = ToolCallLoop(
-                    api=api,
-                    allowed_tools=allowed_tools,
-                    max_iterations=DEFAULT_MAX_TOOL_ITERATIONS,
-                )
-
-                while pending_tool_calls and tool_loop.check_iteration_limit():
-                    tool_loop.increment_iteration()
-
-                    for tool_call in pending_tool_calls:
-                        tool_call_id = tool_call.get("id", "")
-                        tool_name = tool_call.get("function_name", "")
-                        parameters = {}
-                        try:
-                            args_str = tool_call.get("function_arguments", "{}")
-                            parameters = json.loads(args_str) if args_str else {}
-                        except json.JSONDecodeError:
-                            parameters = {}
-
-                        yield AgentRunResult.tool_call_started(
-                            run_id,
-                            tool_call_id=tool_call_id,
-                            tool_name=tool_name,
-                            parameters=parameters,
-                        )
-
-                        result, error = await tool_loop.execute_tool_call(tool_call)
-
-                        yield AgentRunResult.tool_call_completed(
-                            run_id,
-                            tool_call_id=tool_call_id,
-                            tool_name=tool_name,
-                            result=result,
-                            error=error,
-                        )
-
-                        tool_msg = build_tool_call_message(
-                            tool_call_id, tool_name, error if error else result, is_error=bool(error)
-                        )
-                        current_messages.append(tool_msg)
-
-                    # Call LLM again with tool results using the committed
-                    # model from the successful first call.
-                    try:
-                        response = await api.invoke_llm(
-                            llm_model_uuid=committed_model_id,
-                            messages=current_messages,
-                            funcs=llm_tools,
-                        )
-
-                        # Update pending tool calls
-                        if response.tool_calls:
-                            pending_tool_calls = [
-                                {
-                                    "id": tc.id,
-                                    "type": tc.type,
-                                    "function_name": tc.function.name if tc.function else "",
-                                    "function_arguments": tc.function.arguments if tc.function else "",
-                                }
-                                for tc in response.tool_calls
-                            ]
-                            current_messages.append(response)
-                        else:
-                            pending_tool_calls = None
-
-                    except Exception as e:
-                        yield AgentRunResult.run_failed(
-                            run_id,
-                            error=f"LLM call in tool loop failed: {e}",
-                            code="runner.tool_loop_error",
-                            retryable=True,
-                        )
-                        return
-
-                if pending_tool_calls and not tool_loop.check_iteration_limit():
-                    yield AgentRunResult.run_failed(
-                        run_id,
-                        error=f"Tool call iteration limit reached ({DEFAULT_MAX_TOOL_ITERATIONS})",
-                        code="runner.tool_loop_limit",
-                    )
-                    return
-
-                # Yield final message
-                yield AgentRunResult.message_completed(run_id, response)
-            else:
-                # No tool calls - yield completed message
-                yield AgentRunResult.message_completed(run_id, response)
-
-            yield AgentRunResult.run_completed(run_id, finish_reason="stop")
-
-        except ModelCallError as e:
-            yield AgentRunResult.run_failed(
+        if event.type == AgentLoopEventType.TOOL_EXECUTION_START and event.tool_call_id and event.tool_name:
+            return AgentRunResult.tool_call_started(
                 run_id,
-                error=str(e),
-                code="runner.llm_error",
-                retryable=e.retryable,
+                tool_call_id=event.tool_call_id,
+                tool_name=event.tool_name,
+                parameters=event.parameters,
             )
-        except Exception as e:
-            yield AgentRunResult.run_failed(
+
+        if event.type == AgentLoopEventType.TOOL_EXECUTION_END and event.tool_call_id and event.tool_name:
+            return AgentRunResult.tool_call_completed(
                 run_id,
-                error=str(e),
-                code="runner.error",
+                tool_call_id=event.tool_call_id,
+                tool_name=event.tool_name,
+                result=event.result,
+                error=event.error,
             )
+
+        if event.type == AgentLoopEventType.RUN_FAILED:
+            return AgentRunResult.run_failed(
+                run_id,
+                error=event.error or "Agent loop failed",
+                code=event.code or "runner.error",
+                retryable=event.retryable,
+            )
+
+        return None
