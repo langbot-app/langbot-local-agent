@@ -135,7 +135,7 @@ class ContextAssembler:
         rag_context = await self._retrieve_rag_context(user_text)
         history_messages = await self._get_history_messages()
 
-        prompt_messages = build_prompt_messages(get_effective_prompt_config(self.ctx))
+        prompt_messages = build_prompt_messages(await self._get_prompt_config())
         current_messages = []
         user_message = build_user_message(
             user_text=user_text,
@@ -150,6 +150,12 @@ class ContextAssembler:
             history_messages=history_messages,
             current_messages=current_messages,
         )
+
+    async def _get_prompt_config(self) -> list[dict[str, typing.Any]]:
+        available_apis = getattr(getattr(self.ctx, "context", None), "available_apis", None)
+        if bool(getattr(available_apis, "prompt_get", False)):
+            return await self.api.get_prompt()
+        return get_effective_prompt_config(self.ctx)
 
     async def _retrieve_rag_context(self, user_text: str) -> str:
         allowed_kb_ids = set(kb.kb_id for kb in self.api.get_allowed_knowledge_bases())
@@ -195,6 +201,20 @@ class ContextCompactor:
 
     def __init__(self, budget: ContextBudget):
         self.budget = budget
+
+    def compact_messages(self, messages: list[Message]) -> ContextAssembly:
+        """Compact an already-assembled runtime message list.
+
+        Initial assembly knows prompt/history/current boundaries. Follow-up turns
+        only have the loop's flat model context, so preserve leading prompt-like
+        messages and compact older runtime messages behind them.
+        """
+        prompt_messages, history_messages = _split_leading_prompt_messages(messages)
+        return self.compact(
+            prompt_messages=prompt_messages,
+            history_messages=history_messages,
+            current_messages=[],
+        )
 
     def compact(
         self,
@@ -394,6 +414,20 @@ def _message_from_transcript_item(item: dict[str, typing.Any], current_event_id:
 
 def _copy_messages(messages: list[Message]) -> list[Message]:
     return [message.model_copy(deep=True) for message in messages]
+
+
+def _split_leading_prompt_messages(messages: list[Message]) -> tuple[list[Message], list[Message]]:
+    prompt_messages: list[Message] = []
+    first_history_index = 0
+    for index, message in enumerate(messages):
+        if message.role not in {"system", "developer"}:
+            first_history_index = index
+            break
+        prompt_messages.append(message)
+    else:
+        first_history_index = len(messages)
+
+    return _copy_messages(prompt_messages), _copy_messages(messages[first_history_index:])
 
 
 def _content_chars(content: typing.Any) -> int:

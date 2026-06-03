@@ -71,6 +71,13 @@ spec:
       type: integer
       required: false
       default: 10
+    - name: max-tool-result-chars
+      label:
+        en_US: Max Tool Result Characters
+        zh_Hans: 最大工具结果字符数
+      type: integer
+      required: false
+      default: 20000
     - name: context-history-fetch-limit
       label:
         en_US: History Fetch Limit
@@ -111,6 +118,8 @@ spec:
     tool_calling: true
     knowledge_retrieval: true
     multimodal_input: true
+    skill_authoring: true
+    skill_injection: true
     event_context: true
     platform_api: false
     interrupt: false

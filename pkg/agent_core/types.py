@@ -121,6 +121,33 @@ class ModelTurnEvent:
         return cls(type=ModelTurnEventType.MESSAGE_END, result=result)
 
 
+class AgentLoopHooks:
+    """Async extension points for Pi-style loop lifecycle customization."""
+
+    async def prepare_model_turn(self, messages: list[Message]) -> list[Message]:
+        return [message.model_copy(deep=True) for message in messages]
+
+    async def recover_context_overflow(self, messages: list[Message], error: Exception) -> list[Message] | None:
+        return None
+
+    async def before_tool_call(self, prepared: PreparedToolCall) -> PreparedToolCall:
+        return prepared
+
+    async def after_tool_call(self, outcome: ToolExecutionOutcome) -> ToolExecutionOutcome:
+        return outcome
+
+    async def should_stop_after_turn(self, result: ModelTurnResult, messages: list[Message]) -> bool:
+        return False
+
+    async def prepare_next_turn(
+        self,
+        messages: list[Message],
+        result: ModelTurnResult,
+        tool_results: list[Message],
+    ) -> list[Message]:
+        return [message.model_copy(deep=True) for message in messages]
+
+
 @dataclass(frozen=True)
 class AgentLoopEvent:
     type: AgentLoopEventType

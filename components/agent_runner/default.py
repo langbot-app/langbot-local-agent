@@ -25,11 +25,12 @@ from pkg.agent_core import (
     AgentLoop,
     AgentLoopEvent,
     AgentLoopEventType,
+    LangBotContextHooks,
     LangBotModelAdapter,
     LangBotToolExecutor,
 )
-from pkg.config import get_max_tool_iterations, parse_model_config
-from pkg.context_pipeline import ContextAssembler
+from pkg.config import get_max_tool_iterations, get_max_tool_result_chars, parse_model_config
+from pkg.context_pipeline import ContextAssembler, ContextBudget
 from pkg.model_calling import build_llm_tools
 
 
@@ -53,6 +54,8 @@ class DefaultAgentRunner(AgentRunner):
             tool_calling=True,
             knowledge_retrieval=True,
             multimodal_input=True,
+            skill_authoring=True,
+            skill_injection=True,
             stateful_session=True,
         )
 
@@ -97,9 +100,11 @@ class DefaultAgentRunner(AgentRunner):
         # Get allowed tools for tool calling.
         allowed_tools = set(t.tool_name for t in api.get_allowed_tools())
         max_tool_iterations = get_max_tool_iterations(ctx.config)
+        max_tool_result_chars = get_max_tool_result_chars(ctx.config)
+        context_budget = ContextBudget.from_context(ctx)
 
         # Build the model context through the runner-owned context pipeline.
-        context_assembly = await ContextAssembler(api, ctx).assemble()
+        context_assembly = await ContextAssembler(api, ctx, budget=context_budget).assemble()
         messages = context_assembly.messages
 
         # Prefer host runtime capability so non-streaming adapters keep the
@@ -117,6 +122,8 @@ class DefaultAgentRunner(AgentRunner):
                 allowed_tools=allowed_tools,
                 streaming=True,
                 max_tool_iterations=max_tool_iterations,
+                max_tool_result_chars=max_tool_result_chars,
+                context_budget=context_budget,
             ):
                 yield result
         else:
@@ -128,6 +135,8 @@ class DefaultAgentRunner(AgentRunner):
                 allowed_tools=allowed_tools,
                 streaming=False,
                 max_tool_iterations=max_tool_iterations,
+                max_tool_result_chars=max_tool_result_chars,
+                context_budget=context_budget,
             ):
                 yield result
 
@@ -140,17 +149,20 @@ class DefaultAgentRunner(AgentRunner):
         allowed_tools: set[str],
         streaming: bool,
         max_tool_iterations: int,
+        max_tool_result_chars: int,
+        context_budget: ContextBudget,
     ) -> AsyncGenerator[AgentRunResult, None]:
         """Run the LangBot-native Pi-style agent loop."""
         llm_tools = await build_llm_tools(api, allowed_tools)
         loop = AgentLoop(
             model_adapter=LangBotModelAdapter(api),
-            tool_executor=LangBotToolExecutor(api, allowed_tools),
+            tool_executor=LangBotToolExecutor(api, allowed_tools, max_result_chars=max_tool_result_chars),
             model_ids=model_ids,
             messages=messages,
             tools=llm_tools,
             streaming=streaming,
             max_tool_iterations=max_tool_iterations,
+            hooks=LangBotContextHooks(context_budget),
         )
 
         final_message: Message | None = None

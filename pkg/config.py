@@ -6,6 +6,8 @@ import typing
 
 from pkg.tool_loop import DEFAULT_MAX_TOOL_ITERATIONS
 
+DEFAULT_MAX_TOOL_RESULT_CHARS = 20000
+
 
 def parse_model_config(
     model_config: typing.Any,
@@ -130,6 +132,11 @@ def get_retrieval_top_k(config: dict[str, typing.Any]) -> int:
 def get_max_tool_iterations(config: dict[str, typing.Any]) -> int:
     """Get the maximum number of tool-call follow-up iterations."""
     return _positive_int(config.get("max-tool-iterations"), default=DEFAULT_MAX_TOOL_ITERATIONS)
+
+
+def get_max_tool_result_chars(config: dict[str, typing.Any]) -> int:
+    """Get the maximum tool result characters injected into model messages."""
+    return _positive_int(config.get("max-tool-result-chars"), default=DEFAULT_MAX_TOOL_RESULT_CHARS)
 
 
 def _positive_int(value: typing.Any, *, default: int) -> int:

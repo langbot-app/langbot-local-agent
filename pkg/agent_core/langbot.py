@@ -9,6 +9,8 @@ from langbot_plugin.api.entities.builtin.provider.message import Message, Messag
 from langbot_plugin.api.entities.builtin.resource.tool import LLMTool
 from langbot_plugin.api.proxies.agent_run_api import AgentRunAPIProxy, PermissionDeniedError
 
+from pkg.config import DEFAULT_MAX_TOOL_RESULT_CHARS
+from pkg.context_pipeline import ContextBudget, ContextCompactor
 from pkg.model_calling import (
     ModelCallError,
     StreamingModelCaller,
@@ -17,6 +19,7 @@ from pkg.model_calling import (
 )
 
 from .types import (
+    AgentLoopHooks,
     ModelTurnEvent,
     ModelTurnResult,
     PreparedToolCall,
@@ -138,9 +141,11 @@ class LangBotToolExecutor:
         self,
         api: AgentRunAPIProxy,
         allowed_tools: set[str],
+        max_result_chars: int = DEFAULT_MAX_TOOL_RESULT_CHARS,
     ):
         self.api = api
         self.allowed_tools = allowed_tools
+        self.max_result_chars = max_result_chars
 
     def prepare(self, request: ToolCallRequest) -> PreparedToolCall:
         parameters: dict[str, typing.Any] = {}
@@ -198,6 +203,7 @@ class LangBotToolExecutor:
             prepared.request.name,
             error if error is not None else result,
             is_error=error is not None,
+            max_result_chars=self.max_result_chars,
         )
         return ToolExecutionOutcome(
             request=prepared.request,
@@ -205,4 +211,35 @@ class LangBotToolExecutor:
             result=result,
             error=error,
             message=message,
+        )
+
+
+class LangBotContextHooks(AgentLoopHooks):
+    """LangBot-specific loop hooks for Pi-style per-turn context management."""
+
+    def __init__(self, budget: ContextBudget):
+        self.budget = budget
+
+    async def prepare_model_turn(self, messages: list[Message]) -> list[Message]:
+        assembly = ContextCompactor(self.budget).compact_messages(messages)
+        return assembly.messages
+
+    async def recover_context_overflow(self, messages: list[Message], error: Exception) -> list[Message] | None:
+        is_overflow = error.is_context_overflow if isinstance(error, ModelCallError) else False
+        if not is_overflow or not self.budget.enabled:
+            return None
+
+        assembly = ContextCompactor(self._overflow_retry_budget()).compact_messages(messages)
+        if not assembly.compacted or assembly.tokens_after >= assembly.tokens_before:
+            return None
+        return assembly.messages
+
+    def _overflow_retry_budget(self) -> ContextBudget:
+        retry_input_tokens = max(1, (self.budget.input_tokens * 3) // 4)
+        return ContextBudget(
+            window_tokens=retry_input_tokens,
+            reserve_tokens=0,
+            keep_recent_tokens=min(self.budget.keep_recent_tokens, max(1, retry_input_tokens // 2)),
+            summary_tokens=min(self.budget.summary_tokens, max(0, retry_input_tokens // 4)),
+            history_fetch_limit=self.budget.history_fetch_limit,
         )

@@ -50,27 +50,31 @@ plugin components use.
 | rerank-model | rerank-model-selector | no | '' | Rerank model for improved retrieval |
 | rerank-top-k | integer | no | 5 | Top-K results after reranking |
 | max-tool-iterations | integer | no | 10 | Maximum tool-call follow-up iterations |
+| max-tool-result-chars | integer | no | 20000 | Maximum serialized tool result characters injected into the next model request |
 | context-history-fetch-limit | integer | no | 50 | Transcript messages pulled from the Host history API |
 | context-window-tokens | integer | no | 200000 | Approximate context window when Host model metadata is not available |
 | context-reserve-tokens | integer | no | 16384 | Tokens reserved for the model response and provider overhead |
 | context-keep-recent-tokens | integer | no | 20000 | Approximate recent history tokens to retain when compaction triggers |
 | context-summary-tokens | integer | no | 8000 | Maximum deterministic summary tokens inserted for compacted older history |
 
-`prompt` is the static binding default. When the run enters through the
-Pipeline adapter, LangBot passes the post-preprocessing effective prompt in
-`ctx.adapter.extra.prompt`; Local Agent uses that host effective prompt instead
-of the static default so `PromptPreProcessing` changes are preserved. If the
-adapter prompt is absent or invalid, Local Agent falls back to `ctx.config.prompt`.
-
-TODO: This Pipeline prompt handoff is a bridge for behavior parity with the old
-Pipeline-based local-agent path, not the final agent product contract. When
-Pipeline is replaced, LangBot should expose a Host-owned effective
-prompt/instruction package as a run-scoped pull API instead of pushing it
-through `ctx.adapter.extra.prompt`.
+`prompt` is the static binding default. When LangBot exposes
+`ctx.context.available_apis.prompt_get`, Local Agent pulls the
+post-preprocessing effective prompt through `AgentRunAPIProxy.get_prompt()` and
+uses it instead of the static default so `PromptPreProcessing` changes are
+preserved. If the prompt API is unavailable, Local Agent falls back to
+`ctx.config.prompt`.
 
 Legacy singular `knowledge-base` values must be normalized by LangBot
 configuration migration before runner execution. Local Agent only reads the
 manifest-defined `knowledge-bases` binding config.
+
+`max-tool-result-chars` is a runner-level safety fallback for model-facing tool
+messages. String results, serialized JSON results, and error results are bounded
+before they are appended as `role="tool"` messages for the next model request.
+Oversized content keeps the leading characters and appends a marker with the
+original and kept character counts. This does not implement Host artifact
+persistence yet; full-output references should move to Host artifact/storage APIs
+in a later phase when that API surface is available.
 
 ## Context Management
 
@@ -97,19 +101,25 @@ Local Agent currently uses a runner-owned context pipeline:
    replace older history with a `system` message containing
    `<conversation_summary>...</conversation_summary>` and keep a recent history
    tail bounded by `context-keep-recent-tokens`.
+5. Re-run the context transform before every model turn, including tool-call
+   follow-up turns, so tool results and assistant tool calls are budgeted before
+   the next provider request.
+6. If a provider fails before producing any streamed content with a
+   context-overflow style error, compact the current loop context with a more
+   aggressive retry budget and retry the model turn once before surfacing
+   `run.failed`.
 
 This is not `max-round` behavior. History is not selected by number of rounds;
 the runner budgets prompt, current input, summary, and recent history together,
-following the Pi-style context threshold shape. Future iterations can replace
-the deterministic summary generator with an LLM summary and persist compaction
-checkpoints through Host state/storage after LangBot exposes tokenizer/model
-usage metadata from the LiteLLM model-info work.
+following the Pi-style context threshold and per-turn transform shape. Future
+iterations can replace the deterministic summary generator with an LLM summary
+and persist compaction checkpoints through Host state/storage after LangBot
+exposes tokenizer/model usage metadata from the LiteLLM model-info work.
 
-Pipeline adapter data is intentionally narrow. Local Agent consumes
-`ctx.adapter.extra.prompt` for the host effective prompt, while new runner logic
-should otherwise prefer event-first context and Host APIs over adapter fields.
-That prompt bridge should be revisited when the agent runtime no longer enters
-through Pipeline.
+Pipeline adapter data is intentionally narrow. Local Agent does not consume
+`ctx.adapter.extra.prompt`; prompt handoff goes through the run-scoped Host
+prompt API when available. New runner logic should prefer event-first context
+and Host APIs over adapter fields.
 
 ## Host APIs Consumed
 
@@ -136,6 +146,8 @@ access unauthorized models, tools, knowledge bases, files, or storage.
 - `tool_calling`: yes
 - `knowledge_retrieval`: yes
 - `multimodal_input`: yes
+- `skill_authoring`: yes
+- `skill_injection`: yes
 - `event_context`: yes
 - `stateful_session`: yes
 

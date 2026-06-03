@@ -43,8 +43,10 @@ from langbot_plugin.api.entities.builtin.provider.message import (
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pkg.config import (
+    DEFAULT_MAX_TOOL_RESULT_CHARS,
     get_knowledge_base_ids,
     get_max_tool_iterations,
+    get_max_tool_result_chars,
     get_rerank_config,
     get_retrieval_top_k,
     parse_model_config,
@@ -58,6 +60,7 @@ from pkg.context_pipeline import (
     ContextCompactor,
 )
 from pkg.messages import build_messages, format_rag_results, get_effective_prompt_config
+from pkg.model_calling import TOOL_RESULT_TRUNCATION_MARKER, build_tool_call_message
 
 # ==================== Fixtures ====================
 
@@ -88,6 +91,7 @@ class FakeAgentRunAPIProxy:
         self.call_tool = AsyncMock()
         self.retrieve_knowledge = AsyncMock()
         self.invoke_rerank = AsyncMock()
+        self.get_prompt = AsyncMock(return_value=[])
         self.history_page = AsyncMock(
             return_value={
                 "items": [],
@@ -116,6 +120,7 @@ def make_context(
     runtime_metadata: dict[str, Any] | None = None,
     adapter_extra: dict[str, Any] | None = None,
     history_available: bool = False,
+    prompt_get: bool = False,
     conversation_id: str = "conv-test",
 ) -> AgentRunContext:
     """Create a test AgentRunContext."""
@@ -138,6 +143,7 @@ def make_context(
             available_apis=ContextAPICapabilities(
                 history_page=history_available,
                 history_search=history_available,
+                prompt_get=prompt_get,
             ),
         ),
         runtime=AgentRuntimeContext(query_id=1, metadata=runtime_metadata or {}),
@@ -300,6 +306,11 @@ class TestRunnerBehaviorConfig:
         assert get_max_tool_iterations({"max-tool-iterations": 2}) == 2
         assert get_max_tool_iterations({"max-tool-iterations": 0}) == 10
 
+    def test_max_tool_result_chars(self):
+        assert get_max_tool_result_chars({"max-tool-result-chars": 1234}) == 1234
+        assert get_max_tool_result_chars({"max-tool-result-chars": 0}) == DEFAULT_MAX_TOOL_RESULT_CHARS
+        assert get_max_tool_result_chars({"max-tool-result-chars": "1234"}) == DEFAULT_MAX_TOOL_RESULT_CHARS
+
 
 # ==================== Message Building Tests ====================
 
@@ -367,23 +378,14 @@ class TestBuildMessages:
 
         assert messages[0].content == "Static prompt"
 
-    def test_effective_prompt_prefers_host_adapter_prompt(self):
-        """Host effective prompt replaces static runner prompt."""
+    def test_effective_prompt_ignores_adapter_prompt(self):
+        """Adapter prompt shims are not part of the local-agent prompt contract."""
         ctx = make_context(
             config={"prompt": [{"role": "system", "content": "Static prompt"}]},
             adapter_extra={"prompt": [{"role": "system", "content": "Host effective prompt"}]},
         )
 
-        assert get_effective_prompt_config(ctx) == [{"role": "system", "content": "Host effective prompt"}]
-
-    def test_effective_prompt_allows_host_to_clear_prompt(self):
-        """An explicit empty host prompt should not fall back to static config."""
-        ctx = make_context(
-            config={"prompt": [{"role": "system", "content": "Static prompt"}]},
-            adapter_extra={"prompt": []},
-        )
-
-        assert get_effective_prompt_config(ctx) == []
+        assert get_effective_prompt_config(ctx) == [{"role": "system", "content": "Static prompt"}]
 
     def test_effective_prompt_falls_back_to_static_config_without_adapter_prompt(self):
         """Static runner config is still used outside Pipeline adapter prompt handoff."""
@@ -430,6 +432,62 @@ class TestBuildMessages:
         assert isinstance(messages[0].content, list)
         assert "<context>" in messages[0].content[0].text
         assert messages[0].content[1].type == "image_base64"
+
+
+class TestToolResultBounding:
+    """Tests for model-facing tool result bounding."""
+
+    def test_string_result_under_limit_is_not_truncated(self):
+        message = build_tool_call_message(
+            "call-1",
+            "echo",
+            "short result",
+            max_result_chars=20,
+        )
+
+        assert message.role == "tool"
+        assert message.tool_call_id == "call-1"
+        assert message.content == "short result"
+
+    def test_string_result_over_limit_keeps_head_and_marker(self):
+        message = build_tool_call_message(
+            "call-1",
+            "echo",
+            "abcdefghi",
+            max_result_chars=4,
+        )
+
+        assert message.content.startswith("abcd")
+        assert "efghi" not in message.content
+        assert TOOL_RESULT_TRUNCATION_MARKER in message.content
+        assert "original_chars=9" in message.content
+        assert "kept_chars=4" in message.content
+
+    def test_json_result_over_limit_is_serialized_and_truncated(self):
+        message = build_tool_call_message(
+            "call-json",
+            "json_tool",
+            {"items": ["alpha", "beta", "gamma"], "ok": True},
+            max_result_chars=18,
+        )
+
+        assert message.content.startswith('{"items": ["alpha')
+        assert TOOL_RESULT_TRUNCATION_MARKER in message.content
+        assert "original_chars=" in message.content
+        assert "kept_chars=18" in message.content
+
+    def test_error_result_over_limit_keeps_error_prefix_and_marker(self):
+        message = build_tool_call_message(
+            "call-error",
+            "failing_tool",
+            "permission denied: " + "x" * 40,
+            is_error=True,
+            max_result_chars=24,
+        )
+
+        assert message.content.startswith("Error: permission denied")
+        assert TOOL_RESULT_TRUNCATION_MARKER in message.content
+        assert "kept_chars=24" in message.content
 
 
 class TestContextCompaction:
@@ -510,6 +568,32 @@ class TestContextCompaction:
         assert "recent assistant sentinel" in contents
         assert contents[-1] == "current request"
 
+    def test_compactor_can_transform_flat_runtime_messages(self):
+        """Follow-up turns can compact the loop's already-assembled message list."""
+        messages = [
+            Message(role="system", content="Static prompt"),
+            Message(role="user", content="old user " + "u" * 500),
+            Message(role="assistant", content="old assistant " + "a" * 500),
+            Message(role="user", content="recent user sentinel"),
+            Message(role="assistant", content="recent assistant sentinel"),
+        ]
+        budget = ContextBudget(
+            window_tokens=180,
+            reserve_tokens=20,
+            keep_recent_tokens=80,
+            summary_tokens=40,
+        )
+
+        assembly = ContextCompactor(budget).compact_messages(messages)
+
+        assert assembly.compacted is True
+        assert assembly.messages[0].content == "Static prompt"
+        assert assembly.summary_message is not None
+        assert "<conversation_summary>" in assembly.summary_message.content
+        contents = [message.content for message in assembly.messages]
+        assert "recent user sentinel" in contents
+        assert "recent assistant sentinel" in contents
+
 
 class TestFormatRagResults:
     """Tests for RAG result formatting."""
@@ -561,6 +645,7 @@ class TestDefaultAgentRunner:
         assert "context-window-chars" not in config_names
         assert "retrieval-top-k" in config_names
         assert "max-tool-iterations" in config_names
+        assert "max-tool-result-chars" in config_names
 
     @pytest.fixture
     def runner(self):
@@ -688,11 +773,12 @@ class TestDefaultAgentRunner:
         ]
 
     @pytest.mark.asyncio
-    async def test_pipeline_effective_prompt_replaces_static_prompt(self, runner, monkeypatch):
-        """PromptPreProcessing output from Host is the model-facing prompt."""
+    async def test_prompt_get_replaces_static_prompt(self, runner, monkeypatch):
+        """PromptPreProcessing output from Host is pulled as the model-facing prompt."""
         fake_api = FakeAgentRunAPIProxy(
             models=[ModelResource(model_id="model-1")],
         )
+        fake_api.get_prompt = AsyncMock(return_value=[{"role": "system", "content": "Host effective prompt"}])
         captured_messages: list[Message] = []
 
         async def mock_stream(*args, **kwargs):
@@ -707,11 +793,9 @@ class TestDefaultAgentRunner:
                 "model": "model-1",
                 "prompt": [{"role": "system", "content": "Static prompt"}],
             },
-            adapter_extra={
-                "prompt": [{"role": "system", "content": "Host effective prompt"}],
-            },
             resources=AgentResources(models=[ModelResource(model_id="model-1")]),
             input_text="qa-effective-prompt",
+            prompt_get=True,
         )
 
         results = [result async for result in runner.run(ctx)]
@@ -721,6 +805,7 @@ class TestDefaultAgentRunner:
             ("system", "Host effective prompt"),
             ("user", "qa-effective-prompt"),
         ]
+        fake_api.get_prompt.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_context_compaction_runs_before_model_call(self, runner, monkeypatch):
@@ -797,6 +882,161 @@ class TestDefaultAgentRunner:
         assert "recent user sentinel" in contents
         assert "recent assistant sentinel" in contents
         assert contents[-1] == "current compact request"
+
+    @pytest.mark.asyncio
+    async def test_follow_up_turn_context_is_transformed_after_tool_results(self, runner, monkeypatch):
+        """Tool follow-up turns re-run context compaction before the next model call."""
+        fake_api = FakeAgentRunAPIProxy(
+            models=[ModelResource(model_id="model-1")],
+            tools=[ToolResource(tool_name="allowed_tool")],
+        )
+        fake_api.history_page = AsyncMock(
+            return_value={
+                "items": [
+                    {
+                        "event_id": "evt-run-follow-up",
+                        "role": "user",
+                        "content": "current tool request",
+                    },
+                    {
+                        "event_id": "evt-old-assistant",
+                        "role": "assistant",
+                        "content": "old assistant " + "a" * 500,
+                    },
+                    {
+                        "event_id": "evt-old-user",
+                        "role": "user",
+                        "content": "old user " + "u" * 500,
+                    },
+                ],
+                "next_cursor": None,
+                "prev_cursor": None,
+                "has_more": False,
+            }
+        )
+        fake_api.call_tool = AsyncMock(return_value="tool result " + "x" * 300)
+        captured_turn_messages: list[list[Message]] = []
+
+        async def mock_stream(*args, **kwargs):
+            captured_turn_messages.append([message.model_copy(deep=True) for message in kwargs["messages"]])
+            if len(captured_turn_messages) == 1:
+                yield MessageChunk(
+                    role="assistant",
+                    content="",
+                    is_final=True,
+                    tool_calls=[
+                        ToolCall(
+                            id="call-1",
+                            type="function",
+                            function=FunctionCall(name="allowed_tool", arguments="{}"),
+                        )
+                    ],
+                )
+            else:
+                yield MessageChunk(role="assistant", content="Done", is_final=True)
+
+        fake_api.invoke_llm_stream = mock_stream
+        monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
+
+        ctx = make_context(
+            run_id="run-follow-up-transform",
+            config={
+                "model": "model-1",
+                "context-window-tokens": 360,
+                "context-reserve-tokens": 40,
+                "context-keep-recent-tokens": 120,
+                "context-summary-tokens": 40,
+                "max-tool-result-chars": 400,
+            },
+            resources=AgentResources(
+                models=[ModelResource(model_id="model-1")],
+                tools=[ToolResource(tool_name="allowed_tool")],
+            ),
+            input_text="current tool request",
+            history_available=True,
+        )
+
+        results = [result async for result in runner.run(ctx)]
+
+        assert any(r.type == AgentRunResultType.RUN_COMPLETED for r in results)
+        assert len(captured_turn_messages) == 2
+        assert not any(
+            isinstance(message.content, str) and "<conversation_summary>" in message.content
+            for message in captured_turn_messages[0]
+        )
+        assert any(
+            isinstance(message.content, str) and "<conversation_summary>" in message.content
+            for message in captured_turn_messages[1]
+        )
+        assert any(message.role == "tool" for message in captured_turn_messages[1])
+
+    @pytest.mark.asyncio
+    async def test_streaming_context_overflow_compacts_and_retries_before_failure(self, runner, monkeypatch):
+        """Provider context overflow before first token triggers a compacted retry."""
+        fake_api = FakeAgentRunAPIProxy(
+            models=[ModelResource(model_id="model-1")],
+        )
+        fake_api.history_page = AsyncMock(
+            return_value={
+                "items": [
+                    {
+                        "event_id": "evt-run-overflow",
+                        "role": "user",
+                        "content": "current overflow request",
+                    },
+                    {
+                        "event_id": "evt-old-assistant",
+                        "role": "assistant",
+                        "content": "old assistant " + "a" * 500,
+                    },
+                    {
+                        "event_id": "evt-old-user",
+                        "role": "user",
+                        "content": "old user " + "u" * 500,
+                    },
+                ],
+                "next_cursor": None,
+                "prev_cursor": None,
+                "has_more": False,
+            }
+        )
+        captured_turn_messages: list[list[Message]] = []
+
+        async def mock_stream(*args, **kwargs):
+            captured_turn_messages.append([message.model_copy(deep=True) for message in kwargs["messages"]])
+            if len(captured_turn_messages) == 1:
+                raise Exception("context length exceeded")
+            yield MessageChunk(role="assistant", content="Recovered", is_final=True)
+
+        fake_api.invoke_llm_stream = mock_stream
+        monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
+
+        ctx = make_context(
+            run_id="run-overflow-retry",
+            config={
+                "model": "model-1",
+                "context-window-tokens": 360,
+                "context-reserve-tokens": 40,
+                "context-keep-recent-tokens": 120,
+                "context-summary-tokens": 40,
+            },
+            resources=AgentResources(models=[ModelResource(model_id="model-1")]),
+            input_text="current overflow request",
+            history_available=True,
+        )
+
+        results = [result async for result in runner.run(ctx)]
+
+        assert any(r.type == AgentRunResultType.RUN_COMPLETED for r in results)
+        assert len(captured_turn_messages) == 2
+        assert not any(
+            isinstance(message.content, str) and "<conversation_summary>" in message.content
+            for message in captured_turn_messages[0]
+        )
+        assert any(
+            isinstance(message.content, str) and "<conversation_summary>" in message.content
+            for message in captured_turn_messages[1]
+        )
 
     @pytest.mark.asyncio
     async def test_streaming_skips_none_chunks(self, runner, monkeypatch):
@@ -982,6 +1222,58 @@ class TestDefaultAgentRunner:
         assert started[0].data.get("tool_name") == "allowed_tool"
         assert len(completed) == 1
         assert completed[0].data.get("error") is None  # No error
+
+    @pytest.mark.asyncio
+    async def test_tool_result_is_bounded_before_follow_up_model_call(self, runner, monkeypatch):
+        """Large tool output is truncated only for the next model request."""
+        fake_api = FakeAgentRunAPIProxy(
+            models=[ModelResource(model_id="model-1")],
+            tools=[ToolResource(tool_name="allowed_tool")],
+        )
+        captured_turn_messages: list[list[Message]] = []
+
+        async def mock_stream(*args, **kwargs):
+            captured_turn_messages.append([message.model_copy(deep=True) for message in kwargs["messages"]])
+            if len(captured_turn_messages) == 1:
+                yield MessageChunk(
+                    role="assistant",
+                    content="",
+                    is_final=True,
+                    tool_calls=[
+                        ToolCall(
+                            id="call-1",
+                            type="function",
+                            function=FunctionCall(name="allowed_tool", arguments="{}"),
+                        )
+                    ],
+                )
+            else:
+                yield MessageChunk(role="assistant", content="Done", is_final=True)
+
+        fake_api.invoke_llm_stream = mock_stream
+        fake_api.call_tool = AsyncMock(return_value="x" * 25)
+        monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
+
+        ctx = make_context(
+            config={"model": "model-1", "max-tool-result-chars": 8},
+            resources=AgentResources(
+                models=[ModelResource(model_id="model-1")],
+                tools=[ToolResource(tool_name="allowed_tool")],
+            ),
+        )
+
+        results = [result async for result in runner.run(ctx)]
+
+        assert len(captured_turn_messages) == 2
+        tool_messages = [message for message in captured_turn_messages[1] if message.role == "tool"]
+        assert len(tool_messages) == 1
+        assert tool_messages[0].content.startswith("x" * 8)
+        assert TOOL_RESULT_TRUNCATION_MARKER in tool_messages[0].content
+        assert "original_chars=25" in tool_messages[0].content
+        assert "kept_chars=8" in tool_messages[0].content
+
+        completed = [r for r in results if r.type == AgentRunResultType.TOOL_CALL_COMPLETED]
+        assert completed[0].data.get("result") == "x" * 25
 
     @pytest.mark.asyncio
     async def test_authorized_tool_detail_is_fetched_and_passed_to_model(self, runner, monkeypatch):

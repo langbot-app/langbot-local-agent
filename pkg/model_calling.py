@@ -9,13 +9,41 @@ from langbot_plugin.api.entities.builtin.provider.message import Message, Messag
 from langbot_plugin.api.entities.builtin.resource.tool import LLMTool
 from langbot_plugin.api.proxies.agent_run_api import AgentRunAPIProxy
 
+from pkg.config import DEFAULT_MAX_TOOL_RESULT_CHARS
+
+TOOL_RESULT_TRUNCATION_MARKER = "tool result truncated"
+CONTEXT_OVERFLOW_PATTERNS = (
+    "context length",
+    "context window",
+    "context too long",
+    "maximum context",
+    "max context",
+    "too many tokens",
+    "token limit",
+    "tokens exceed",
+    "prompt is too long",
+)
+
 
 class ModelCallError(Exception):
     """Error during model invocation."""
 
-    def __init__(self, message: str, retryable: bool = False):
+    def __init__(self, message: str, retryable: bool = False, code: str | None = None):
         super().__init__(message)
         self.retryable = retryable
+        self.code = code
+
+    @property
+    def is_context_overflow(self) -> bool:
+        if self.code == "context_overflow":
+            return True
+        return is_context_overflow_error(self)
+
+
+def is_context_overflow_error(error: Exception) -> bool:
+    """Best-effort provider-neutral context overflow detection."""
+    text = str(error).lower()
+    return any(pattern in text for pattern in CONTEXT_OVERFLOW_PATTERNS)
 
 
 async def build_llm_tools(
@@ -287,6 +315,7 @@ def build_tool_call_message(
     tool_name: str,
     result: typing.Any,
     is_error: bool = False,
+    max_result_chars: int = DEFAULT_MAX_TOOL_RESULT_CHARS,
 ) -> Message:
     """Build a tool result message.
 
@@ -295,20 +324,54 @@ def build_tool_call_message(
         tool_name: Name of the tool that was called
         result: Tool execution result
         is_error: Whether the result is an error
+        max_result_chars: Maximum result content characters before fallback truncation
 
     Returns:
         Message with role="tool" containing the result
     """
-    content: str
-    if is_error:
-        content = f"Error: {result}"
-    elif isinstance(result, str):
-        content = result
-    else:
-        content = json.dumps(result, ensure_ascii=False)
+    content = bound_tool_result_content(
+        result,
+        is_error=is_error,
+        max_result_chars=max_result_chars,
+    )
 
     return Message(
         role="tool",
         content=content,
         tool_call_id=tool_call_id,
     )
+
+
+def bound_tool_result_content(
+    result: typing.Any,
+    *,
+    is_error: bool = False,
+    max_result_chars: int = DEFAULT_MAX_TOOL_RESULT_CHARS,
+) -> str:
+    """Serialize and bound a tool result for model-facing tool messages."""
+    content = serialize_tool_result_content(result, is_error=is_error)
+    if isinstance(max_result_chars, bool) or not isinstance(max_result_chars, int) or max_result_chars < 1:
+        max_result_chars = DEFAULT_MAX_TOOL_RESULT_CHARS
+
+    original_chars = len(content)
+    if original_chars <= max_result_chars:
+        return content
+
+    kept_content = content[:max_result_chars]
+    marker = (
+        "\n\n"
+        f"[{TOOL_RESULT_TRUNCATION_MARKER}: original_chars={original_chars}, "
+        f"kept_chars={len(kept_content)}. "
+        "Only the leading content is included. Host artifact persistence is not available yet; "
+        "persisted full-output references are a future Host-storage phase.]"
+    )
+    return kept_content + marker
+
+
+def serialize_tool_result_content(result: typing.Any, *, is_error: bool = False) -> str:
+    """Serialize a raw tool result into provider tool-message content."""
+    if is_error:
+        return f"Error: {result}"
+    if isinstance(result, str):
+        return result
+    return json.dumps(result, ensure_ascii=False, default=str)

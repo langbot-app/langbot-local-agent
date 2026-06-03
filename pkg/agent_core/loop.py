@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import typing
 
 from langbot_plugin.api.entities.builtin.provider.message import Message
@@ -10,7 +11,14 @@ from langbot_plugin.api.entities.builtin.resource.tool import LLMTool
 from pkg.model_calling import ModelCallError
 
 from .langbot import LangBotModelAdapter, LangBotToolExecutor
-from .types import AgentLoopEvent, ModelTurnEventType, ModelTurnResult
+from .types import (
+    AgentLoopEvent,
+    AgentLoopHooks,
+    ModelTurnEventType,
+    ModelTurnResult,
+    PreparedToolCall,
+    ToolExecutionOutcome,
+)
 
 
 class AgentLoop:
@@ -30,6 +38,7 @@ class AgentLoop:
         tools: list[LLMTool],
         streaming: bool,
         max_tool_iterations: int,
+        hooks: AgentLoopHooks | None = None,
     ):
         self.model_adapter = model_adapter
         self.tool_executor = tool_executor
@@ -38,6 +47,7 @@ class AgentLoop:
         self.tools = list(tools)
         self.streaming = streaming
         self.max_tool_iterations = max_tool_iterations
+        self.hooks = hooks or AgentLoopHooks()
 
     async def run(self) -> typing.AsyncGenerator[AgentLoopEvent, None]:
         if self.streaming:
@@ -48,6 +58,69 @@ class AgentLoop:
         async for event in self._run_non_streaming():
             yield event
 
+    async def _execute_prepared_tool_call(
+        self,
+        index: int,
+        prepared: PreparedToolCall,
+    ) -> tuple[int, ToolExecutionOutcome]:
+        outcome = await self.tool_executor.execute(prepared)
+        outcome = await self.hooks.after_tool_call(outcome)
+        return index, outcome
+
+    async def _prepare_model_turn(self) -> None:
+        messages = await self.hooks.prepare_model_turn(self.messages)
+        self.messages = [message.model_copy(deep=True) for message in messages]
+
+    async def _recover_context_overflow(self, error: ModelCallError) -> bool:
+        messages = await self.hooks.recover_context_overflow(self.messages, error)
+        if messages is None:
+            return False
+        self.messages = [message.model_copy(deep=True) for message in messages]
+        return True
+
+    async def _execute_tool_batch(
+        self,
+        pending_tool_calls: typing.Iterable[typing.Any],
+        last_model_turn: ModelTurnResult | None,
+    ) -> typing.AsyncGenerator[AgentLoopEvent, None]:
+        prepared_calls: list[PreparedToolCall] = []
+        for tool_call in pending_tool_calls:
+            prepared = self.tool_executor.prepare(tool_call)
+            prepared = await self.hooks.before_tool_call(prepared)
+            prepared_calls.append(prepared)
+            yield AgentLoopEvent.tool_execution_start(tool_call, prepared.parameters)
+
+        tasks = [
+            asyncio.create_task(self._execute_prepared_tool_call(index, prepared))
+            for index, prepared in enumerate(prepared_calls)
+        ]
+        outcomes_by_source_order: list[ToolExecutionOutcome | None] = [None] * len(tasks)
+
+        try:
+            for completed in asyncio.as_completed(tasks):
+                index, outcome = await completed
+                outcomes_by_source_order[index] = outcome
+                yield AgentLoopEvent.tool_execution_end(outcome)
+        except Exception:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+        tool_results: list[Message] = []
+        for outcome in outcomes_by_source_order:
+            if outcome is None or outcome.message is None:
+                continue
+            self.messages.append(outcome.message)
+            tool_results.append(outcome.message)
+            yield AgentLoopEvent.message_start(outcome.message)
+            yield AgentLoopEvent.message_end(outcome.message)
+
+        if last_model_turn is not None:
+            yield AgentLoopEvent.turn_end(last_model_turn.message, tool_results)
+            messages = await self.hooks.prepare_next_turn(self.messages, last_model_turn, tool_results)
+            self.messages = [message.model_copy(deep=True) for message in messages]
+
     async def _run_streaming(self) -> typing.AsyncGenerator[AgentLoopEvent, None]:
         yield AgentLoopEvent.agent_start()
 
@@ -55,7 +128,7 @@ class AgentLoop:
         pending_tool_calls = None
         visible_content_prefix = ""
         tool_iterations = 0
-        last_assistant_message: Message | None = None
+        last_model_turn: ModelTurnResult | None = None
 
         while True:
             if pending_tool_calls is not None:
@@ -66,21 +139,9 @@ class AgentLoop:
                     )
                     return
 
-                tool_results: list[Message] = []
                 tool_iterations += 1
-                for tool_call in pending_tool_calls:
-                    prepared = self.tool_executor.prepare(tool_call)
-                    yield AgentLoopEvent.tool_execution_start(tool_call, prepared.parameters)
-                    outcome = await self.tool_executor.execute(prepared)
-                    yield AgentLoopEvent.tool_execution_end(outcome)
-                    if outcome.message is not None:
-                        self.messages.append(outcome.message)
-                        tool_results.append(outcome.message)
-                        yield AgentLoopEvent.message_start(outcome.message)
-                        yield AgentLoopEvent.message_end(outcome.message)
-
-                if last_assistant_message is not None:
-                    yield AgentLoopEvent.turn_end(last_assistant_message, tool_results)
+                async for event in self._execute_tool_batch(pending_tool_calls, last_model_turn):
+                    yield event
 
             if committed_model_id is None:
                 turn_model_ids = self.model_ids
@@ -90,24 +151,37 @@ class AgentLoop:
             yield AgentLoopEvent.turn_start()
             yield AgentLoopEvent.message_start(Message(role="assistant", content=""))
 
-            try:
-                model_turn: ModelTurnResult | None = None
-                async for model_event in self.model_adapter.stream_turn(
-                    model_ids=turn_model_ids,
-                    messages=self.messages,
-                    tools=self.tools,
-                    visible_prefix=visible_content_prefix,
-                ):
-                    if model_event.type == ModelTurnEventType.MESSAGE_DELTA and model_event.chunk is not None:
-                        yield AgentLoopEvent.message_update(model_event.chunk)
-                    elif model_event.type == ModelTurnEventType.MESSAGE_END and model_event.result is not None:
-                        model_turn = model_event.result
-            except ModelCallError as e:
-                yield AgentLoopEvent.run_failed(str(e), code="runner.llm_error", retryable=e.retryable)
-                return
-            except Exception as e:
-                yield AgentLoopEvent.run_failed(str(e), code="runner.error")
-                return
+            context_retry_used = False
+            while True:
+                stream_started = False
+                try:
+                    await self._prepare_model_turn()
+                    model_turn: ModelTurnResult | None = None
+                    async for model_event in self.model_adapter.stream_turn(
+                        model_ids=turn_model_ids,
+                        messages=self.messages,
+                        tools=self.tools,
+                        visible_prefix=visible_content_prefix,
+                    ):
+                        if model_event.type == ModelTurnEventType.MESSAGE_DELTA and model_event.chunk is not None:
+                            stream_started = True
+                            yield AgentLoopEvent.message_update(model_event.chunk)
+                        elif model_event.type == ModelTurnEventType.MESSAGE_END and model_event.result is not None:
+                            model_turn = model_event.result
+                    break
+                except ModelCallError as e:
+                    if (
+                        not stream_started
+                        and not context_retry_used
+                        and await self._recover_context_overflow(e)
+                    ):
+                        context_retry_used = True
+                        continue
+                    yield AgentLoopEvent.run_failed(str(e), code="runner.llm_error", retryable=e.retryable)
+                    return
+                except Exception as e:
+                    yield AgentLoopEvent.run_failed(str(e), code="runner.error")
+                    return
 
             if model_turn is None:
                 yield AgentLoopEvent.run_failed("Model stream ended without a final message", code="runner.llm_error")
@@ -115,8 +189,13 @@ class AgentLoop:
 
             committed_model_id = model_turn.committed_model_id or committed_model_id
             self.messages.append(model_turn.message)
-            last_assistant_message = model_turn.message
+            last_model_turn = model_turn
             yield AgentLoopEvent.message_end(model_turn.message)
+
+            if await self.hooks.should_stop_after_turn(model_turn, self.messages):
+                yield AgentLoopEvent.turn_end(model_turn.message, [])
+                yield AgentLoopEvent.agent_end(self.messages)
+                return
 
             pending_tool_calls = model_turn.tool_calls
             if not pending_tool_calls:
@@ -132,7 +211,7 @@ class AgentLoop:
         committed_model_id: str | None = None
         pending_tool_calls = None
         tool_iterations = 0
-        last_assistant_message: Message | None = None
+        last_model_turn: ModelTurnResult | None = None
 
         while True:
             if pending_tool_calls is not None:
@@ -143,49 +222,49 @@ class AgentLoop:
                     )
                     return
 
-                tool_results: list[Message] = []
                 tool_iterations += 1
-                for tool_call in pending_tool_calls:
-                    prepared = self.tool_executor.prepare(tool_call)
-                    yield AgentLoopEvent.tool_execution_start(tool_call, prepared.parameters)
-                    outcome = await self.tool_executor.execute(prepared)
-                    yield AgentLoopEvent.tool_execution_end(outcome)
-                    if outcome.message is not None:
-                        self.messages.append(outcome.message)
-                        tool_results.append(outcome.message)
-                        yield AgentLoopEvent.message_start(outcome.message)
-                        yield AgentLoopEvent.message_end(outcome.message)
-
-                if last_assistant_message is not None:
-                    yield AgentLoopEvent.turn_end(last_assistant_message, tool_results)
+                async for event in self._execute_tool_batch(pending_tool_calls, last_model_turn):
+                    yield event
 
             yield AgentLoopEvent.turn_start()
             yield AgentLoopEvent.message_start(Message(role="assistant", content=""))
 
-            try:
-                if committed_model_id is None:
-                    model_turn = await self.model_adapter.invoke_turn(
-                        model_ids=self.model_ids,
-                        messages=self.messages,
-                        tools=self.tools,
-                    )
-                else:
-                    model_turn = await self.model_adapter.invoke_committed_turn(
-                        committed_model_id=committed_model_id,
-                        messages=self.messages,
-                        tools=self.tools,
-                    )
-            except ModelCallError as e:
-                yield AgentLoopEvent.run_failed(str(e), code="runner.llm_error", retryable=e.retryable)
-                return
-            except Exception as e:
-                yield AgentLoopEvent.run_failed(str(e), code="runner.error")
-                return
+            context_retry_used = False
+            while True:
+                try:
+                    await self._prepare_model_turn()
+                    if committed_model_id is None:
+                        model_turn = await self.model_adapter.invoke_turn(
+                            model_ids=self.model_ids,
+                            messages=self.messages,
+                            tools=self.tools,
+                        )
+                    else:
+                        model_turn = await self.model_adapter.invoke_committed_turn(
+                            committed_model_id=committed_model_id,
+                            messages=self.messages,
+                            tools=self.tools,
+                        )
+                    break
+                except ModelCallError as e:
+                    if not context_retry_used and await self._recover_context_overflow(e):
+                        context_retry_used = True
+                        continue
+                    yield AgentLoopEvent.run_failed(str(e), code="runner.llm_error", retryable=e.retryable)
+                    return
+                except Exception as e:
+                    yield AgentLoopEvent.run_failed(str(e), code="runner.error")
+                    return
 
             committed_model_id = model_turn.committed_model_id or committed_model_id
             self.messages.append(model_turn.message)
-            last_assistant_message = model_turn.message
+            last_model_turn = model_turn
             yield AgentLoopEvent.message_end(model_turn.message)
+
+            if await self.hooks.should_stop_after_turn(model_turn, self.messages):
+                yield AgentLoopEvent.turn_end(model_turn.message, [])
+                yield AgentLoopEvent.agent_end(self.messages)
+                return
 
             pending_tool_calls = model_turn.tool_calls
             if not pending_tool_calls:
