@@ -29,9 +29,14 @@ from pkg.agent_core import (
     LangBotModelAdapter,
     LangBotToolExecutor,
 )
-from pkg.config import get_max_tool_iterations, get_max_tool_result_chars, parse_model_config
+from pkg.config import (
+    get_max_tool_iterations,
+    get_max_tool_result_artifact_bytes,
+    get_max_tool_result_chars,
+    parse_model_config,
+)
 from pkg.context_pipeline import ContextAssembler, ContextBudget
-from pkg.model_calling import build_llm_tools
+from pkg.model_calling import INTERNAL_ARTIFACT_READ_TOOL_NAME, build_artifact_read_tool, build_llm_tools
 
 
 class DefaultAgentRunner(AgentRunner):
@@ -67,6 +72,7 @@ class DefaultAgentRunner(AgentRunner):
             tools=["detail", "call"],
             knowledge_bases=["list", "retrieve"],
             history=["page", "search"],
+            artifacts=["metadata", "read"],
         )
 
     async def run(self, ctx: AgentRunContext) -> AsyncGenerator[AgentRunResult, None]:
@@ -99,8 +105,12 @@ class DefaultAgentRunner(AgentRunner):
 
         # Get allowed tools for tool calling.
         allowed_tools = set(t.tool_name for t in api.get_allowed_tools())
+        artifact_read_available = bool(getattr(ctx.context.available_apis, "artifact_read", False))
+        if artifact_read_available:
+            allowed_tools.add(INTERNAL_ARTIFACT_READ_TOOL_NAME)
         max_tool_iterations = get_max_tool_iterations(ctx.config)
         max_tool_result_chars = get_max_tool_result_chars(ctx.config)
+        max_tool_result_artifact_bytes = get_max_tool_result_artifact_bytes(ctx.config)
         context_budget = ContextBudget.from_context(ctx)
 
         # Build the model context through the runner-owned context pipeline.
@@ -123,7 +133,9 @@ class DefaultAgentRunner(AgentRunner):
                 streaming=True,
                 max_tool_iterations=max_tool_iterations,
                 max_tool_result_chars=max_tool_result_chars,
+                max_tool_result_artifact_bytes=max_tool_result_artifact_bytes,
                 context_budget=context_budget,
+                artifact_read_available=artifact_read_available,
             ):
                 yield result
         else:
@@ -136,7 +148,9 @@ class DefaultAgentRunner(AgentRunner):
                 streaming=False,
                 max_tool_iterations=max_tool_iterations,
                 max_tool_result_chars=max_tool_result_chars,
+                max_tool_result_artifact_bytes=max_tool_result_artifact_bytes,
                 context_budget=context_budget,
+                artifact_read_available=artifact_read_available,
             ):
                 yield result
 
@@ -150,13 +164,24 @@ class DefaultAgentRunner(AgentRunner):
         streaming: bool,
         max_tool_iterations: int,
         max_tool_result_chars: int,
+        max_tool_result_artifact_bytes: int,
         context_budget: ContextBudget,
+        artifact_read_available: bool,
     ) -> AsyncGenerator[AgentRunResult, None]:
         """Run the LangBot-native Pi-style agent loop."""
-        llm_tools = await build_llm_tools(api, allowed_tools)
+        host_tool_names = {tool_name for tool_name in allowed_tools if tool_name != INTERNAL_ARTIFACT_READ_TOOL_NAME}
+        llm_tools = await build_llm_tools(api, host_tool_names)
+        if artifact_read_available:
+            llm_tools.append(build_artifact_read_tool())
         loop = AgentLoop(
             model_adapter=LangBotModelAdapter(api),
-            tool_executor=LangBotToolExecutor(api, allowed_tools, max_result_chars=max_tool_result_chars),
+            tool_executor=LangBotToolExecutor(
+                api,
+                allowed_tools,
+                max_result_chars=max_tool_result_chars,
+                max_artifact_bytes=max_tool_result_artifact_bytes,
+                artifact_read_available=artifact_read_available,
+            ),
             model_ids=model_ids,
             messages=messages,
             tools=llm_tools,
@@ -167,6 +192,20 @@ class DefaultAgentRunner(AgentRunner):
 
         final_message: Message | None = None
         async for event in loop.run():
+            if event.type == AgentLoopEventType.TOOL_EXECUTION_END and event.artifact is not None:
+                artifact = event.artifact
+                yield AgentRunResult.artifact_created(
+                    run_id,
+                    artifact_id=artifact.artifact_id,
+                    artifact_type=artifact.artifact_type,
+                    mime_type=artifact.mime_type,
+                    name=artifact.name,
+                    size_bytes=artifact.size_bytes,
+                    sha256=artifact.sha256,
+                    metadata=artifact.metadata,
+                    content_base64=artifact.content_base64,
+                )
+
             result = self._loop_event_to_result(run_id, event, streaming=streaming)
             if result is not None:
                 yield result

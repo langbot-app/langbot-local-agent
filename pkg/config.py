@@ -7,6 +7,7 @@ import typing
 from pkg.tool_loop import DEFAULT_MAX_TOOL_ITERATIONS
 
 DEFAULT_MAX_TOOL_RESULT_CHARS = 20000
+DEFAULT_MAX_TOOL_RESULT_ARTIFACT_BYTES = 1_048_576
 
 
 def parse_model_config(
@@ -137,6 +138,14 @@ def get_max_tool_iterations(config: dict[str, typing.Any]) -> int:
 def get_max_tool_result_chars(config: dict[str, typing.Any]) -> int:
     """Get the maximum tool result characters injected into model messages."""
     return _positive_int(config.get("max-tool-result-chars"), default=DEFAULT_MAX_TOOL_RESULT_CHARS)
+
+
+def get_max_tool_result_artifact_bytes(config: dict[str, typing.Any]) -> int:
+    """Get the maximum inline artifact payload bytes emitted by the runner."""
+    return _positive_int(
+        config.get("max-tool-result-artifact-bytes"),
+        default=DEFAULT_MAX_TOOL_RESULT_ARTIFACT_BYTES,
+    )
 
 
 def _positive_int(value: typing.Any, *, default: int) -> int:

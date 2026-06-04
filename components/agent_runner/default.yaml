@@ -78,6 +78,13 @@ spec:
       type: integer
       required: false
       default: 20000
+    - name: max-tool-result-artifact-bytes
+      label:
+        en_US: Max Tool Result Artifact Bytes
+        zh_Hans: 最大工具结果 Artifact 字节数
+      type: integer
+      required: false
+      default: 1048576
     - name: context-history-fetch-limit
       label:
         en_US: History Fetch Limit
@@ -129,6 +136,7 @@ spec:
     tools: ["detail", "call"]
     knowledge_bases: ["list", "retrieve"]
     history: ["page", "search"]
+    artifacts: ["metadata", "read"]
     storage: ["plugin"]
     files: ["config", "knowledge"]
     platform_api: []

@@ -51,6 +51,7 @@ plugin components use.
 | rerank-top-k | integer | no | 5 | Top-K results after reranking |
 | max-tool-iterations | integer | no | 10 | Maximum tool-call follow-up iterations |
 | max-tool-result-chars | integer | no | 20000 | Maximum serialized tool result characters injected into the next model request |
+| max-tool-result-artifact-bytes | integer | no | 1048576 | Maximum inline artifact payload bytes emitted by the runner for oversized tool text results |
 | context-history-fetch-limit | integer | no | 50 | Transcript messages pulled from the Host history API |
 | context-window-tokens | integer | no | 200000 | Approximate context window when Host model metadata is not available |
 | context-reserve-tokens | integer | no | 16384 | Tokens reserved for the model response and provider overhead |
@@ -71,10 +72,22 @@ manifest-defined `knowledge-bases` binding config.
 `max-tool-result-chars` is a runner-level safety fallback for model-facing tool
 messages. String results, serialized JSON results, and error results are bounded
 before they are appended as `role="tool"` messages for the next model request.
-Oversized content keeps the leading characters and appends a marker with the
-original and kept character counts. This does not implement Host artifact
-persistence yet; full-output references should move to Host artifact/storage APIs
-in a later phase when that API surface is available.
+When Host exposes `ctx.context.available_apis.artifact_read`, oversized
+non-error tool results are emitted as Host `artifact.created` results and the
+model receives only an artifact reference plus a bounded preview. Follow-up
+reads go through the runner-owned `langbot_artifact_read` tool, which calls
+`AgentRunAPIProxy.artifact_read()`. This inline artifact path is capped by
+`max-tool-result-artifact-bytes`; if artifact reads are unavailable or the
+serialized result exceeds that byte cap, Local Agent falls back to a bounded
+preview event and does not emit a full-result payload. Large files should be
+returned by sandbox tools as Host artifact/file references, not inline file
+content.
+
+When a sandbox or Host tool already returns explicit `artifact_refs`,
+`artifact_id`, `file_refs`, `file_key`, or `file_id` fields, Local Agent treats
+those as authoritative references. It does not create another runner artifact
+for the same tool result; if the surrounding result is large, the model and Host
+events receive the references plus a bounded preview only.
 
 ## Context Management
 
@@ -126,6 +139,15 @@ and Host APIs over adapter fields.
 Model, tool, knowledge-base, artifact, history, event, state, and storage access
 go through `AgentRunAPIProxy`. LangBot validates these calls with the current
 `run_id`, runner permissions, resource policy, and caller plugin identity.
+
+Local Agent must not expose the runner process filesystem as an agent
+capability. In sandboxed deployments, file access is mediated by Host/sandbox
+tools registered in `ctx.resources.tools`; the model can request those tools,
+and the runner invokes them through `AgentRunAPIProxy.call_tool()`. "Local" here
+means the agent loop runs locally as a LangBot plugin, not that the model can
+read or write arbitrary files on the runner machine. The manifest `files`
+permission is limited to Host-authorized config/knowledge file resources, not
+general local filesystem access.
 
 Typical local-agent usage:
 

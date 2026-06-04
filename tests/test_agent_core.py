@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from unittest.mock import AsyncMock
 
 import pytest
@@ -18,7 +19,7 @@ from pkg.agent_core import (
     ModelTurnResult,
     ToolCallRequest,
 )
-from pkg.model_calling import ModelCallError
+from pkg.model_calling import INTERNAL_ARTIFACT_READ_TOOL_NAME, ModelCallError
 
 
 async def _collect_events(loop: AgentLoop):
@@ -96,6 +97,47 @@ async def test_streaming_loop_emits_turn_message_and_tool_events():
     ]
     assert deltas == ["Checking", "CheckingDone"]
     api.call_tool.assert_awaited_once_with(tool_name="allowed_tool", parameters={"arg": "value"})
+
+
+@pytest.mark.asyncio
+async def test_artifact_read_tool_uses_host_artifact_api_not_tool_call():
+    class FakeAPI:
+        def __init__(self):
+            self.call_tool = AsyncMock()
+            self.artifact_read = AsyncMock(
+                return_value={
+                    "artifact_id": "artifact-1",
+                    "mime_type": "text/plain; charset=utf-8",
+                    "size_bytes": 11,
+                    "offset": 2,
+                    "length": 5,
+                    "has_more": True,
+                    "content_base64": base64.b64encode("hello".encode("utf-8")).decode("ascii"),
+                }
+            )
+
+    api = FakeAPI()
+    executor = LangBotToolExecutor(
+        api,
+        {INTERNAL_ARTIFACT_READ_TOOL_NAME},
+        artifact_read_available=True,
+    )
+    prepared = executor.prepare(
+        ToolCallRequest(
+            id="call-artifact",
+            name=INTERNAL_ARTIFACT_READ_TOOL_NAME,
+            arguments='{"artifact_id": "artifact-1", "offset": 2, "limit": 5}',
+        )
+    )
+
+    outcome = await executor.execute(prepared)
+
+    assert outcome.error is None
+    assert outcome.result["artifact_id"] == "artifact-1"
+    assert outcome.result["text"] == "hello"
+    assert outcome.result["has_more"] is True
+    api.artifact_read.assert_awaited_once_with(artifact_id="artifact-1", offset=2, limit=5)
+    api.call_tool.assert_not_awaited()
 
 
 @pytest.mark.asyncio

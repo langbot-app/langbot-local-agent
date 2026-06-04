@@ -12,6 +12,7 @@ from .types import (
     PreparedToolCall,
     ToolCallRequest,
     ToolExecutionOutcome,
+    ToolResultArtifact,
 )
 
 __all__ = [
@@ -28,4 +29,5 @@ __all__ = [
     "PreparedToolCall",
     "ToolCallRequest",
     "ToolExecutionOutcome",
+    "ToolResultArtifact",
 ]

@@ -2,20 +2,28 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import typing
+import uuid
 
 from langbot_plugin.api.entities.builtin.provider.message import Message, MessageChunk
 from langbot_plugin.api.entities.builtin.resource.tool import LLMTool
 from langbot_plugin.api.proxies.agent_run_api import AgentRunAPIProxy, PermissionDeniedError
 
-from pkg.config import DEFAULT_MAX_TOOL_RESULT_CHARS
+from pkg.config import DEFAULT_MAX_TOOL_RESULT_ARTIFACT_BYTES, DEFAULT_MAX_TOOL_RESULT_CHARS
 from pkg.context_pipeline import ContextBudget, ContextCompactor
 from pkg.model_calling import (
+    INTERNAL_ARTIFACT_READ_TOOL_NAME,
     ModelCallError,
     StreamingModelCaller,
+    build_tool_artifact_message,
     build_tool_call_message,
+    build_tool_reference_message,
+    extract_tool_result_references,
     invoke_with_fallback,
+    serialize_tool_result_content,
 )
 
 from .types import (
@@ -25,6 +33,7 @@ from .types import (
     PreparedToolCall,
     ToolCallRequest,
     ToolExecutionOutcome,
+    ToolResultArtifact,
 )
 
 
@@ -142,10 +151,14 @@ class LangBotToolExecutor:
         api: AgentRunAPIProxy,
         allowed_tools: set[str],
         max_result_chars: int = DEFAULT_MAX_TOOL_RESULT_CHARS,
+        max_artifact_bytes: int = DEFAULT_MAX_TOOL_RESULT_ARTIFACT_BYTES,
+        artifact_read_available: bool = False,
     ):
         self.api = api
         self.allowed_tools = allowed_tools
         self.max_result_chars = max_result_chars
+        self.max_artifact_bytes = max_artifact_bytes
+        self.artifact_read_available = artifact_read_available
 
     def prepare(self, request: ToolCallRequest) -> PreparedToolCall:
         parameters: dict[str, typing.Any] = {}
@@ -181,10 +194,13 @@ class LangBotToolExecutor:
             return self.finalize(prepared, result=None, error=prepared.error)
 
         try:
-            result = await self.api.call_tool(
-                tool_name=prepared.request.name,
-                parameters=prepared.parameters,
-            )
+            if prepared.request.name == INTERNAL_ARTIFACT_READ_TOOL_NAME:
+                result = await self._read_artifact(prepared.parameters)
+            else:
+                result = await self.api.call_tool(
+                    tool_name=prepared.request.name,
+                    parameters=prepared.parameters,
+                )
             return self.finalize(prepared, result=result, error=None)
         except PermissionDeniedError as e:
             return self.finalize(prepared, result=None, error=str(e))
@@ -198,6 +214,80 @@ class LangBotToolExecutor:
         result: typing.Any,
         error: str | None,
     ) -> ToolExecutionOutcome:
+        event_result: typing.Any = None
+        if error is None:
+            references = extract_tool_result_references(result)
+            if references["artifact_refs"] or references["file_refs"]:
+                message, event_result = build_tool_reference_message(
+                    prepared.request.id,
+                    result=result,
+                    references=references,
+                    max_result_chars=self.max_result_chars,
+                )
+                return ToolExecutionOutcome(
+                    request=prepared.request,
+                    parameters=prepared.parameters,
+                    result=result,
+                    event_result=event_result,
+                    error=None,
+                    message=message,
+                )
+
+            content = serialize_tool_result_content(result, is_error=False)
+            if len(content) > self.max_result_chars:
+                preview = content[: self.max_result_chars]
+                content_bytes = content.encode("utf-8")
+                if self.artifact_read_available and len(content_bytes) <= self.max_artifact_bytes:
+                    artifact = self._build_tool_result_artifact(prepared, content, content_bytes=content_bytes)
+                    message = build_tool_artifact_message(
+                        prepared.request.id,
+                        artifact_ref=artifact.to_reference(),
+                        preview=preview,
+                        original_chars=len(content),
+                        kept_chars=len(preview),
+                    )
+                    event_result = {
+                        "type": "langbot_tool_result_artifact",
+                        "artifact": artifact.to_reference(),
+                        "original_chars": len(content),
+                        "kept_preview_chars": len(preview),
+                    }
+                    return ToolExecutionOutcome(
+                        request=prepared.request,
+                        parameters=prepared.parameters,
+                        result=result,
+                        event_result=event_result,
+                        error=None,
+                        message=message,
+                        artifact=artifact,
+                    )
+
+                message = build_tool_call_message(
+                    prepared.request.id,
+                    prepared.request.name,
+                    result,
+                    is_error=False,
+                    max_result_chars=self.max_result_chars,
+                )
+                reason = "artifact_too_large" if self.artifact_read_available else "artifact_read_unavailable"
+                event_result = {
+                    "type": "langbot_tool_result_preview",
+                    "truncated": True,
+                    "reason": reason,
+                    "original_chars": len(content),
+                    "original_bytes": len(content_bytes),
+                    "kept_preview_chars": len(preview),
+                    "preview": preview,
+                }
+                return ToolExecutionOutcome(
+                    request=prepared.request,
+                    parameters=prepared.parameters,
+                    result=result,
+                    event_result=event_result,
+                    error=None,
+                    message=message,
+                )
+
         message = build_tool_call_message(
             prepared.request.id,
             prepared.request.name,
@@ -209,8 +299,62 @@ class LangBotToolExecutor:
             request=prepared.request,
             parameters=prepared.parameters,
             result=result,
+            event_result=event_result,
             error=error,
             message=message,
+        )
+
+    async def _read_artifact(self, parameters: dict[str, typing.Any]) -> dict[str, typing.Any]:
+        if not self.artifact_read_available:
+            raise PermissionDeniedError("Artifact read API is not available for this run")
+
+        artifact_id = str(parameters.get("artifact_id") or "").strip()
+        if not artifact_id:
+            raise ValueError("artifact_id is required")
+
+        offset = _non_negative_int(parameters.get("offset"), default=0)
+        limit = min(_positive_int(parameters.get("limit"), default=8000), 20_000)
+        result = await self.api.artifact_read(artifact_id=artifact_id, offset=offset, limit=limit)
+
+        content_base64 = result.get("content_base64")
+        text: str | None = None
+        if isinstance(content_base64, str) and content_base64:
+            text = base64.b64decode(content_base64).decode("utf-8", errors="replace")
+
+        return {
+            "artifact_id": result.get("artifact_id", artifact_id),
+            "mime_type": result.get("mime_type"),
+            "size_bytes": result.get("size_bytes"),
+            "offset": result.get("offset", offset),
+            "length": result.get("length"),
+            "has_more": bool(result.get("has_more", False)),
+            "text": text,
+            "file_key": result.get("file_key"),
+        }
+
+    def _build_tool_result_artifact(
+        self,
+        prepared: PreparedToolCall,
+        content: str,
+        *,
+        content_bytes: bytes | None = None,
+    ) -> ToolResultArtifact:
+        if content_bytes is None:
+            content_bytes = content.encode("utf-8")
+        artifact_id = f"tool-result-{uuid.uuid4().hex}"
+        return ToolResultArtifact(
+            artifact_id=artifact_id,
+            artifact_type="tool_result",
+            mime_type="text/plain; charset=utf-8",
+            name=f"{prepared.request.name}-{prepared.request.id}.txt",
+            size_bytes=len(content_bytes),
+            sha256=hashlib.sha256(content_bytes).hexdigest(),
+            content_base64=base64.b64encode(content_bytes).decode("ascii"),
+            metadata={
+                "tool_name": prepared.request.name,
+                "tool_call_id": prepared.request.id,
+                "stored_by": "langbot-local-agent",
+            },
         )
 
 
@@ -243,3 +387,15 @@ class LangBotContextHooks(AgentLoopHooks):
             summary_tokens=min(self.budget.summary_tokens, max(0, retry_input_tokens // 4)),
             history_fetch_limit=self.budget.history_fetch_limit,
         )
+
+
+def _non_negative_int(value: typing.Any, *, default: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return default
+    return value
+
+
+def _positive_int(value: typing.Any, *, default: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return default
+    return value

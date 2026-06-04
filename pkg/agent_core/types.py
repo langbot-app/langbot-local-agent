@@ -86,12 +86,38 @@ class PreparedToolCall:
 
 
 @dataclass(frozen=True)
+class ToolResultArtifact:
+    artifact_id: str
+    artifact_type: str
+    mime_type: str
+    name: str
+    size_bytes: int
+    sha256: str
+    content_base64: str
+    metadata: dict[str, typing.Any] = field(default_factory=dict)
+
+    def to_reference(self) -> dict[str, typing.Any]:
+        return {
+            "type": "langbot_artifact_ref",
+            "artifact_id": self.artifact_id,
+            "artifact_type": self.artifact_type,
+            "mime_type": self.mime_type,
+            "name": self.name,
+            "size_bytes": self.size_bytes,
+            "sha256": self.sha256,
+            "metadata": dict(self.metadata),
+        }
+
+
+@dataclass(frozen=True)
 class ToolExecutionOutcome:
     request: ToolCallRequest
     parameters: dict[str, typing.Any]
     result: typing.Any = None
+    event_result: typing.Any = None
     error: str | None = None
     message: Message | None = None
+    artifact: ToolResultArtifact | None = None
 
     @property
     def is_error(self) -> bool:
@@ -158,6 +184,7 @@ class AgentLoopEvent:
     parameters: dict[str, typing.Any] = field(default_factory=dict)
     result: typing.Any = None
     error: str | None = None
+    artifact: ToolResultArtifact | None = None
     code: str | None = None
     retryable: bool = False
     tool_results: list[Message] = field(default_factory=list)
@@ -219,8 +246,9 @@ class AgentLoopEvent:
             tool_call_id=outcome.request.id,
             tool_name=outcome.request.name,
             parameters=dict(outcome.parameters),
-            result=outcome.result,
+            result=outcome.event_result if outcome.event_result is not None else outcome.result,
             error=outcome.error,
+            artifact=outcome.artifact,
         )
 
     @classmethod
