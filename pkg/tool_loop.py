@@ -2,4 +2,4 @@
 
 from __future__ import annotations
 
-DEFAULT_MAX_TOOL_ITERATIONS = 10
+DEFAULT_MAX_TOOL_ITERATIONS = 20

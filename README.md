@@ -49,7 +49,7 @@ plugin components use.
 | retrieval-top-k | integer | no | 5 | Retrieval results requested per knowledge base |
 | rerank-model | rerank-model-selector | no | '' | Rerank model for improved retrieval |
 | rerank-top-k | integer | no | 5 | Top-K results after reranking |
-| max-tool-iterations | integer | no | 10 | Maximum tool-call follow-up iterations |
+| max-tool-iterations | integer | no | 20 | Maximum tool-call follow-up iterations |
 | max-tool-result-chars | integer | no | 20000 | Maximum serialized tool result characters injected into the next model request |
 | max-tool-result-artifact-bytes | integer | no | 1048576 | Maximum inline artifact payload bytes emitted by the runner for oversized tool text results |
 | context-history-fetch-limit | integer | no | 50 | Transcript messages pulled from the Host history API |

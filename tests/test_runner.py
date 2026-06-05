@@ -45,6 +45,7 @@ from langbot_plugin.api.entities.builtin.provider.message import (
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pkg.config import (
+    DEFAULT_MAX_TOOL_ITERATIONS,
     DEFAULT_MAX_TOOL_RESULT_ARTIFACT_BYTES,
     DEFAULT_MAX_TOOL_RESULT_CHARS,
     get_knowledge_base_ids,
@@ -317,7 +318,7 @@ class TestRunnerBehaviorConfig:
 
     def test_max_tool_iterations(self):
         assert get_max_tool_iterations({"max-tool-iterations": 2}) == 2
-        assert get_max_tool_iterations({"max-tool-iterations": 0}) == 10
+        assert get_max_tool_iterations({"max-tool-iterations": 0}) == DEFAULT_MAX_TOOL_ITERATIONS
 
     def test_max_tool_result_chars(self):
         assert get_max_tool_result_chars({"max-tool-result-chars": 1234}) == 1234
@@ -669,6 +670,10 @@ class TestDefaultAgentRunner:
         assert "max-tool-iterations" in config_names
         assert "max-tool-result-chars" in config_names
         assert "max-tool-result-artifact-bytes" in config_names
+        max_tool_iterations = next(
+            item for item in manifest["spec"]["config"] if item["name"] == "max-tool-iterations"
+        )
+        assert max_tool_iterations["default"] == DEFAULT_MAX_TOOL_ITERATIONS
 
     @pytest.fixture
     def runner(self):
