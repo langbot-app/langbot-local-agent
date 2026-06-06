@@ -16,9 +16,8 @@ def parse_model_config(
 ) -> list[str]:
     """Parse model configuration into ordered list of model IDs.
 
-    Supports two formats:
-    - Legacy string format: "model_uuid"
-    - New dict format: {"primary": "...", "fallbacks": [...]}
+    Supports the Protocol v1 model-fallback-selector shape:
+    {"primary": "...", "fallbacks": [...]}
 
     Filters out models not in allowed_model_ids.
 
@@ -35,14 +34,6 @@ def parse_model_config(
     if model_config is None:
         return candidates
 
-    # Legacy string format
-    if isinstance(model_config, str):
-        model_id = _normalize_model_id(model_config)
-        if model_id and model_id in allowed_model_ids:
-            candidates.append(model_id)
-        return candidates
-
-    # New dict format
     if isinstance(model_config, dict):
         # Primary model
         primary = model_config.get("primary")

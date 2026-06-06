@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import typing
+import uuid
 
 from langbot_plugin.api.entities.builtin.provider.message import Message, MessageChunk
 from langbot_plugin.api.entities.builtin.resource.tool import LLMTool
@@ -27,6 +29,8 @@ CONTEXT_OVERFLOW_PATTERNS = (
     "tokens exceed",
     "prompt is too long",
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ModelCallError(Exception):
@@ -71,21 +75,21 @@ async def build_llm_tools(
     for tool_name in allowed_tools:
         try:
             detail = await api.get_tool_detail(tool_name)
-            description = detail.get('description', '')
+            description = detail.get("description", "")
 
             async def _placeholder_func(**kwargs):
                 return kwargs
 
             tool = LLMTool(
-                name=detail.get('name', tool_name),
+                name=detail.get("name", tool_name),
                 human_desc=description,
                 description=description,
-                parameters=detail.get('parameters', {}),
+                parameters=detail.get("parameters", {}),
                 func=_placeholder_func,
             )
             tools.append(tool)
         except Exception:
-            # Tool detail fetch failed - skip this tool
+            logger.warning("Tool detail fetch failed; skipping tool: %s", tool_name, exc_info=True)
             continue
 
     return tools
@@ -197,6 +201,8 @@ class StreamingModelCaller:
         self._committed_model_id: str | None = None
         self._accumulated_content = ""
         self._tool_calls_map: dict[str, dict[str, typing.Any]] = {}
+        self._tool_call_id_keys: dict[str, str] = {}
+        self._tool_call_position_keys: dict[str, str] = {}
         self._msg_idx = 0
         self._msg_sequence = 0
 
@@ -295,20 +301,23 @@ class StreamingModelCaller:
 
         # Accumulate tool calls
         if raw_chunk.tool_calls:
-            for tc in raw_chunk.tool_calls:
-                tc_id = tc.id
-                if tc_id not in self._tool_calls_map:
-                    self._tool_calls_map[tc_id] = {
-                        "id": tc_id,
-                        "type": tc.type,
+            for position, tc in enumerate(raw_chunk.tool_calls):
+                key = self._tool_call_accumulation_key(tc, position)
+                tc_id = _normalized_tool_call_id(tc.id)
+                if key not in self._tool_calls_map:
+                    self._tool_calls_map[key] = {
+                        "id": tc_id or _new_tool_call_id(),
+                        "type": tc.type or "function",
                         "function_name": "",
                         "function_arguments": "",
                     }
+                elif tc_id:
+                    self._tool_calls_map[key]["id"] = tc_id
                 if tc.function:
                     if tc.function.name:
-                        self._tool_calls_map[tc_id]["function_name"] = tc.function.name
+                        self._tool_calls_map[key]["function_name"] = tc.function.name
                     if tc.function.arguments:
-                        self._tool_calls_map[tc_id]["function_arguments"] += tc.function.arguments
+                        self._tool_calls_map[key]["function_arguments"] += tc.function.arguments
 
         # Yield every 8 chunks or on final
         if self._msg_idx % 8 == 0 or raw_chunk.is_final:
@@ -318,6 +327,7 @@ class StreamingModelCaller:
             tool_calls = None
             if self._tool_calls_map and raw_chunk.is_final:
                 from langbot_plugin.api.entities.builtin.provider.message import FunctionCall, ToolCall
+
                 tool_calls = [
                     ToolCall(
                         id=tc["id"],
@@ -353,6 +363,21 @@ class StreamingModelCaller:
     def get_committed_model_id(self) -> str | None:
         """Get the model ID that was committed for this stream."""
         return self._committed_model_id
+
+    def _tool_call_accumulation_key(self, tool_call: typing.Any, position: int) -> str:
+        tc_id = _normalized_tool_call_id(getattr(tool_call, "id", None))
+        position_key = _tool_call_position_key(tool_call, position)
+        if tc_id:
+            key = self._tool_call_id_keys.get(tc_id) or self._tool_call_position_keys.get(position_key) or f"id:{tc_id}"
+            self._tool_call_id_keys[tc_id] = key
+            self._tool_call_position_keys[position_key] = key
+            return key
+
+        key = self._tool_call_position_keys.get(position_key)
+        if key is None:
+            key = position_key
+            self._tool_call_position_keys[position_key] = key
+        return key
 
 
 def build_tool_call_message(
@@ -537,9 +562,28 @@ def extract_tool_result_references(result: typing.Any) -> dict[str, list[dict[st
     return {"artifact_refs": artifact_refs, "file_refs": file_refs}
 
 
-def has_tool_result_references(result: typing.Any) -> bool:
-    refs = extract_tool_result_references(result)
-    return bool(refs["artifact_refs"] or refs["file_refs"])
+def _normalized_tool_call_id(value: typing.Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text or text.lower() == "none":
+        return ""
+    return text
+
+
+def _tool_call_position_key(tool_call: typing.Any, position: int) -> str:
+    index = getattr(tool_call, "index", None)
+    if index is None:
+        extra = getattr(tool_call, "__pydantic_extra__", None)
+        if isinstance(extra, dict):
+            index = extra.get("index")
+    if index is not None:
+        return f"index:{index}"
+    return f"position:{position}"
+
+
+def _new_tool_call_id() -> str:
+    return f"call_{uuid.uuid4().hex}"
 
 
 def _copy_reference_fields(

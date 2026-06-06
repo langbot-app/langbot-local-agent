@@ -27,6 +27,13 @@ async def _collect_events(loop: AgentLoop):
     return [event async for event in loop.run()]
 
 
+def test_tool_call_request_generates_uuid_ids_for_raw_calls_without_id():
+    request = ToolCallRequest.from_raw({"function": {"name": "search", "arguments": "{}"}})
+
+    assert request.id.startswith("call_")
+    assert request.id != ToolCallRequest.from_raw({"function": {"name": "search", "arguments": "{}"}}).id
+
+
 @pytest.mark.asyncio
 async def test_streaming_loop_emits_turn_message_and_tool_events():
     """The core loop exposes a Pi-style lifecycle independent from AgentRunResult."""
@@ -239,9 +246,7 @@ async def test_loop_executes_same_batch_tools_in_parallel_and_preserves_source_o
     result_message_ids = [
         event.message.tool_call_id
         for event in events
-        if event.type == AgentLoopEventType.MESSAGE_END
-        and event.message is not None
-        and event.message.role == "tool"
+        if event.type == AgentLoopEventType.MESSAGE_END and event.message is not None and event.message.role == "tool"
     ]
     assert result_message_ids == ["call-slow", "call-fast"]
 

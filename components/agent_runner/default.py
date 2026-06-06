@@ -15,8 +15,6 @@ from typing import Any, AsyncGenerator
 from langbot_plugin.api.definition.components.agent_runner.runner import AgentRunner
 from langbot_plugin.api.entities.builtin.agent_runner import (
     AgentRunContext,
-    AgentRunnerCapabilities,
-    AgentRunnerPermissions,
     AgentRunResult,
 )
 from langbot_plugin.api.entities.builtin.provider.message import Message
@@ -51,30 +49,6 @@ class DefaultAgentRunner(AgentRunner):
     All resource access goes through AgentRunAPIProxy for authorization.
     """
 
-    @classmethod
-    def get_capabilities(cls) -> AgentRunnerCapabilities:
-        """Get runner capabilities."""
-        return AgentRunnerCapabilities(
-            streaming=True,
-            tool_calling=True,
-            knowledge_retrieval=True,
-            multimodal_input=True,
-            skill_authoring=True,
-            skill_injection=True,
-            stateful_session=True,
-        )
-
-    @classmethod
-    def get_permissions(cls) -> AgentRunnerPermissions:
-        """Get runner permissions for resource access."""
-        return AgentRunnerPermissions(
-            models=["invoke", "stream"],
-            tools=["detail", "call"],
-            knowledge_bases=["list", "retrieve"],
-            history=["page", "search"],
-            artifacts=["metadata", "read"],
-        )
-
     async def run(self, ctx: AgentRunContext) -> AsyncGenerator[AgentRunResult, None]:
         """Run the agent with full LLM capabilities.
 
@@ -91,7 +65,7 @@ class DefaultAgentRunner(AgentRunner):
         # Get authorized models
         allowed_model_ids = set(m.model_id for m in api.get_allowed_models())
 
-        # Parse model config (supports string and dict formats)
+        # Parse current model-fallback-selector config.
         model_config = ctx.config.get("model")
         model_ids = parse_model_config(model_config, allowed_model_ids)
 
@@ -119,40 +93,22 @@ class DefaultAgentRunner(AgentRunner):
 
         # Prefer host runtime capability so non-streaming adapters keep the
         # same behavior as the original built-in local-agent runner.
-        use_streaming = ctx.config.get("streaming")
-        if use_streaming is None:
-            use_streaming = ctx.runtime.metadata.get("streaming_supported", True)
+        use_streaming = bool(ctx.runtime.metadata.get("streaming_supported", True))
 
-        if use_streaming:
-            async for result in self._run_agent_loop(
-                run_id=ctx.run_id,
-                api=api,
-                model_ids=model_ids,
-                messages=messages,
-                allowed_tools=allowed_tools,
-                streaming=True,
-                max_tool_iterations=max_tool_iterations,
-                max_tool_result_chars=max_tool_result_chars,
-                max_tool_result_artifact_bytes=max_tool_result_artifact_bytes,
-                context_budget=context_budget,
-                artifact_read_available=artifact_read_available,
-            ):
-                yield result
-        else:
-            async for result in self._run_agent_loop(
-                run_id=ctx.run_id,
-                api=api,
-                model_ids=model_ids,
-                messages=messages,
-                allowed_tools=allowed_tools,
-                streaming=False,
-                max_tool_iterations=max_tool_iterations,
-                max_tool_result_chars=max_tool_result_chars,
-                max_tool_result_artifact_bytes=max_tool_result_artifact_bytes,
-                context_budget=context_budget,
-                artifact_read_available=artifact_read_available,
-            ):
-                yield result
+        async for result in self._run_agent_loop(
+            run_id=ctx.run_id,
+            api=api,
+            model_ids=model_ids,
+            messages=messages,
+            allowed_tools=allowed_tools,
+            streaming=use_streaming,
+            max_tool_iterations=max_tool_iterations,
+            max_tool_result_chars=max_tool_result_chars,
+            max_tool_result_artifact_bytes=max_tool_result_artifact_bytes,
+            context_budget=context_budget,
+            artifact_read_available=artifact_read_available,
+        ):
+            yield result
 
     async def _run_agent_loop(
         self,

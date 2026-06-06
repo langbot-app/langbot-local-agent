@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import typing
+import uuid
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -62,13 +62,13 @@ class ToolCallRequest:
                 arguments = raw.get("function_arguments", "")
 
             return cls(
-                id=str(raw.get("id") or hash(json.dumps(raw, sort_keys=True, default=str))),
+                id=str(raw.get("id") or _new_tool_call_id()),
                 type=str(raw.get("type") or "function"),
                 name=str(name or ""),
                 arguments=str(arguments or ""),
             )
 
-        return cls(id=str(hash(str(raw))), name="", arguments="")
+        return cls(id=_new_tool_call_id(), name="", arguments="")
 
     def to_tool_call(self) -> ToolCall:
         return ToolCall(
@@ -76,6 +76,10 @@ class ToolCallRequest:
             type=self.type,
             function=FunctionCall(name=self.name, arguments=self.arguments),
         )
+
+
+def _new_tool_call_id() -> str:
+    return f"call_{uuid.uuid4().hex}"
 
 
 @dataclass(frozen=True)

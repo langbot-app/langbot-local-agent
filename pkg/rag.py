@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import typing
 
 from langbot_plugin.api.proxies.agent_run_api import AgentRunAPIProxy, PermissionDeniedError
 
 from .messages import format_rag_results
+
+logger = logging.getLogger(__name__)
 
 
 async def retrieve_from_knowledge_bases(
@@ -47,10 +50,10 @@ async def retrieve_from_knowledge_bases(
             if results:
                 all_results.extend(results)
         except PermissionDeniedError:
-            # KB not authorized - skip
+            logger.debug("Knowledge base is not authorized for this run: %s", kb_id)
             continue
         except Exception:
-            # KB retrieval failed - skip and continue
+            logger.warning("Knowledge base retrieval failed: %s", kb_id, exc_info=True)
             continue
 
     if not all_results:
@@ -64,19 +67,19 @@ async def retrieve_from_knowledge_bases(
             for entry in all_results:
                 # Handle different result formats
                 if isinstance(entry, dict):
-                    content = entry.get('content', '')
+                    content = entry.get("content", "")
                     if isinstance(content, str):
                         doc_texts.append(content)
                     elif isinstance(content, list):
                         # Multiple content parts - join text parts
                         text_parts = []
                         for part in content:
-                            if isinstance(part, dict) and part.get('type') == 'text':
-                                text_parts.append(part.get('text', ''))
+                            if isinstance(part, dict) and part.get("type") == "text":
+                                text_parts.append(part.get("text", ""))
                             elif isinstance(part, str):
                                 text_parts.append(part)
-                        doc_texts.append(' '.join(text_parts))
-                elif hasattr(entry, 'content'):
+                        doc_texts.append(" ".join(text_parts))
+                elif hasattr(entry, "content"):
                     # Object with content attribute
                     content = entry.content
                     if isinstance(content, str):
@@ -84,9 +87,9 @@ async def retrieve_from_knowledge_bases(
                     elif isinstance(content, list):
                         text_parts = []
                         for part in content:
-                            if hasattr(part, 'type') and part.type == 'text' and hasattr(part, 'text'):
+                            if hasattr(part, "type") and part.type == "text" and hasattr(part, "text"):
                                 text_parts.append(part.text)
-                        doc_texts.append(' '.join(text_parts))
+                        doc_texts.append(" ".join(text_parts))
 
             if doc_texts:
                 # Invoke rerank model
@@ -100,13 +103,13 @@ async def retrieve_from_knowledge_bases(
                 # Sort results by rerank scores
                 if scores:
                     # Get indices sorted by relevance score (already sorted by invoke_rerank)
-                    top_indices = [s['index'] for s in scores if s['index'] < len(all_results)]
+                    top_indices = [s["index"] for s in scores if s["index"] < len(all_results)]
                     all_results = [all_results[i] for i in top_indices]
         except PermissionDeniedError:
-            # Rerank model not authorized - use original order
+            logger.debug("Rerank model is not authorized for this run: %s", rerank_model_id)
             pass
         except Exception:
-            # Rerank failed - use original order
+            logger.warning("Knowledge rerank failed: %s", rerank_model_id, exc_info=True)
             pass
 
     return format_rag_results(all_results)

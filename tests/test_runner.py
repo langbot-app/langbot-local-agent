@@ -66,12 +66,13 @@ from pkg.context_pipeline import (
     ContextBudget,
     ContextCompactor,
 )
-from pkg.messages import build_messages, format_rag_results, get_effective_prompt_config
+from pkg.messages import build_prompt_messages, build_user_message, format_rag_results, get_effective_prompt_config
 from pkg.model_calling import (
     INTERNAL_ARTIFACT_READ_TOOL_NAME,
     TOOL_RESULT_ARTIFACT_MARKER,
     TOOL_RESULT_REFERENCE_MARKER,
     TOOL_RESULT_TRUNCATION_MARKER,
+    StreamingModelCaller,
     build_tool_call_message,
 )
 
@@ -173,26 +174,6 @@ def make_context(
 
 class TestParseModelConfig:
     """Tests for model configuration parsing."""
-
-    def test_string_format_primary_success(self):
-        """String format: primary model configured and allowed."""
-        result = parse_model_config("model-123", {"model-123", "model-456"})
-        assert result == ["model-123"]
-
-    def test_string_format_primary_not_allowed(self):
-        """String format: primary model not in allowed set."""
-        result = parse_model_config("model-999", {"model-123", "model-456"})
-        assert result == []
-
-    def test_string_format_empty_string(self):
-        """String format: empty string returns empty."""
-        result = parse_model_config("", {"model-123"})
-        assert result == []
-
-    def test_string_format_none_value(self):
-        """String format: __none__ returns empty."""
-        result = parse_model_config("__none__", {"model-123"})
-        assert result == []
 
     def test_dict_format_primary_only(self):
         """Dict format: only primary model configured."""
@@ -337,69 +318,28 @@ class TestRunnerBehaviorConfig:
         )
 
 
-# ==================== Message Building Tests ====================
+# ==================== Message Helper Tests ====================
 
 
-class TestBuildMessages:
-    """Tests for message building."""
-
-    def test_basic_messages(self):
-        """Basic message building with prompt, history, and input."""
-        prompt = [{"role": "system", "content": "You are helpful."}]
-        history = [Message(role="user", content="Hi"), Message(role="assistant", content="Hello")]
-
-        messages = build_messages(
-            prompt_config=prompt,
-            history_messages=history,
-            user_text="How are you?",
-        )
-
-        assert len(messages) == 4
-        assert messages[0].role == "system"
-        assert messages[0].content == "You are helpful."
-        assert messages[-1].role == "user"
-        assert messages[-1].content == "How are you?"
-
-    def test_history_is_preserved_as_provided(self):
-        """History selection is owned by Host APIs and runner policy."""
-        history = []
-        for i in range(15):
-            history.append(Message(role="user", content=f"User {i}"))
-            history.append(Message(role="assistant", content=f"Assistant {i}"))
-
-        messages = build_messages(
-            prompt_config=[],
-            history_messages=history,
-            user_text="New message",
-        )
-
-        assert len(messages) == 31
-        assert messages[0].content == "User 0"
-        assert messages[-2].content == "Assistant 14"
-        assert messages[-1].content == "New message"
+class TestMessageHelpers:
+    """Tests for production message helper functions."""
 
     def test_rag_context(self):
         """RAG context is prepended to user message."""
-        messages = build_messages(
-            prompt_config=[],
-            history_messages=[],
+        message = build_user_message(
             user_text="What is X?",
             rag_context="[1] X is a variable.",
         )
 
-        assert len(messages) == 1
-        assert "<context>" in messages[0].content
-        assert "[1] X is a variable." in messages[0].content
-        assert "<user_message>" in messages[0].content
-        assert "What is X?" in messages[0].content
+        assert message is not None
+        assert "<context>" in message.content
+        assert "[1] X is a variable." in message.content
+        assert "<user_message>" in message.content
+        assert "What is X?" in message.content
 
     def test_static_prompt_config_is_used(self):
         """Static binding prompt config is used for system prompt."""
-        messages = build_messages(
-            prompt_config=[{"role": "system", "content": "Static prompt"}],
-            history_messages=[],
-            user_text="Hello",
-        )
+        messages = build_prompt_messages([{"role": "system", "content": "Static prompt"}])
 
         assert messages[0].content == "Static prompt"
 
@@ -428,16 +368,15 @@ class TestBuildMessages:
             ContentElement.from_image_base64("base64-image"),
         ]
 
-        messages = build_messages(
-            prompt_config=[],
-            history_messages=[],
+        message = build_user_message(
             user_text="Look at this",
             input_contents=contents,
         )
 
-        assert isinstance(messages[0].content, list)
-        assert messages[0].content[0].text == "Look at this"
-        assert messages[0].content[1].type == "image_base64"
+        assert message is not None
+        assert isinstance(message.content, list)
+        assert message.content[0].text == "Look at this"
+        assert message.content[1].type == "image_base64"
 
     def test_rag_context_replaces_text_and_preserves_multimodal_parts(self):
         """RAG modifies only the text content and keeps attachments."""
@@ -446,17 +385,16 @@ class TestBuildMessages:
             ContentElement.from_image_base64("base64-image"),
         ]
 
-        messages = build_messages(
-            prompt_config=[],
-            history_messages=[],
+        message = build_user_message(
             user_text="What is in this image?",
             input_contents=contents,
             rag_context="[1] Image metadata",
         )
 
-        assert isinstance(messages[0].content, list)
-        assert "<context>" in messages[0].content[0].text
-        assert messages[0].content[1].type == "image_base64"
+        assert message is not None
+        assert isinstance(message.content, list)
+        assert "<context>" in message.content[0].text
+        assert message.content[1].type == "image_base64"
 
 
 class TestToolResultBounding:
@@ -619,6 +557,72 @@ class TestContextCompaction:
         assert "recent user sentinel" in contents
         assert "recent assistant sentinel" in contents
 
+    def test_flat_compaction_keeps_current_user_when_prompt_exceeds_budget(self):
+        """A large injected prompt must not evict the current user request."""
+        messages = [
+            Message(role="system", content="Available Skills:\n" + ("skill index " * 120)),
+            Message(role="user", content="current user sentinel"),
+        ]
+        budget = ContextBudget(
+            window_tokens=80,
+            reserve_tokens=20,
+            keep_recent_tokens=20,
+            summary_tokens=20,
+        )
+
+        assembly = ContextCompactor(budget).compact_messages(messages)
+
+        assert assembly.messages[-1].role == "user"
+        assert assembly.messages[-1].content == "current user sentinel"
+
+    def test_flat_compaction_keeps_tool_turn_tail_when_prompt_exceeds_budget(self):
+        """Tool follow-up turns keep the assistant tool call and tool results."""
+        tool_call = ToolCall(
+            id="call-1",
+            type="function",
+            function=FunctionCall(name="allowed_tool", arguments="{}"),
+        )
+        messages = [
+            Message(role="system", content="Available Skills:\n" + ("skill index " * 120)),
+            Message(role="user", content="old tool request " + "x" * 200),
+            Message(role="assistant", content="", tool_calls=[tool_call]),
+            Message(role="tool", tool_call_id="call-1", content="tool result sentinel"),
+        ]
+        budget = ContextBudget(
+            window_tokens=80,
+            reserve_tokens=20,
+            keep_recent_tokens=20,
+            summary_tokens=20,
+        )
+
+        assembly = ContextCompactor(budget).compact_messages(messages)
+
+        assert any(message.role == "assistant" and message.tool_calls for message in assembly.messages)
+        assert assembly.messages[-1].role == "tool"
+        assert assembly.messages[-1].content == "tool result sentinel"
+
+    def test_compactor_summarizes_history_when_prompt_and_current_exceed_budget(self):
+        """A large prompt should not force all older facts to disappear."""
+        messages = [
+            Message(role="system", content="Available Skills:\n" + ("skill index " * 120)),
+            Message(role="user", content="remember qa_compaction_sentinel_7391"),
+            Message(role="assistant", content="MEMORY_SET"),
+            Message(role="user", content="what was the sentinel?"),
+        ]
+        budget = ContextBudget(
+            window_tokens=80,
+            reserve_tokens=20,
+            keep_recent_tokens=20,
+            summary_tokens=80,
+        )
+
+        assembly = ContextCompactor(budget).compact_messages(messages)
+
+        assert assembly.summary_message is not None
+        assert "qa_compaction_sentinel_7391" in assembly.summary_message.content
+        assert assembly.messages[-1].role == "user"
+        assert assembly.messages[-1].content == "what was the sentinel?"
+
 
 class TestFormatRagResults:
     """Tests for RAG result formatting."""
@@ -664,6 +668,8 @@ class TestDefaultAgentRunner:
 
         assert manifest["spec"]["capabilities"]["event_context"] is True
         assert manifest["spec"]["permissions"]["history"] == ["page", "search"]
+        assert "storage" not in manifest["spec"]["permissions"]
+        assert "files" not in manifest["spec"]["permissions"]
         config_names = {item["name"] for item in manifest["spec"]["config"]}
         assert "context-window-tokens" in config_names
         assert "context-keep-recent-tokens" in config_names
@@ -672,10 +678,57 @@ class TestDefaultAgentRunner:
         assert "max-tool-iterations" in config_names
         assert "max-tool-result-chars" in config_names
         assert "max-tool-result-artifact-bytes" in config_names
-        max_tool_iterations = next(
-            item for item in manifest["spec"]["config"] if item["name"] == "max-tool-iterations"
-        )
+        max_tool_iterations = next(item for item in manifest["spec"]["config"] if item["name"] == "max-tool-iterations")
         assert max_tool_iterations["default"] == DEFAULT_MAX_TOOL_ITERATIONS
+
+    @pytest.mark.asyncio
+    async def test_streaming_tool_call_arguments_continue_when_later_delta_has_no_id(self):
+        class StreamingAPI:
+            def invoke_llm_stream(self, *args, **kwargs):
+                async def stream():
+                    yield MessageChunk(
+                        role="assistant",
+                        content="",
+                        is_final=False,
+                        tool_calls=[
+                            ToolCall(
+                                id="call-real",
+                                type="function",
+                                function=FunctionCall(name="allowed_tool", arguments='{"a"'),
+                            )
+                        ],
+                    )
+                    yield MessageChunk(
+                        role="assistant",
+                        content="",
+                        is_final=True,
+                        tool_calls=[
+                            ToolCall(
+                                id="",
+                                type="function",
+                                function=FunctionCall(name="", arguments=": 1}"),
+                            )
+                        ],
+                    )
+
+                return stream()
+
+        caller = StreamingModelCaller(
+            StreamingAPI(),
+            model_ids=["model-1"],
+            messages=[Message(role="user", content="use tool")],
+        )
+
+        chunks = []
+        async for chunk, _ in caller.stream():
+            chunks.append(chunk)
+
+        final_tool_calls = chunks[-1].tool_calls
+        assert final_tool_calls is not None
+        assert len(final_tool_calls) == 1
+        assert final_tool_calls[0].id == "call-real"
+        assert final_tool_calls[0].function.name == "allowed_tool"
+        assert final_tool_calls[0].function.arguments == '{"a": 1}'
 
     @pytest.fixture
     def runner(self):
@@ -693,7 +746,7 @@ class TestDefaultAgentRunner:
     async def test_no_model_returns_failed(self, runner):
         """No authorized model returns run.failed with code=runner.no_model."""
         ctx = make_context(
-            config={"model": "model-1"},
+            config={"model": {"primary": "model-1", "fallbacks": []}},
             resources=AgentResources(models=[]),  # No models authorized
         )
 
@@ -782,7 +835,7 @@ class TestDefaultAgentRunner:
         ctx = make_context(
             run_id="run-history",
             config={
-                "model": "model-1",
+                "model": {"primary": "model-1", "fallbacks": []},
                 "prompt": [{"role": "system", "content": "Static prompt"}],
             },
             resources=AgentResources(models=[ModelResource(model_id="model-1")]),
@@ -824,7 +877,7 @@ class TestDefaultAgentRunner:
 
         ctx = make_context(
             config={
-                "model": "model-1",
+                "model": {"primary": "model-1", "fallbacks": []},
                 "prompt": [{"role": "system", "content": "Static prompt"}],
             },
             resources=AgentResources(models=[ModelResource(model_id="model-1")]),
@@ -893,7 +946,7 @@ class TestDefaultAgentRunner:
         ctx = make_context(
             run_id="run-compact",
             config={
-                "model": "model-1",
+                "model": {"primary": "model-1", "fallbacks": []},
                 "prompt": [{"role": "system", "content": "Static prompt"}],
                 "context-window-tokens": 85,
                 "context-reserve-tokens": 20,
@@ -975,7 +1028,7 @@ class TestDefaultAgentRunner:
         ctx = make_context(
             run_id="run-follow-up-transform",
             config={
-                "model": "model-1",
+                "model": {"primary": "model-1", "fallbacks": []},
                 "context-window-tokens": 360,
                 "context-reserve-tokens": 40,
                 "context-keep-recent-tokens": 120,
@@ -1048,7 +1101,7 @@ class TestDefaultAgentRunner:
         ctx = make_context(
             run_id="run-overflow-retry",
             config={
-                "model": "model-1",
+                "model": {"primary": "model-1", "fallbacks": []},
                 "context-window-tokens": 360,
                 "context-reserve-tokens": 40,
                 "context-keep-recent-tokens": 120,
@@ -1089,7 +1142,7 @@ class TestDefaultAgentRunner:
         monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
 
         ctx = make_context(
-            config={"model": "model-1"},
+            config={"model": {"primary": "model-1", "fallbacks": []}},
             resources=AgentResources(models=[ModelResource(model_id="model-1")]),
         )
 
@@ -1126,13 +1179,13 @@ class TestDefaultAgentRunner:
 
         ctx_a = make_context(
             run_id="run-a",
-            config={"model": "model-a"},
+            config={"model": {"primary": "model-a", "fallbacks": []}},
             resources=AgentResources(models=[ModelResource(model_id="model-a")]),
             input_text="input a",
         )
         ctx_b = make_context(
             run_id="run-b",
-            config={"model": "model-b"},
+            config={"model": {"primary": "model-b", "fallbacks": []}},
             resources=AgentResources(models=[ModelResource(model_id="model-b")]),
             input_text="input b",
         )
@@ -1237,7 +1290,7 @@ class TestDefaultAgentRunner:
         monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
 
         ctx = make_context(
-            config={"model": "model-1"},
+            config={"model": {"primary": "model-1", "fallbacks": []}},
             resources=AgentResources(
                 models=[ModelResource(model_id="model-1")],
                 tools=[ToolResource(tool_name="allowed_tool")],
@@ -1289,7 +1342,7 @@ class TestDefaultAgentRunner:
         monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
 
         ctx = make_context(
-            config={"model": "model-1", "max-tool-result-chars": 8},
+            config={"model": {"primary": "model-1", "fallbacks": []}, "max-tool-result-chars": 8},
             resources=AgentResources(
                 models=[ModelResource(model_id="model-1")],
                 tools=[ToolResource(tool_name="allowed_tool")],
@@ -1348,7 +1401,7 @@ class TestDefaultAgentRunner:
         monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
 
         ctx = make_context(
-            config={"model": "model-1", "max-tool-result-chars": 8},
+            config={"model": {"primary": "model-1", "fallbacks": []}, "max-tool-result-chars": 8},
             resources=AgentResources(
                 models=[ModelResource(model_id="model-1")],
                 tools=[ToolResource(tool_name="allowed_tool")],
@@ -1422,7 +1475,7 @@ class TestDefaultAgentRunner:
 
         ctx = make_context(
             config={
-                "model": "model-1",
+                "model": {"primary": "model-1", "fallbacks": []},
                 "max-tool-result-chars": 8,
                 "max-tool-result-artifact-bytes": 10,
             },
@@ -1502,7 +1555,7 @@ class TestDefaultAgentRunner:
         monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
 
         ctx = make_context(
-            config={"model": "model-1", "max-tool-result-chars": 8},
+            config={"model": {"primary": "model-1", "fallbacks": []}, "max-tool-result-chars": 8},
             resources=AgentResources(
                 models=[ModelResource(model_id="model-1")],
                 tools=[ToolResource(tool_name="sandbox_read")],
@@ -1558,7 +1611,7 @@ class TestDefaultAgentRunner:
         monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
 
         ctx = make_context(
-            config={"model": "model-1"},
+            config={"model": {"primary": "model-1", "fallbacks": []}},
             resources=AgentResources(
                 models=[ModelResource(model_id="model-1")],
                 tools=[ToolResource(tool_name="allowed_tool")],
@@ -1609,7 +1662,7 @@ class TestDefaultAgentRunner:
         monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
 
         ctx = make_context(
-            config={"model": "model-1"},
+            config={"model": {"primary": "model-1", "fallbacks": []}},
             resources=AgentResources(
                 models=[ModelResource(model_id="model-1")],
                 tools=[ToolResource(tool_name="allowed_tool")],
@@ -1664,7 +1717,7 @@ class TestDefaultAgentRunner:
         monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
 
         ctx = make_context(
-            config={"model": "model-1"},
+            config={"model": {"primary": "model-1", "fallbacks": []}},
             resources=AgentResources(
                 models=[ModelResource(model_id="model-1")],
                 tools=[ToolResource(tool_name="allowed_tool")],
@@ -1697,7 +1750,7 @@ class TestDefaultAgentRunner:
 
         ctx = make_context(
             config={
-                "model": "model-1",
+                "model": {"primary": "model-1", "fallbacks": []},
                 "knowledge-bases": ["kb-1", "kb-2"],
                 "retrieval-top-k": 3,
             },
@@ -1734,7 +1787,7 @@ class TestDefaultAgentRunner:
         monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
 
         ctx = make_context(
-            config={"model": "model-1", "knowledge-bases": ["kb-1"]},  # Request kb-1
+            config={"model": {"primary": "model-1", "fallbacks": []}, "knowledge-bases": ["kb-1"]},  # Request kb-1
             resources=AgentResources(
                 models=[ModelResource(model_id="model-1")],
                 knowledge_bases=[],  # No KBs authorized
@@ -1776,7 +1829,7 @@ class TestDefaultAgentRunner:
 
         ctx = make_context(
             config={
-                "model": "model-1",
+                "model": {"primary": "model-1", "fallbacks": []},
                 "knowledge-bases": ["kb-1"],
                 "rerank-model": "rerank-1",
                 "rerank-top-k": 1,
@@ -1897,7 +1950,7 @@ class TestDefaultAgentRunner:
         monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
 
         ctx = make_context(
-            config={"model": "model-1", "max-tool-iterations": 2},
+            config={"model": {"primary": "model-1", "fallbacks": []}, "max-tool-iterations": 2},
             resources=AgentResources(
                 models=[ModelResource(model_id="model-1")],
                 tools=[ToolResource(tool_name="allowed_tool")],
@@ -1927,8 +1980,9 @@ class TestDefaultAgentRunner:
         monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
 
         ctx = make_context(
-            config={"model": "model-1", "streaming": False},
+            config={"model": {"primary": "model-1", "fallbacks": []}},
             resources=AgentResources(models=[ModelResource(model_id="model-1")]),
+            runtime_metadata={"streaming_supported": False},
         )
 
         results = []
@@ -1956,7 +2010,7 @@ class TestDefaultAgentRunner:
         monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
 
         ctx = make_context(
-            config={"model": "model-1"},
+            config={"model": {"primary": "model-1", "fallbacks": []}},
             resources=AgentResources(models=[ModelResource(model_id="model-1")]),
             runtime_metadata={"streaming_supported": False},
         )
@@ -1992,13 +2046,14 @@ class TestDefaultAgentRunner:
         monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
 
         ctx = make_context(
-            config={"model": {"primary": "model-1", "fallbacks": ["model-2"]}, "streaming": False},
+            config={"model": {"primary": "model-1", "fallbacks": ["model-2"]}},
             resources=AgentResources(
                 models=[
                     ModelResource(model_id="model-1"),
                     ModelResource(model_id="model-2"),
                 ]
             ),
+            runtime_metadata={"streaming_supported": False},
         )
 
         results = []
@@ -2049,7 +2104,7 @@ class TestDefaultAgentRunner:
         monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
 
         ctx = make_context(
-            config={"model": {"primary": "model-1", "fallbacks": ["model-2"]}, "streaming": False},
+            config={"model": {"primary": "model-1", "fallbacks": ["model-2"]}},
             resources=AgentResources(
                 models=[
                     ModelResource(model_id="model-1"),
@@ -2057,6 +2112,7 @@ class TestDefaultAgentRunner:
                 ],
                 tools=[ToolResource(tool_name="allowed_tool")],
             ),
+            runtime_metadata={"streaming_supported": False},
         )
 
         results = []

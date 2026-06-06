@@ -170,11 +170,7 @@ class AgentLoop:
                             model_turn = model_event.result
                     break
                 except ModelCallError as e:
-                    if (
-                        not stream_started
-                        and not context_retry_used
-                        and await self._recover_context_overflow(e)
-                    ):
+                    if not stream_started and not context_retry_used and await self._recover_context_overflow(e):
                         context_retry_used = True
                         continue
                     yield AgentLoopEvent.run_failed(str(e), code="runner.llm_error", retryable=e.retryable)

@@ -10,9 +10,12 @@ tool loop, RAG orchestration, and optional context compaction.
 ## Scope
 
 This repository does not define the LangBot host protocol. It consumes the
-Protocol v1 run context produced by LangBot:
+Protocol v1 run context produced by LangBot. The canonical protocol source is
+`LangBot/docs/agent-runner-pluginization/PROTOCOL_V1.md`; this README only
+documents how Local Agent consumes that contract:
 
 - `ctx.event`: event-first metadata for the current trigger.
+- `ctx.conversation`, `ctx.actor`, `ctx.subject`: current run scope metadata.
 - `ctx.input`: current structured input, including text, multimodal contents,
   and artifact/file references.
 - `ctx.context`: context handles, inline policy, and available pull APIs. Local
@@ -20,15 +23,19 @@ Protocol v1 run context produced by LangBot:
   bootstrap.
 - `ctx.resources`: run-scoped authorized models, tools, knowledge bases, files,
   and storage capabilities.
-- `ctx.runtime`: runtime metadata such as deadline, trace id, query id from
-  Pipeline adapter paths, and adapter capabilities.
+- `ctx.state`: small Host-projected state for the current run.
+- `ctx.runtime`: runtime metadata such as deadline, trace id, protocol version,
+  query id from migration adapter paths, and Host metadata.
 - `ctx.delivery`: host delivery surface and streaming/edit capabilities.
-- `ctx.adapter`: Pipeline adapter fields; not part of Protocol v1 core.
+- `ctx.config`: runner binding config.
+- `ctx.adapter`: migration adapter fields; not part of Protocol v1 core and not
+  a place for prompt, history, RAG results, tool schemas, or authorized
+  resources.
 
 LangBot does not inline full conversation history by default. When the runner
 needs more context, it should use authorized Host APIs through
-`AgentRunAPIProxy`, for example history, event, artifact, state, model, tool,
-knowledge-base, and storage APIs.
+`AgentRunAPIProxy`, for example model, prompt, history, artifact, tool, and
+knowledge-base APIs.
 
 AgentRunner components should obtain that proxy with `self.get_run_api(ctx)`.
 They should not use the legacy `self.plugin` proxy that regular non-runner
@@ -95,9 +102,8 @@ The local agent should be treated as a self-managed or hybrid-context runner:
 
 - LangBot inlines the current event/input and context handles.
 - The runner pulls transcript history through the authorized Host history API.
-- The runner decides whether to search history, read
-  artifacts, load state, summarize, compact, or construct a model request from
-  scratch.
+- The runner decides whether to page history, read artifacts, summarize,
+  compact, or construct a model request from scratch.
 - Large files, images, audio, and tool outputs should be consumed as artifact
   references instead of large inline payloads.
 
@@ -126,8 +132,9 @@ This is not `max-round` behavior. History is not selected by number of rounds;
 the runner budgets prompt, current input, summary, and recent history together,
 following the Pi-style context threshold and per-turn transform shape. Future
 iterations can replace the deterministic summary generator with an LLM summary
-and persist compaction checkpoints through Host state/storage after LangBot
-exposes tokenizer/model usage metadata from the LiteLLM model-info work.
+and persist compaction checkpoints through Host state/storage after the runner
+adds the corresponding permissions and LangBot exposes tokenizer/model usage
+metadata from the LiteLLM model-info work.
 
 Pipeline adapter data is intentionally narrow. Local Agent does not consume
 `ctx.adapter.extra.prompt`; prompt handoff goes through the run-scoped Host
@@ -136,8 +143,8 @@ and Host APIs over adapter fields.
 
 ## Host APIs Consumed
 
-Model, tool, knowledge-base, artifact, history, event, state, and storage access
-go through `AgentRunAPIProxy`. LangBot validates these calls with the current
+Model, prompt, history, artifact, tool, knowledge-base, and rerank access go
+through `AgentRunAPIProxy`. LangBot validates these calls with the current
 `run_id`, runner permissions, resource policy, and caller plugin identity.
 
 Local Agent must not expose the runner process filesystem as an agent
@@ -145,9 +152,7 @@ capability. In sandboxed deployments, file access is mediated by Host/sandbox
 tools registered in `ctx.resources.tools`; the model can request those tools,
 and the runner invokes them through `AgentRunAPIProxy.call_tool()`. "Local" here
 means the agent loop runs locally as a LangBot plugin, not that the model can
-read or write arbitrary files on the runner machine. The manifest `files`
-permission is limited to Host-authorized config/knowledge file resources, not
-general local filesystem access.
+read or write arbitrary files on the runner machine.
 
 Typical local-agent usage:
 
@@ -157,10 +162,10 @@ Typical local-agent usage:
 - Page transcript history for the model request and search history when the
   runner decides it is needed.
 - Read artifact metadata/content for files, images, or large tool results.
-- Save optional summary/checkpoint/session state through Host state or storage.
 
 The runner must not bypass `ctx.resources` or call host-private managers to
-access unauthorized models, tools, knowledge bases, files, or storage.
+access unauthorized models, tools, knowledge bases, files, storage, or platform
+APIs.
 
 ## Capabilities
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import typing
 from dataclasses import dataclass
 
@@ -20,6 +21,8 @@ DEFAULT_CONTEXT_SUMMARY_TOKENS = 8_000
 
 ESTIMATED_ATTACHMENT_CHARS = 4800
 ESTIMATED_CHARS_PER_TOKEN = 4
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -208,13 +211,15 @@ class ContextCompactor:
 
         Initial assembly knows prompt/history/current boundaries. Follow-up turns
         only have the loop's flat model context, so preserve leading prompt-like
-        messages and compact older runtime messages behind them.
+        messages plus the current turn tail, and compact older runtime messages
+        between them.
         """
-        prompt_messages, history_messages = _split_leading_prompt_messages(messages)
+        prompt_messages, runtime_messages = _split_leading_prompt_messages(messages)
+        history_messages, current_messages = _split_runtime_history_and_current(runtime_messages)
         return self.compact(
             prompt_messages=prompt_messages,
             history_messages=history_messages,
-            current_messages=[],
+            current_messages=current_messages,
         )
 
     def compact(
@@ -239,13 +244,23 @@ class ContextCompactor:
             )
 
         history_budget = max(self.budget.input_tokens - estimate_messages_tokens(prompt + current), 0)
-        if not history or history_budget <= 0:
+        if not history:
             messages = prompt + current
             return ContextAssembly(
                 messages=messages,
-                compacted=bool(history),
+                compacted=False,
                 tokens_before=tokens_before,
                 tokens_after=estimate_messages_tokens(messages),
+            )
+        if history_budget <= 0:
+            summary_message = self._build_summary_message(history, self.budget.summary_tokens)
+            messages = prompt + ([summary_message] if summary_message is not None else []) + current
+            return ContextAssembly(
+                messages=messages,
+                compacted=True,
+                tokens_before=tokens_before,
+                tokens_after=estimate_messages_tokens(messages),
+                summary_message=summary_message,
             )
 
         summary_budget = self._summary_budget(history_budget)
@@ -345,10 +360,6 @@ def summarize_messages(messages: list[Message], max_chars: int) -> str:
     return _truncate_text("\n".join(lines), max_chars)
 
 
-def estimate_messages_chars(messages: list[Message]) -> int:
-    return sum(estimate_message_chars(message) for message in messages)
-
-
 def estimate_messages_tokens(messages: list[Message]) -> int:
     return sum(estimate_message_tokens(message) for message in messages)
 
@@ -403,7 +414,7 @@ def _message_from_transcript_item(item: dict[str, typing.Any], current_event_id:
         try:
             return Message.model_validate(content_json)
         except Exception:
-            pass
+            logger.debug("Failed to parse transcript content_json as Message", exc_info=True)
 
     role = item.get("role")
     content = item.get("content")
@@ -445,6 +456,42 @@ def _split_leading_prompt_messages(messages: list[Message]) -> tuple[list[Messag
         first_history_index = len(messages)
 
     return _copy_messages(prompt_messages), _copy_messages(messages[first_history_index:])
+
+
+def _split_runtime_history_and_current(messages: list[Message]) -> tuple[list[Message], list[Message]]:
+    current_start = _current_turn_tail_start(messages)
+    if current_start >= len(messages):
+        return _copy_messages(messages), []
+    return _copy_messages(messages[:current_start]), _copy_messages(messages[current_start:])
+
+
+def _current_turn_tail_start(messages: list[Message]) -> int:
+    if not messages:
+        return 0
+
+    tool_tail_start = _tool_turn_tail_start(messages)
+    if tool_tail_start is not None:
+        return tool_tail_start
+
+    last = messages[-1]
+    if last.role == "user":
+        return len(messages) - 1
+    if last.role == "assistant" and last.tool_calls:
+        return len(messages) - 1
+    return len(messages)
+
+
+def _tool_turn_tail_start(messages: list[Message]) -> int | None:
+    if not messages or messages[-1].role != "tool":
+        return None
+
+    index = len(messages) - 1
+    while index >= 0 and messages[index].role == "tool":
+        index -= 1
+
+    if index >= 0 and messages[index].role == "assistant" and messages[index].tool_calls:
+        return index
+    return None
 
 
 def _content_chars(content: typing.Any) -> int:

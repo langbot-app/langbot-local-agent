@@ -23,44 +23,6 @@ def get_effective_prompt_config(ctx: typing.Any) -> list[dict[str, typing.Any]]:
     return []
 
 
-def build_messages(
-    prompt_config: list[dict[str, typing.Any]] | None,
-    history_messages: list[Message],
-    user_text: str,
-    rag_context: str | None = None,
-    input_contents: list[ContentElement] | None = None,
-) -> list[Message]:
-    """Build messages list for LLM invocation.
-
-    Structure:
-    1. Effective system prompt from Host adapter or static config
-    2. Historical messages pulled from Host history API
-    3. Current user input (with RAG context if provided)
-
-    Args:
-        prompt_config: System prompt configuration
-        history_messages: Conversation history
-        user_text: Current user input text
-        rag_context: Optional RAG context to prepend to user message
-
-    Returns:
-        List of Message objects ready for LLM
-    """
-    messages = build_prompt_messages(prompt_config)
-
-    messages.extend([msg.model_copy(deep=True) for msg in history_messages])
-
-    user_message = build_user_message(
-        user_text=user_text,
-        input_contents=input_contents,
-        rag_context=rag_context,
-    )
-    if user_message is not None:
-        messages.append(user_message)
-
-    return messages
-
-
 def build_prompt_messages(
     prompt_config: list[dict[str, typing.Any]] | None,
 ) -> list[Message]:
