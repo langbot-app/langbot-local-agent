@@ -316,20 +316,20 @@ class LangBotToolExecutor:
         limit = min(_positive_int(parameters.get("limit"), default=8000), 20_000)
         result = await self.api.artifact_read(artifact_id=artifact_id, offset=offset, limit=limit)
 
-        content_base64 = result.get("content_base64")
+        content_base64 = _model_or_mapping_get(result, "content_base64")
         text: str | None = None
         if isinstance(content_base64, str) and content_base64:
             text = base64.b64decode(content_base64).decode("utf-8", errors="replace")
 
         return {
-            "artifact_id": result.get("artifact_id", artifact_id),
-            "mime_type": result.get("mime_type"),
-            "size_bytes": result.get("size_bytes"),
-            "offset": result.get("offset", offset),
-            "length": result.get("length"),
-            "has_more": bool(result.get("has_more", False)),
+            "artifact_id": _model_or_mapping_get(result, "artifact_id", artifact_id),
+            "mime_type": _model_or_mapping_get(result, "mime_type"),
+            "size_bytes": _model_or_mapping_get(result, "size_bytes"),
+            "offset": _model_or_mapping_get(result, "offset", offset),
+            "length": _model_or_mapping_get(result, "length"),
+            "has_more": bool(_model_or_mapping_get(result, "has_more", False)),
             "text": text,
-            "file_key": result.get("file_key"),
+            "file_key": _model_or_mapping_get(result, "file_key"),
         }
 
     def _build_tool_result_artifact(
@@ -399,3 +399,9 @@ def _positive_int(value: typing.Any, *, default: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         return default
     return value
+
+
+def _model_or_mapping_get(value: typing.Any, key: str, default: typing.Any = None) -> typing.Any:
+    if isinstance(value, dict):
+        return value.get(key, default)
+    return getattr(value, key, default)

@@ -186,8 +186,9 @@ class ContextAssembler:
         )
 
         messages: list[Message] = []
-        for item in reversed(page.get("items", [])):
-            if not isinstance(item, dict):
+        for raw_item in reversed(_model_or_mapping_get(page, "items", [])):
+            item = _as_mapping(raw_item)
+            if item is None:
                 continue
             message = _message_from_transcript_item(item, self.ctx.event.event_id)
             if message is not None:
@@ -410,6 +411,22 @@ def _message_from_transcript_item(item: dict[str, typing.Any], current_event_id:
         return Message(role=role, content=content)
 
     return None
+
+
+def _as_mapping(value: typing.Any) -> dict[str, typing.Any] | None:
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "model_dump"):
+        dumped = value.model_dump()
+        if isinstance(dumped, dict):
+            return dumped
+    return None
+
+
+def _model_or_mapping_get(value: typing.Any, key: str, default: typing.Any = None) -> typing.Any:
+    if isinstance(value, dict):
+        return value.get(key, default)
+    return getattr(value, key, default)
 
 
 def _copy_messages(messages: list[Message]) -> list[Message]:

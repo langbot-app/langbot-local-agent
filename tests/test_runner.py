@@ -23,6 +23,7 @@ from langbot_plugin.api.entities.builtin.agent_runner.context_access import (
 from langbot_plugin.api.entities.builtin.agent_runner.delivery import DeliveryContext
 from langbot_plugin.api.entities.builtin.agent_runner.event import AgentEventContext
 from langbot_plugin.api.entities.builtin.agent_runner.input import AgentInput
+from langbot_plugin.api.entities.builtin.agent_runner.page_results import HistoryPage
 from langbot_plugin.api.entities.builtin.agent_runner.resources import (
     AgentResources,
     KnowledgeBaseResource,
@@ -33,6 +34,7 @@ from langbot_plugin.api.entities.builtin.agent_runner.result import (
     AgentRunResultType,
 )
 from langbot_plugin.api.entities.builtin.agent_runner.runtime import AgentRuntimeContext
+from langbot_plugin.api.entities.builtin.agent_runner.transcript import TranscriptItem
 from langbot_plugin.api.entities.builtin.agent_runner.trigger import AgentTrigger
 from langbot_plugin.api.entities.builtin.provider.message import (
     ContentElement,
@@ -742,27 +744,31 @@ class TestDefaultAgentRunner:
             models=[ModelResource(model_id="model-1")],
         )
         fake_api.history_page = AsyncMock(
-            return_value={
-                "items": [
-                    {
-                        "event_id": "evt-run-history",
-                        "role": "user",
-                        "content": "current input",
-                    },
-                    {
-                        "event_id": "evt-old-assistant",
-                        "content_json": {"role": "assistant", "content": "previous answer"},
-                    },
-                    {
-                        "event_id": "evt-old-user",
-                        "role": "user",
-                        "content": "previous question",
-                    },
+            return_value=HistoryPage(
+                items=[
+                    TranscriptItem(
+                        transcript_id="tr-current",
+                        event_id="evt-run-history",
+                        role="user",
+                        content="current input",
+                    ),
+                    TranscriptItem(
+                        transcript_id="tr-old-assistant",
+                        event_id="evt-old-assistant",
+                        role="assistant",
+                        content_json={"role": "assistant", "content": "previous answer"},
+                    ),
+                    TranscriptItem(
+                        transcript_id="tr-old-user",
+                        event_id="evt-old-user",
+                        role="user",
+                        content="previous question",
+                    ),
                 ],
-                "next_cursor": None,
-                "prev_cursor": None,
-                "has_more": False,
-            }
+                next_cursor=None,
+                prev_cursor=None,
+                has_more=False,
+            )
         )
         captured_messages: list[Message] = []
 

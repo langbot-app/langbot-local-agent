@@ -7,6 +7,7 @@ import base64
 from unittest.mock import AsyncMock
 
 import pytest
+from langbot_plugin.api.entities.builtin.agent_runner.artifact import ArtifactReadResult
 from langbot_plugin.api.entities.builtin.provider.message import FunctionCall, Message, MessageChunk, ToolCall
 
 from pkg.agent_core import (
@@ -105,15 +106,15 @@ async def test_artifact_read_tool_uses_host_artifact_api_not_tool_call():
         def __init__(self):
             self.call_tool = AsyncMock()
             self.artifact_read = AsyncMock(
-                return_value={
-                    "artifact_id": "artifact-1",
-                    "mime_type": "text/plain; charset=utf-8",
-                    "size_bytes": 11,
-                    "offset": 2,
-                    "length": 5,
-                    "has_more": True,
-                    "content_base64": base64.b64encode("hello".encode("utf-8")).decode("ascii"),
-                }
+                return_value=ArtifactReadResult(
+                    artifact_id="artifact-1",
+                    mime_type="text/plain; charset=utf-8",
+                    size_bytes=11,
+                    offset=2,
+                    length=5,
+                    has_more=True,
+                    content_base64=base64.b64encode("hello".encode("utf-8")).decode("ascii"),
+                )
             )
 
     api = FakeAPI()
