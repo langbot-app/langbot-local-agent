@@ -52,11 +52,13 @@ plugin components use.
 | model | model-fallback-selector | yes | primary: '', fallbacks: [] | LLM model with fallbacks |
 | timeout | integer | no | 300 | Total runner execution timeout in seconds. Set to `0` or `null` to disable the host deadline. |
 | prompt | prompt-editor | yes | system: "You are a helpful assistant." | Default system prompt edited in LangBot UI |
+| remove-think | boolean | no | false | Ask Host model APIs to remove provider thinking output when supported |
 | knowledge-bases | knowledge-base-multi-selector | no | [] | Knowledge bases for RAG |
 | retrieval-top-k | integer | no | 5 | Retrieval results requested per knowledge base |
 | rerank-model | rerank-model-selector | no | '' | Rerank model for improved retrieval |
 | rerank-top-k | integer | no | 5 | Top-K results after reranking |
 | max-tool-iterations | integer | no | 20 | Maximum tool-call follow-up iterations |
+| tool-execution-mode | select | no | auto | Same-batch tool execution: `auto`, `parallel`, or `serial` |
 | max-tool-result-chars | integer | no | 20000 | Maximum serialized tool result characters injected into the next model request |
 | max-tool-result-artifact-bytes | integer | no | 1048576 | Maximum inline artifact payload bytes emitted by the runner for oversized tool text results |
 | context-history-fetch-limit | integer | no | 50 | Transcript messages pulled from the Host history API |
@@ -71,6 +73,23 @@ post-preprocessing effective prompt through `AgentRunAPIProxy.get_prompt()` and
 uses it instead of the static default so `PromptPreProcessing` changes are
 preserved. If the prompt API is unavailable, Local Agent falls back to
 `ctx.config.prompt`.
+
+`remove-think` is the first supported thinking-output control for Local Agent.
+When enabled, the runner passes `remove_think=True` to Host model APIs for both
+streaming and non-streaming calls. It is not Pi-style thinking-level control; it
+only requests provider thinking output removal when the active Host model
+adapter supports that flag.
+
+Skill support is Host-mediated. When Local Agent advertises
+`skill_injection`, LangBot pre-processing resolves the pipeline-visible skills
+from the Box-backed skill cache and appends a short `Available Skills` index
+(name and description only) to the effective system prompt. When Local Agent
+advertises `skill_authoring`, LangBot exposes the Host-owned `activate` and
+`register_skill` tools. Calling `activate` returns the full `SKILL.md`
+instructions as a tool result and registers the skill package for Box mount
+resolution under `/workspace/.skills/<skill-name>`. Local Agent consumes these
+through the Host prompt/tool APIs; it does not keep a runner-owned skill cache
+or scan `SKILL.md` files directly.
 
 Legacy singular `knowledge-base` values must be normalized by LangBot
 configuration migration before runner execution. Local Agent only reads the
@@ -89,6 +108,13 @@ serialized result exceeds that byte cap, Local Agent falls back to a bounded
 preview event and does not emit a full-result payload. Large files should be
 returned by sandbox tools as Host artifact/file references, not inline file
 content.
+
+`tool-execution-mode` controls tool calls emitted in the same model turn.
+`parallel` runs the batch concurrently and still writes tool-result messages
+back in source order. `serial` executes them one by one. `auto` keeps read-only
+and ordinary tools parallel, but switches the batch to serial when it includes
+stateful or side-effect tools such as `activate`, `register_skill`, `exec`,
+`write`, or `edit`.
 
 When a sandbox or Host tool already returns explicit `artifact_refs`,
 `artifact_id`, `file_refs`, `file_key`, or `file_id` fields, Local Agent treats
@@ -154,6 +180,11 @@ and the runner invokes them through `AgentRunAPIProxy.call_tool()`. "Local" here
 means the agent loop runs locally as a LangBot plugin, not that the model can
 read or write arbitrary files on the runner machine.
 
+Skill activation uses the same tool path. If Host exposes `activate` in the
+run's allowed tools, the model calls `activate` like any other function tool and
+Local Agent forwards it through `AgentRunAPIProxy.call_tool()`; no separate
+runner action is required for skill activation.
+
 Typical local-agent usage:
 
 - Invoke authorized LangBot-hosted models.
@@ -176,12 +207,19 @@ APIs.
 - `skill_authoring`: yes
 - `skill_injection`: yes
 - `event_context`: yes
-- `stateful_session`: yes
+- `stateful_session`: no
 
-`stateful_session` means the runner can participate in cross-run state through
-Host-owned state/storage or through runner-owned external state. It does not
-mean the plugin instance should keep mutable per-conversation state in memory.
-The plugin process is shared and must remain reentrant.
+`skill_authoring` and `skill_injection` mean Local Agent participates in
+LangBot's Host-owned skill flow. Skills remain owned by LangBot/Box; the runner
+only consumes the effective prompt, the `activate`/`register_skill` tools, and
+the tool results produced by the Host.
+
+Local Agent is currently reentrant and stateless across runs. It can pull Host
+history each run, but it does not yet persist summary checkpoints, external
+session IDs, or runner-owned memory through Host state/storage. Future
+stateful-session support should declare the required storage permissions and
+write/read checkpoints through `AgentRunAPIProxy` instead of keeping mutable
+per-conversation state in the plugin instance.
 
 ## Event System Boundary
 

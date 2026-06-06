@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import typing
 import uuid
 
@@ -36,14 +37,29 @@ from .types import (
     ToolResultArtifact,
 )
 
+THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_thinking_blocks(content: str) -> str:
+    return THINK_BLOCK_RE.sub("", content).lstrip()
+
 
 def build_assistant_message(content: str, tool_calls: list[ToolCallRequest]) -> Message:
     """Build an assistant message that preserves provider tool call IDs."""
     return Message(
         role="assistant",
-        content=content,
+        content=_strip_thinking_blocks(content) if tool_calls else content,
         tool_calls=[tool_call.to_tool_call() for tool_call in tool_calls] if tool_calls else None,
     )
+
+
+def _context_message_for_tool_follow_up(message: Message, tool_calls: list[ToolCallRequest]) -> Message:
+    if not tool_calls or not isinstance(message.content, str):
+        return message
+
+    copied = message.model_copy(deep=True)
+    copied.content = _strip_thinking_blocks(message.content)
+    return copied
 
 
 def _prefix_chunk_content(chunk: MessageChunk, prefix: str) -> MessageChunk:
@@ -64,8 +80,9 @@ def _prefix_chunk_content(chunk: MessageChunk, prefix: str) -> MessageChunk:
 class LangBotModelAdapter:
     """Model invocation adapter that keeps all model access behind Host APIs."""
 
-    def __init__(self, api: AgentRunAPIProxy):
+    def __init__(self, api: AgentRunAPIProxy, *, remove_think: bool = False):
         self.api = api
+        self.remove_think = remove_think
 
     async def stream_turn(
         self,
@@ -80,6 +97,7 @@ class LangBotModelAdapter:
             model_ids=model_ids,
             messages=messages,
             tools=tools,
+            remove_think=self.remove_think,
         )
 
         async for chunk, _is_delta in caller.stream():
@@ -109,10 +127,11 @@ class LangBotModelAdapter:
             model_ids=model_ids,
             messages=messages,
             tools=tools,
+            remove_think=self.remove_think,
         )
         tool_calls = [ToolCallRequest.from_raw(tool_call) for tool_call in response.tool_calls or []]
         return ModelTurnResult(
-            message=response,
+            message=_context_message_for_tool_follow_up(response, tool_calls),
             tool_calls=tool_calls,
             committed_model_id=committed_model_id,
             visible_content=response.content if isinstance(response.content, str) else "",
@@ -130,13 +149,14 @@ class LangBotModelAdapter:
                 llm_model_uuid=committed_model_id,
                 messages=messages,
                 funcs=tools,
+                remove_think=self.remove_think,
             )
         except Exception as e:
             raise ModelCallError(f"LLM call in tool loop failed: {e}", retryable=True) from e
 
         tool_calls = [ToolCallRequest.from_raw(tool_call) for tool_call in response.tool_calls or []]
         return ModelTurnResult(
-            message=response,
+            message=_context_message_for_tool_follow_up(response, tool_calls),
             tool_calls=tool_calls,
             committed_model_id=committed_model_id,
             visible_content=response.content if isinstance(response.content, str) else "",

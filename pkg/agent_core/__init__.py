@@ -11,6 +11,7 @@ from .types import (
     ModelTurnResult,
     PreparedToolCall,
     ToolCallRequest,
+    ToolExecutionMode,
     ToolExecutionOutcome,
     ToolResultArtifact,
 )
@@ -28,6 +29,7 @@ __all__ = [
     "ModelTurnResult",
     "PreparedToolCall",
     "ToolCallRequest",
+    "ToolExecutionMode",
     "ToolExecutionOutcome",
     "ToolResultArtifact",
 ]

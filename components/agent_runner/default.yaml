@@ -36,6 +36,13 @@ spec:
       default:
         - role: system
           content: "You are a helpful assistant."
+    - name: remove-think
+      label:
+        en_US: Remove Thinking Output
+        zh_Hans: 移除思考内容
+      type: boolean
+      required: false
+      default: false
     - name: knowledge-bases
       label:
         en_US: Knowledge Bases
@@ -71,6 +78,26 @@ spec:
       type: integer
       required: false
       default: 20
+    - name: tool-execution-mode
+      label:
+        en_US: Tool Execution Mode
+        zh_Hans: 工具执行模式
+      type: select
+      required: false
+      default: auto
+      options:
+        - name: auto
+          label:
+            en_US: Auto
+            zh_Hans: 自动
+        - name: parallel
+          label:
+            en_US: Parallel
+            zh_Hans: 并行
+        - name: serial
+          label:
+            en_US: Serial
+            zh_Hans: 串行
     - name: max-tool-result-chars
       label:
         en_US: Max Tool Result Characters
@@ -130,7 +157,7 @@ spec:
     event_context: true
     platform_api: false
     interrupt: false
-    stateful_session: true
+    stateful_session: false
   permissions:
     models: ["invoke", "stream"]
     tools: ["detail", "call"]

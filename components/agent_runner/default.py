@@ -31,6 +31,8 @@ from pkg.config import (
     get_max_tool_iterations,
     get_max_tool_result_artifact_bytes,
     get_max_tool_result_chars,
+    get_remove_think,
+    get_tool_execution_mode,
     parse_model_config,
 )
 from pkg.context_pipeline import ContextAssembler, ContextBudget
@@ -85,6 +87,8 @@ class DefaultAgentRunner(AgentRunner):
         max_tool_iterations = get_max_tool_iterations(ctx.config)
         max_tool_result_chars = get_max_tool_result_chars(ctx.config)
         max_tool_result_artifact_bytes = get_max_tool_result_artifact_bytes(ctx.config)
+        tool_execution_mode = get_tool_execution_mode(ctx.config)
+        remove_think = get_remove_think(ctx.config)
         context_budget = ContextBudget.from_context(ctx)
 
         # Build the model context through the runner-owned context pipeline.
@@ -103,8 +107,10 @@ class DefaultAgentRunner(AgentRunner):
             allowed_tools=allowed_tools,
             streaming=use_streaming,
             max_tool_iterations=max_tool_iterations,
+            tool_execution_mode=tool_execution_mode,
             max_tool_result_chars=max_tool_result_chars,
             max_tool_result_artifact_bytes=max_tool_result_artifact_bytes,
+            remove_think=remove_think,
             context_budget=context_budget,
             artifact_read_available=artifact_read_available,
         ):
@@ -119,8 +125,10 @@ class DefaultAgentRunner(AgentRunner):
         allowed_tools: set[str],
         streaming: bool,
         max_tool_iterations: int,
+        tool_execution_mode: Any,
         max_tool_result_chars: int,
         max_tool_result_artifact_bytes: int,
+        remove_think: bool,
         context_budget: ContextBudget,
         artifact_read_available: bool,
     ) -> AsyncGenerator[AgentRunResult, None]:
@@ -130,7 +138,7 @@ class DefaultAgentRunner(AgentRunner):
         if artifact_read_available:
             llm_tools.append(build_artifact_read_tool())
         loop = AgentLoop(
-            model_adapter=LangBotModelAdapter(api),
+            model_adapter=LangBotModelAdapter(api, remove_think=remove_think),
             tool_executor=LangBotToolExecutor(
                 api,
                 allowed_tools,
@@ -143,6 +151,7 @@ class DefaultAgentRunner(AgentRunner):
             tools=llm_tools,
             streaming=streaming,
             max_tool_iterations=max_tool_iterations,
+            tool_execution_mode=tool_execution_mode,
             hooks=LangBotContextHooks(context_budget),
         )
 

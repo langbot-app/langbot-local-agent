@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import typing
 
+from pkg.agent_core.types import ToolExecutionMode
 from pkg.tool_loop import DEFAULT_MAX_TOOL_ITERATIONS
 
 DEFAULT_MAX_TOOL_RESULT_CHARS = 20000
 DEFAULT_MAX_TOOL_RESULT_ARTIFACT_BYTES = 1_048_576
+DEFAULT_TOOL_EXECUTION_MODE = ToolExecutionMode.AUTO
 
 
 def parse_model_config(
@@ -126,6 +128,17 @@ def get_max_tool_iterations(config: dict[str, typing.Any]) -> int:
     return _positive_int(config.get("max-tool-iterations"), default=DEFAULT_MAX_TOOL_ITERATIONS)
 
 
+def get_tool_execution_mode(config: dict[str, typing.Any]) -> ToolExecutionMode:
+    """Get the same-batch tool execution strategy."""
+    raw_mode = config.get("tool-execution-mode", DEFAULT_TOOL_EXECUTION_MODE.value)
+    if not isinstance(raw_mode, str):
+        return DEFAULT_TOOL_EXECUTION_MODE
+    try:
+        return ToolExecutionMode(raw_mode)
+    except ValueError:
+        return DEFAULT_TOOL_EXECUTION_MODE
+
+
 def get_max_tool_result_chars(config: dict[str, typing.Any]) -> int:
     """Get the maximum tool result characters injected into model messages."""
     return _positive_int(config.get("max-tool-result-chars"), default=DEFAULT_MAX_TOOL_RESULT_CHARS)
@@ -137,6 +150,11 @@ def get_max_tool_result_artifact_bytes(config: dict[str, typing.Any]) -> int:
         config.get("max-tool-result-artifact-bytes"),
         default=DEFAULT_MAX_TOOL_RESULT_ARTIFACT_BYTES,
     )
+
+
+def get_remove_think(config: dict[str, typing.Any]) -> bool:
+    """Whether to ask Host model APIs to strip provider thinking output."""
+    return config.get("remove-think") is True
 
 
 def _positive_int(value: typing.Any, *, default: int) -> int:

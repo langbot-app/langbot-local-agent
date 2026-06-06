@@ -19,6 +19,7 @@ from pkg.agent_core import (
     ModelTurnEvent,
     ModelTurnResult,
     ToolCallRequest,
+    ToolExecutionMode,
 )
 from pkg.model_calling import INTERNAL_ARTIFACT_READ_TOOL_NAME, ModelCallError
 
@@ -105,6 +106,60 @@ async def test_streaming_loop_emits_turn_message_and_tool_events():
     ]
     assert deltas == ["Checking", "CheckingDone"]
     api.call_tool.assert_awaited_once_with(tool_name="allowed_tool", parameters={"arg": "value"})
+
+
+@pytest.mark.asyncio
+async def test_streaming_tool_follow_up_strips_thinking_from_model_context():
+    class FakeAPI:
+        def __init__(self):
+            self.call_tool = AsyncMock(return_value={"value": "tool-result"})
+            self.stream_calls: list[list[Message]] = []
+
+        def invoke_llm_stream(self, *args, **kwargs):
+            self.stream_calls.append([message.model_copy(deep=True) for message in kwargs["messages"]])
+
+            async def stream():
+                if len(self.stream_calls) == 1:
+                    yield MessageChunk(
+                        role="assistant",
+                        content="<think>private reasoning</think>\nNeed tool",
+                        is_final=True,
+                        tool_calls=[
+                            ToolCall(
+                                id="call-1",
+                                type="function",
+                                function=FunctionCall(name="allowed_tool", arguments='{"arg": "value"}'),
+                            )
+                        ],
+                    )
+                else:
+                    yield MessageChunk(role="assistant", content="Done", is_final=True)
+
+            return stream()
+
+    api = FakeAPI()
+    loop = AgentLoop(
+        model_adapter=LangBotModelAdapter(api),
+        tool_executor=LangBotToolExecutor(api, {"allowed_tool"}),
+        model_ids=["model-1"],
+        messages=[Message(role="user", content="Use the tool")],
+        tools=[],
+        streaming=True,
+        max_tool_iterations=10,
+    )
+
+    events = await _collect_events(loop)
+
+    deltas = [
+        event.chunk.content
+        for event in events
+        if event.type == AgentLoopEventType.MESSAGE_UPDATE and event.chunk is not None
+    ]
+    assert any("<think>private reasoning</think>" in delta for delta in deltas)
+    follow_up_messages = api.stream_calls[1]
+    assistant_with_tool = next(message for message in follow_up_messages if message.role == "assistant")
+    assert assistant_with_tool.content == "Need tool"
+    assert assistant_with_tool.tool_calls is not None
 
 
 @pytest.mark.asyncio
@@ -258,6 +313,160 @@ async def test_loop_executes_same_batch_tools_in_parallel_and_preserves_source_o
         message.tool_call_id for message in model_adapter.messages_by_turn[1] if message.role == "tool"
     ]
     assert second_model_turn_tool_results == ["call-slow", "call-fast"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_loop_auto_serializes_stateful_tool_batches(streaming):
+    class StatefulBatchModelAdapter:
+        def __init__(self):
+            self.turns = 0
+            self.tool_calls = [
+                ToolCallRequest(id="call-activate", name="activate", arguments='{"skill_name": "pdf"}'),
+                ToolCallRequest(id="call-read", name="read_tool", arguments='{"path": "/workspace/a.txt"}'),
+            ]
+
+        def _next_turn(self, messages: list[Message]) -> ModelTurnResult:
+            self.turns += 1
+            if self.turns == 1:
+                return ModelTurnResult(
+                    message=Message(
+                        role="assistant",
+                        content="Need skill",
+                        tool_calls=[tool_call.to_tool_call() for tool_call in self.tool_calls],
+                    ),
+                    tool_calls=self.tool_calls,
+                    committed_model_id="model-1",
+                    visible_content="Need skill",
+                )
+
+            return ModelTurnResult(
+                message=Message(role="assistant", content="Done"),
+                tool_calls=[],
+                committed_model_id="model-1",
+                visible_content="Done",
+            )
+
+        async def invoke_turn(self, *, model_ids, messages, tools):
+            return self._next_turn(messages)
+
+        async def invoke_committed_turn(self, *, committed_model_id, messages, tools):
+            return self._next_turn(messages)
+
+        async def stream_turn(self, *, model_ids, messages, tools, visible_prefix=""):
+            result = self._next_turn(messages)
+            yield ModelTurnEvent.message_delta(
+                MessageChunk(role="assistant", content=result.visible_content, is_final=True)
+            )
+            yield ModelTurnEvent.message_end(result)
+
+    class RecordingToolAPI:
+        def __init__(self):
+            self.active_calls = 0
+            self.max_active_calls = 0
+            self.call_order: list[str] = []
+
+        async def call_tool(self, *, tool_name, parameters):
+            self.active_calls += 1
+            self.max_active_calls = max(self.max_active_calls, self.active_calls)
+            self.call_order.append(tool_name)
+            try:
+                await asyncio.sleep(0.001)
+                return {"tool": tool_name, "parameters": parameters}
+            finally:
+                self.active_calls -= 1
+
+    api = RecordingToolAPI()
+    loop = AgentLoop(
+        model_adapter=StatefulBatchModelAdapter(),
+        tool_executor=LangBotToolExecutor(api, {"activate", "read_tool"}),
+        model_ids=["model-1"],
+        messages=[Message(role="user", content="Use pdf skill")],
+        tools=[],
+        streaming=streaming,
+        max_tool_iterations=10,
+        tool_execution_mode=ToolExecutionMode.AUTO,
+    )
+
+    events = await _collect_events(loop)
+
+    assert api.max_active_calls == 1
+    assert api.call_order == ["activate", "read_tool"]
+
+    tool_events = [
+        (event.type, event.tool_call_id)
+        for event in events
+        if event.type in {AgentLoopEventType.TOOL_EXECUTION_START, AgentLoopEventType.TOOL_EXECUTION_END}
+    ]
+    assert tool_events == [
+        (AgentLoopEventType.TOOL_EXECUTION_START, "call-activate"),
+        (AgentLoopEventType.TOOL_EXECUTION_END, "call-activate"),
+        (AgentLoopEventType.TOOL_EXECUTION_START, "call-read"),
+        (AgentLoopEventType.TOOL_EXECUTION_END, "call-read"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_loop_serial_mode_forces_serial_execution_for_ordinary_tools():
+    class OrdinaryBatchModelAdapter:
+        def __init__(self):
+            self.turns = 0
+            self.tool_calls = [
+                ToolCallRequest(id="call-a", name="tool_a", arguments="{}"),
+                ToolCallRequest(id="call-b", name="tool_b", arguments="{}"),
+            ]
+
+        async def invoke_turn(self, *, model_ids, messages, tools):
+            self.turns += 1
+            if self.turns == 1:
+                return ModelTurnResult(
+                    message=Message(
+                        role="assistant",
+                        content="Need tools",
+                        tool_calls=[tool_call.to_tool_call() for tool_call in self.tool_calls],
+                    ),
+                    tool_calls=self.tool_calls,
+                    committed_model_id="model-1",
+                    visible_content="Need tools",
+                )
+            return ModelTurnResult(
+                message=Message(role="assistant", content="Done"),
+                tool_calls=[],
+                committed_model_id="model-1",
+            )
+
+        async def invoke_committed_turn(self, *, committed_model_id, messages, tools):
+            return await self.invoke_turn(model_ids=[committed_model_id], messages=messages, tools=tools)
+
+    class RecordingToolAPI:
+        def __init__(self):
+            self.active_calls = 0
+            self.max_active_calls = 0
+
+        async def call_tool(self, *, tool_name, parameters):
+            self.active_calls += 1
+            self.max_active_calls = max(self.max_active_calls, self.active_calls)
+            try:
+                await asyncio.sleep(0.001)
+                return {"tool": tool_name}
+            finally:
+                self.active_calls -= 1
+
+    api = RecordingToolAPI()
+    loop = AgentLoop(
+        model_adapter=OrdinaryBatchModelAdapter(),
+        tool_executor=LangBotToolExecutor(api, {"tool_a", "tool_b"}),
+        model_ids=["model-1"],
+        messages=[Message(role="user", content="Use tools")],
+        tools=[],
+        streaming=False,
+        max_tool_iterations=10,
+        tool_execution_mode=ToolExecutionMode.SERIAL,
+    )
+
+    await _collect_events(loop)
+
+    assert api.max_active_calls == 1
 
 
 @pytest.mark.asyncio

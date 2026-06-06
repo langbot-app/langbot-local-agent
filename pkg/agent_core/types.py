@@ -33,6 +33,12 @@ class ModelTurnEventType(StrEnum):
     MESSAGE_END = "message_end"
 
 
+class ToolExecutionMode(StrEnum):
+    AUTO = "auto"
+    PARALLEL = "parallel"
+    SERIAL = "serial"
+
+
 @dataclass(frozen=True)
 class ToolCallRequest:
     """Provider-neutral tool call shape used by the agent loop."""

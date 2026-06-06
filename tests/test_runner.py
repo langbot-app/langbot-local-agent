@@ -54,8 +54,10 @@ from pkg.config import (
     get_max_tool_iterations,
     get_max_tool_result_artifact_bytes,
     get_max_tool_result_chars,
+    get_remove_think,
     get_rerank_config,
     get_retrieval_top_k,
+    get_tool_execution_mode,
     parse_model_config,
 )
 from pkg.context_pipeline import (
@@ -316,6 +318,20 @@ class TestRunnerBehaviorConfig:
         assert get_max_tool_result_artifact_bytes({"max-tool-result-artifact-bytes": "1024"}) == (
             DEFAULT_MAX_TOOL_RESULT_ARTIFACT_BYTES
         )
+
+    def test_remove_think(self):
+        assert get_remove_think({"remove-think": True}) is True
+        assert get_remove_think({"remove-think": False}) is False
+        assert get_remove_think({"remove-think": "true"}) is False
+        assert get_remove_think({}) is False
+
+    def test_tool_execution_mode(self):
+        assert get_tool_execution_mode({"tool-execution-mode": "auto"}) == "auto"
+        assert get_tool_execution_mode({"tool-execution-mode": "parallel"}) == "parallel"
+        assert get_tool_execution_mode({"tool-execution-mode": "serial"}) == "serial"
+        assert get_tool_execution_mode({"tool-execution-mode": "invalid"}) == "auto"
+        assert get_tool_execution_mode({"tool-execution-mode": True}) == "auto"
+        assert get_tool_execution_mode({}) == "auto"
 
 
 # ==================== Message Helper Tests ====================
@@ -667,15 +683,20 @@ class TestDefaultAgentRunner:
         )
 
         assert manifest["spec"]["capabilities"]["event_context"] is True
+        assert manifest["spec"]["capabilities"]["skill_authoring"] is True
+        assert manifest["spec"]["capabilities"]["skill_injection"] is True
+        assert manifest["spec"]["capabilities"]["stateful_session"] is False
         assert manifest["spec"]["permissions"]["history"] == ["page", "search"]
         assert "storage" not in manifest["spec"]["permissions"]
         assert "files" not in manifest["spec"]["permissions"]
         config_names = {item["name"] for item in manifest["spec"]["config"]}
+        assert "remove-think" in config_names
         assert "context-window-tokens" in config_names
         assert "context-keep-recent-tokens" in config_names
         assert "context-window-chars" not in config_names
         assert "retrieval-top-k" in config_names
         assert "max-tool-iterations" in config_names
+        assert "tool-execution-mode" in config_names
         assert "max-tool-result-chars" in config_names
         assert "max-tool-result-artifact-bytes" in config_names
         max_tool_iterations = next(item for item in manifest["spec"]["config"] if item["name"] == "max-tool-iterations")
@@ -1309,6 +1330,58 @@ class TestDefaultAgentRunner:
         assert started[0].data.get("tool_name") == "allowed_tool"
         assert len(completed) == 1
         assert completed[0].data.get("error") is None  # No error
+
+    @pytest.mark.asyncio
+    async def test_skill_activation_uses_host_tool_call(self, runner, monkeypatch):
+        """Host-owned activate tool is invoked through the normal tool API."""
+        fake_api = FakeAgentRunAPIProxy(
+            models=[ModelResource(model_id="model-1")],
+            tools=[ToolResource(tool_name="activate")],
+        )
+        call_count = [0]
+
+        async def mock_stream(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                yield MessageChunk(
+                    role="assistant",
+                    content="",
+                    is_final=True,
+                    tool_calls=[
+                        ToolCall(
+                            id="call-activate",
+                            type="function",
+                            function=FunctionCall(name="activate", arguments='{"skill_name": "pdf"}'),
+                        )
+                    ],
+                )
+            else:
+                yield MessageChunk(role="assistant", content="Skill loaded.", is_final=True)
+
+        fake_api.invoke_llm_stream = mock_stream
+        fake_api.call_tool = AsyncMock(
+            return_value={
+                "activated": True,
+                "skill_name": "pdf",
+                "content": '<skill-activation><skill-name>pdf</skill-name></skill-activation>',
+            }
+        )
+        monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
+
+        ctx = make_context(
+            config={"model": {"primary": "model-1", "fallbacks": []}},
+            resources=AgentResources(
+                models=[ModelResource(model_id="model-1")],
+                tools=[ToolResource(tool_name="activate")],
+            ),
+        )
+
+        results = [result async for result in runner.run(ctx)]
+
+        fake_api.call_tool.assert_awaited_once_with(tool_name="activate", parameters={"skill_name": "pdf"})
+        completed = [r for r in results if r.type == AgentRunResultType.TOOL_CALL_COMPLETED]
+        assert completed[0].data.get("tool_name") == "activate"
+        assert completed[0].data.get("error") is None
 
     @pytest.mark.asyncio
     async def test_tool_result_is_bounded_before_follow_up_model_call(self, runner, monkeypatch):
@@ -1999,6 +2072,30 @@ class TestDefaultAgentRunner:
         assert len(completed) == 1
         assert completed[0].data.get("message", {}).get("content") == "Non-streaming response"
         assert len(run_completed) == 1
+
+    @pytest.mark.asyncio
+    async def test_remove_think_is_forwarded_to_model_calls(self, runner, monkeypatch):
+        """Runner config can request Host-side thinking output removal."""
+        fake_api = FakeAgentRunAPIProxy(
+            models=[ModelResource(model_id="model-1")],
+        )
+        fake_api.invoke_llm = AsyncMock(return_value=Message(role="assistant", content="Clean response"))
+        monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
+
+        ctx = make_context(
+            config={"model": {"primary": "model-1", "fallbacks": []}, "remove-think": True},
+            resources=AgentResources(models=[ModelResource(model_id="model-1")]),
+            runtime_metadata={"streaming_supported": False},
+        )
+
+        results = []
+        async for result in runner.run(ctx):
+            results.append(result)
+
+        fake_api.invoke_llm.assert_awaited_once()
+        assert fake_api.invoke_llm.await_args.kwargs["remove_think"] is True
+        completed = [r for r in results if r.type == AgentRunResultType.MESSAGE_COMPLETED]
+        assert completed[0].data.get("message", {}).get("content") == "Clean response"
 
     @pytest.mark.asyncio
     async def test_runtime_metadata_can_disable_default_streaming(self, runner, monkeypatch):

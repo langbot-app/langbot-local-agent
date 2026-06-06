@@ -141,6 +141,7 @@ async def invoke_with_fallback(
     model_ids: list[str],
     messages: list[Message],
     tools: list[LLMTool] | None = None,
+    remove_think: bool = False,
 ) -> tuple[Message, str]:
     """Invoke LLM with sequential fallback on failure.
 
@@ -166,6 +167,7 @@ async def invoke_with_fallback(
                 llm_model_uuid=model_id,
                 messages=messages,
                 funcs=tools or [],
+                remove_think=remove_think,
             )
             return response, model_id
         except Exception as e:
@@ -192,11 +194,13 @@ class StreamingModelCaller:
         model_ids: list[str],
         messages: list[Message],
         tools: list[LLMTool] | None = None,
+        remove_think: bool = False,
     ):
         self.api = api
         self.model_ids = model_ids
         self.messages = messages
         self.tools = tools or []
+        self.remove_think = remove_think
 
         self._committed_model_id: str | None = None
         self._accumulated_content = ""
@@ -239,6 +243,7 @@ class StreamingModelCaller:
                     llm_model_uuid=model_id,
                     messages=self.messages,
                     funcs=self.tools,
+                    remove_think=self.remove_think,
                 )
                 first_chunk = await self._next_non_empty_chunk(stream)
                 # First chunk received - model is now committed
