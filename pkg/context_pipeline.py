@@ -214,6 +214,7 @@ class ContextCompactor:
         messages plus the current turn tail, and compact older runtime messages
         between them.
         """
+        messages = sanitize_provider_messages(messages)
         prompt_messages, runtime_messages = _split_leading_prompt_messages(messages)
         history_messages, current_messages = _split_runtime_history_and_current(runtime_messages)
         return self.compact(
@@ -229,23 +230,24 @@ class ContextCompactor:
         history_messages: list[Message],
         current_messages: list[Message],
     ) -> ContextAssembly:
-        prompt = _copy_messages(prompt_messages)
-        history = _copy_messages(history_messages)
-        current = _copy_messages(current_messages)
+        prompt = sanitize_provider_messages(prompt_messages)
+        history = sanitize_provider_messages(history_messages)
+        current = sanitize_provider_messages(current_messages)
         original_messages = prompt + history + current
         tokens_before = estimate_messages_tokens(original_messages)
 
         if not self.budget.enabled or tokens_before <= self.budget.input_tokens:
+            messages = sanitize_provider_messages(original_messages)
             return ContextAssembly(
-                messages=original_messages,
+                messages=messages,
                 compacted=False,
                 tokens_before=tokens_before,
-                tokens_after=tokens_before,
+                tokens_after=estimate_messages_tokens(messages),
             )
 
         history_budget = max(self.budget.input_tokens - estimate_messages_tokens(prompt + current), 0)
         if not history:
-            messages = prompt + current
+            messages = sanitize_provider_messages(prompt + current)
             return ContextAssembly(
                 messages=messages,
                 compacted=False,
@@ -254,7 +256,9 @@ class ContextCompactor:
             )
         if history_budget <= 0:
             summary_message = self._build_summary_message(history, self.budget.summary_tokens)
-            messages = prompt + ([summary_message] if summary_message is not None else []) + current
+            messages = sanitize_provider_messages(
+                prompt + ([summary_message] if summary_message is not None else []) + current
+            )
             return ContextAssembly(
                 messages=messages,
                 compacted=True,
@@ -271,7 +275,7 @@ class ContextCompactor:
         recent = history[first_kept_index:]
         summary_message = self._build_summary_message(omitted, summary_budget)
         compacted_history = ([summary_message] if summary_message is not None else []) + recent
-        messages = prompt + compacted_history + current
+        messages = sanitize_provider_messages(prompt + compacted_history + current)
 
         return ContextAssembly(
             messages=messages,
@@ -318,6 +322,65 @@ class ContextCompactor:
         if not summary:
             return None
         return Message(role="system", content=summary)
+
+
+def sanitize_provider_messages(messages: list[Message]) -> list[Message]:
+    """Return model messages with provider-unsafe tool/thinking blocks removed.
+
+    Anthropic-style providers require every tool result to be adjacent to the
+    assistant tool use that produced it. Host transcript history can contain
+    partial old turns, so normalize that shape before every model call.
+    """
+    cleaned = [_sanitize_message(message) for message in messages]
+    cleaned = [message for message in cleaned if message is not None]
+
+    normalized: list[Message] = []
+    index = 0
+    while index < len(cleaned):
+        message = cleaned[index]
+        if message.role == "tool":
+            index += 1
+            continue
+
+        if message.role == "assistant" and message.tool_calls:
+            next_index = index + 1
+            tool_result_messages: list[Message] = []
+            seen_result_ids: set[str] = set()
+            valid_tool_call_ids = {
+                tool_call.id
+                for tool_call in message.tool_calls
+                if isinstance(getattr(tool_call, "id", None), str) and tool_call.id
+            }
+
+            while next_index < len(cleaned) and cleaned[next_index].role == "tool":
+                tool_message = cleaned[next_index]
+                tool_call_id = tool_message.tool_call_id
+                if (
+                    isinstance(tool_call_id, str)
+                    and tool_call_id in valid_tool_call_ids
+                    and tool_call_id not in seen_result_ids
+                ):
+                    tool_result_messages.append(tool_message)
+                    seen_result_ids.add(tool_call_id)
+                next_index += 1
+
+            if tool_result_messages:
+                message.tool_calls = [
+                    tool_call for tool_call in message.tool_calls if tool_call.id in seen_result_ids
+                ]
+                normalized.append(message)
+                normalized.extend(tool_result_messages)
+            else:
+                message.tool_calls = None
+                if _message_has_model_content(message):
+                    normalized.append(message)
+            index = next_index
+            continue
+
+        normalized.append(message)
+        index += 1
+
+    return normalized
 
 
 def summarize_messages(messages: list[Message], max_chars: int) -> str:
@@ -442,6 +505,60 @@ def _model_or_mapping_get(value: typing.Any, key: str, default: typing.Any = Non
 
 def _copy_messages(messages: list[Message]) -> list[Message]:
     return [message.model_copy(deep=True) for message in messages]
+
+
+def _sanitize_message(message: Message) -> Message | None:
+    copied = message.model_copy(deep=True)
+    copied.content = _sanitize_content(copied.content)
+    if copied.tool_calls:
+        copied.tool_calls = [
+            tool_call
+            for tool_call in copied.tool_calls
+            if isinstance(getattr(tool_call, "id", None), str)
+            and tool_call.id
+            and getattr(tool_call, "function", None) is not None
+            and isinstance(getattr(tool_call.function, "name", None), str)
+            and tool_call.function.name
+        ]
+        if not copied.tool_calls:
+            copied.tool_calls = None
+
+    if copied.role == "tool" and not copied.tool_call_id:
+        return None
+
+    if copied.role not in {"system", "developer", "user", "assistant", "tool"}:
+        return None
+
+    if not _message_has_model_content(copied) and copied.role != "tool":
+        return None
+
+    return copied
+
+
+def _sanitize_content(content: typing.Any) -> typing.Any:
+    if not isinstance(content, list):
+        return content
+
+    safe_content = []
+    for item in content:
+        item_type = getattr(item, "type", "")
+        if item_type == "text":
+            if getattr(item, "text", None):
+                safe_content.append(item)
+        elif isinstance(item_type, str) and item_type.startswith(("image", "file")):
+            safe_content.append(item)
+
+    return safe_content if safe_content else ""
+
+
+def _message_has_model_content(message: Message) -> bool:
+    if message.tool_calls:
+        return True
+    if isinstance(message.content, str):
+        return bool(message.content)
+    if isinstance(message.content, list):
+        return bool(message.content)
+    return False
 
 
 def _split_leading_prompt_messages(messages: list[Message]) -> tuple[list[Message], list[Message]]:

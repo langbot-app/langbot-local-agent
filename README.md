@@ -21,8 +21,8 @@ documents how Local Agent consumes that contract:
 - `ctx.context`: context handles, inline policy, and available pull APIs. Local
   Agent uses the Host history API for conversation history instead of adapter
   bootstrap.
-- `ctx.resources`: run-scoped authorized models, tools, knowledge bases, files,
-  and storage capabilities.
+- `ctx.resources`: run-scoped authorized models, tools, knowledge bases, skills,
+  files, and storage capabilities.
 - `ctx.state`: small Host-projected state for the current run.
 - `ctx.runtime`: runtime metadata such as deadline, trace id, protocol version,
   query id from migration adapter paths, and Host metadata.
@@ -81,15 +81,14 @@ only requests provider thinking output removal when the active Host model
 adapter supports that flag.
 
 Skill support is Host-mediated. When Local Agent advertises
-`skill_injection`, LangBot pre-processing resolves the pipeline-visible skills
-from the Box-backed skill cache and appends a short `Available Skills` index
-(name and description only) to the effective system prompt. When Local Agent
-advertises `skill_authoring`, LangBot exposes the Host-owned `activate` and
-`register_skill` tools. Calling `activate` returns the full `SKILL.md`
-instructions as a tool result and registers the skill package for Box mount
-resolution under `/workspace/.skills/<skill-name>`. Local Agent consumes these
-through the Host prompt/tool APIs; it does not keep a runner-owned skill cache
-or scan `SKILL.md` files directly.
+`skill_authoring`, LangBot lists the current pipeline-visible skill facts in
+`ctx.resources.skills` and exposes the Host-owned `activate` and
+`register_skill` tools according to the same visibility policy. Calling
+`activate` returns the full `SKILL.md` instructions as a tool result and
+registers the skill package for Box mount resolution under
+`/workspace/.skills/<skill-name>`. Local Agent consumes skill facts and tools
+through Host APIs; it decides how tool schemas, tool results, prompt context,
+or MCP surfaces are presented to the model.
 
 Legacy singular `knowledge-base` values must be normalized by LangBot
 configuration migration before runner execution. Local Agent only reads the
@@ -205,14 +204,14 @@ APIs.
 - `knowledge_retrieval`: yes
 - `multimodal_input`: yes
 - `skill_authoring`: yes
-- `skill_injection`: yes
 - `event_context`: yes
 - `stateful_session`: no
 
-`skill_authoring` and `skill_injection` mean Local Agent participates in
-LangBot's Host-owned skill flow. Skills remain owned by LangBot/Box; the runner
-only consumes the effective prompt, the `activate`/`register_skill` tools, and
-the tool results produced by the Host.
+`skill_authoring` means Local Agent can receive LangBot's Host-owned
+`ctx.resources.skills` facts plus `activate`/`register_skill` tools when skills
+are available. Skills remain owned by LangBot/Box; the runner owns how
+model-facing prompts, tool schemas, tool results, or MCP adapters are assembled
+from those Host capabilities.
 
 Local Agent is currently reentrant and stateless across runs. It can pull Host
 history each run, but it does not yet persist summary checkpoints, external

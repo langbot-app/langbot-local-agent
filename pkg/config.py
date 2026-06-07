@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import typing
 
-from pkg.agent_core.types import ToolExecutionMode
 from pkg.tool_loop import DEFAULT_MAX_TOOL_ITERATIONS
 
 DEFAULT_MAX_TOOL_RESULT_CHARS = 20000
 DEFAULT_MAX_TOOL_RESULT_ARTIFACT_BYTES = 1_048_576
-DEFAULT_TOOL_EXECUTION_MODE = ToolExecutionMode.AUTO
+DEFAULT_TOOL_EXECUTION_MODE = "auto"
+VALID_TOOL_EXECUTION_MODES = {"auto", "parallel", "serial"}
 
 
 def parse_model_config(
@@ -128,15 +128,14 @@ def get_max_tool_iterations(config: dict[str, typing.Any]) -> int:
     return _positive_int(config.get("max-tool-iterations"), default=DEFAULT_MAX_TOOL_ITERATIONS)
 
 
-def get_tool_execution_mode(config: dict[str, typing.Any]) -> ToolExecutionMode:
+def get_tool_execution_mode(config: dict[str, typing.Any]) -> str:
     """Get the same-batch tool execution strategy."""
-    raw_mode = config.get("tool-execution-mode", DEFAULT_TOOL_EXECUTION_MODE.value)
+    raw_mode = config.get("tool-execution-mode", DEFAULT_TOOL_EXECUTION_MODE)
     if not isinstance(raw_mode, str):
         return DEFAULT_TOOL_EXECUTION_MODE
-    try:
-        return ToolExecutionMode(raw_mode)
-    except ValueError:
+    if raw_mode not in VALID_TOOL_EXECUTION_MODES:
         return DEFAULT_TOOL_EXECUTION_MODE
+    return raw_mode
 
 
 def get_max_tool_result_chars(config: dict[str, typing.Any]) -> int:

@@ -153,7 +153,6 @@ spec:
     knowledge_retrieval: true
     multimodal_input: true
     skill_authoring: true
-    skill_injection: true
     event_context: true
     platform_api: false
     interrupt: false

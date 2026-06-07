@@ -28,6 +28,7 @@ from langbot_plugin.api.entities.builtin.agent_runner.resources import (
     AgentResources,
     KnowledgeBaseResource,
     ModelResource,
+    SkillResource,
     ToolResource,
 )
 from langbot_plugin.api.entities.builtin.agent_runner.result import (
@@ -67,6 +68,7 @@ from pkg.context_pipeline import (
     DEFAULT_CONTEXT_WINDOW_TOKENS,
     ContextBudget,
     ContextCompactor,
+    sanitize_provider_messages,
 )
 from pkg.messages import build_prompt_messages, build_user_message, format_rag_results, get_effective_prompt_config
 from pkg.model_calling import (
@@ -574,9 +576,9 @@ class TestContextCompaction:
         assert "recent assistant sentinel" in contents
 
     def test_flat_compaction_keeps_current_user_when_prompt_exceeds_budget(self):
-        """A large injected prompt must not evict the current user request."""
+        """A large system prompt must not evict the current user request."""
         messages = [
-            Message(role="system", content="Available Skills:\n" + ("skill index " * 120)),
+            Message(role="system", content="Large system context:\n" + ("policy note " * 120)),
             Message(role="user", content="current user sentinel"),
         ]
         budget = ContextBudget(
@@ -599,7 +601,7 @@ class TestContextCompaction:
             function=FunctionCall(name="allowed_tool", arguments="{}"),
         )
         messages = [
-            Message(role="system", content="Available Skills:\n" + ("skill index " * 120)),
+            Message(role="system", content="Large system context:\n" + ("policy note " * 120)),
             Message(role="user", content="old tool request " + "x" * 200),
             Message(role="assistant", content="", tool_calls=[tool_call]),
             Message(role="tool", tool_call_id="call-1", content="tool result sentinel"),
@@ -617,10 +619,65 @@ class TestContextCompaction:
         assert assembly.messages[-1].role == "tool"
         assert assembly.messages[-1].content == "tool result sentinel"
 
+    def test_provider_sanitizer_drops_orphan_tool_results_and_keeps_legal_pairs(self):
+        """Provider history keeps only adjacent assistant tool-call/tool-result pairs."""
+        legal_tool_call = ToolCall(
+            id="call-legal",
+            type="function",
+            function=FunctionCall(name="allowed_tool", arguments="{}"),
+        )
+        dangling_tool_call = ToolCall(
+            id="call-dangling",
+            type="function",
+            function=FunctionCall(name="allowed_tool", arguments="{}"),
+        )
+        messages = [
+            Message(role="user", content="ordinary context"),
+            Message(role="tool", tool_call_id="call-orphan", content="orphan result"),
+            Message(role="assistant", content="", tool_calls=[legal_tool_call, dangling_tool_call]),
+            Message(role="tool", tool_call_id="call-legal", content="legal result"),
+            Message(role="assistant", content="assistant text", tool_calls=[dangling_tool_call]),
+            Message(role="user", content="current user"),
+        ]
+
+        sanitized = sanitize_provider_messages(messages)
+
+        assert [(message.role, message.content) for message in sanitized] == [
+            ("user", "ordinary context"),
+            ("assistant", ""),
+            ("tool", "legal result"),
+            ("assistant", "assistant text"),
+            ("user", "current user"),
+        ]
+        assert sanitized[1].tool_calls is not None
+        assert [tool_call.id for tool_call in sanitized[1].tool_calls] == ["call-legal"]
+        assert sanitized[2].tool_call_id == "call-legal"
+        assert sanitized[3].tool_calls is None
+
+    def test_provider_sanitizer_filters_reasoning_and_provider_tool_content_blocks(self):
+        """Provider-specific content blocks are not replayed as generic model input."""
+        message = Message.model_validate(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "reasoning_content", "text": "hidden reasoning"},
+                    {"type": "tool_result", "tool_use_id": "call-1", "content": "raw provider result"},
+                    {"type": "text", "text": "visible user context"},
+                ],
+            }
+        )
+
+        sanitized = sanitize_provider_messages([message])
+
+        assert len(sanitized) == 1
+        assert isinstance(sanitized[0].content, list)
+        assert [content.type for content in sanitized[0].content] == ["text"]
+        assert sanitized[0].content[0].text == "visible user context"
+
     def test_compactor_summarizes_history_when_prompt_and_current_exceed_budget(self):
         """A large prompt should not force all older facts to disappear."""
         messages = [
-            Message(role="system", content="Available Skills:\n" + ("skill index " * 120)),
+            Message(role="system", content="Large system context:\n" + ("policy note " * 120)),
             Message(role="user", content="remember qa_compaction_sentinel_7391"),
             Message(role="assistant", content="MEMORY_SET"),
             Message(role="user", content="what was the sentinel?"),
@@ -684,7 +741,6 @@ class TestDefaultAgentRunner:
 
         assert manifest["spec"]["capabilities"]["event_context"] is True
         assert manifest["spec"]["capabilities"]["skill_authoring"] is True
-        assert manifest["spec"]["capabilities"]["skill_injection"] is True
         assert manifest["spec"]["capabilities"]["stateful_session"] is False
         assert manifest["spec"]["permissions"]["history"] == ["page", "search"]
         assert "storage" not in manifest["spec"]["permissions"]
@@ -879,6 +935,112 @@ class TestDefaultAgentRunner:
             ("assistant", "previous answer"),
             ("user", "current input"),
         ]
+
+    @pytest.mark.asyncio
+    async def test_history_tool_results_are_provider_normalized_before_model_call(self, runner, monkeypatch):
+        """Host history orphan tool results are removed before provider invocation."""
+        fake_api = FakeAgentRunAPIProxy(
+            models=[ModelResource(model_id="model-1")],
+        )
+        fake_api.history_page = AsyncMock(
+            return_value={
+                "items": [
+                    {
+                        "event_id": "evt-run-tool-history",
+                        "role": "user",
+                        "content": "current request",
+                    },
+                    {
+                        "event_id": "evt-orphan-tool",
+                        "role": "tool",
+                        "content_json": {
+                            "role": "tool",
+                            "tool_call_id": "call-orphan",
+                            "content": "orphan tool result",
+                        },
+                    },
+                    {
+                        "event_id": "evt-history-after-orphan",
+                        "role": "user",
+                        "content": "ordinary context after orphan",
+                    },
+                    {
+                        "event_id": "evt-legal-tool",
+                        "role": "tool",
+                        "content_json": {
+                            "role": "tool",
+                            "tool_call_id": "call-legal",
+                            "content": "legal tool result",
+                        },
+                    },
+                    {
+                        "event_id": "evt-legal-assistant",
+                        "role": "assistant",
+                        "content_json": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call-legal",
+                                    "type": "function",
+                                    "function": {"name": "allowed_tool", "arguments": "{}"},
+                                },
+                                {
+                                    "id": "call-missing-result",
+                                    "type": "function",
+                                    "function": {"name": "allowed_tool", "arguments": "{}"},
+                                },
+                            ],
+                        },
+                    },
+                    {
+                        "event_id": "evt-history-user",
+                        "role": "user",
+                        "content": "ordinary context before tool",
+                    },
+                ],
+                "next_cursor": None,
+                "prev_cursor": None,
+                "has_more": False,
+            }
+        )
+        captured_messages: list[Message] = []
+
+        async def mock_stream(*args, **kwargs):
+            captured_messages.extend([message.model_copy(deep=True) for message in kwargs["messages"]])
+            yield MessageChunk(role="assistant", content="Response", is_final=True)
+
+        fake_api.invoke_llm_stream = mock_stream
+        monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
+
+        ctx = make_context(
+            run_id="run-tool-history",
+            config={"model": {"primary": "model-1", "fallbacks": []}},
+            resources=AgentResources(models=[ModelResource(model_id="model-1")]),
+            input_text="current request",
+            history_available=True,
+        )
+
+        results = [result async for result in runner.run(ctx)]
+
+        assert any(r.type == AgentRunResultType.RUN_COMPLETED for r in results)
+        assert "ordinary context before tool" in [message.content for message in captured_messages]
+        assert "ordinary context after orphan" in [message.content for message in captured_messages]
+        assert "current request" == captured_messages[-1].content
+        assert not any(message.role == "tool" and message.tool_call_id == "call-orphan" for message in captured_messages)
+
+        assistant_tool_messages = [
+            message
+            for message in captured_messages
+            if message.role == "assistant" and message.tool_calls
+        ]
+        assert len(assistant_tool_messages) == 1
+        assert [tool_call.id for tool_call in assistant_tool_messages[0].tool_calls] == ["call-legal"]
+
+        legal_assistant_index = captured_messages.index(assistant_tool_messages[0])
+        assert captured_messages[legal_assistant_index + 1].role == "tool"
+        assert captured_messages[legal_assistant_index + 1].tool_call_id == "call-legal"
+        assert captured_messages[legal_assistant_index + 1].content == "legal tool result"
 
     @pytest.mark.asyncio
     async def test_prompt_get_replaces_static_prompt(self, runner, monkeypatch):
@@ -1372,6 +1534,7 @@ class TestDefaultAgentRunner:
             config={"model": {"primary": "model-1", "fallbacks": []}},
             resources=AgentResources(
                 models=[ModelResource(model_id="model-1")],
+                skills=[SkillResource(skill_name="pdf", display_name="PDF", description="Work with PDFs")],
                 tools=[ToolResource(tool_name="activate")],
             ),
         )
