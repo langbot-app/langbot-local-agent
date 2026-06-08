@@ -23,20 +23,9 @@ from pkg.agent_core import (
     AgentLoop,
     AgentLoopEvent,
     AgentLoopEventType,
-    LangBotContextHooks,
     LangBotModelAdapter,
-    LangBotToolExecutor,
 )
-from pkg.config import (
-    get_max_tool_iterations,
-    get_max_tool_result_artifact_bytes,
-    get_max_tool_result_chars,
-    get_remove_think,
-    get_tool_execution_mode,
-    parse_model_config,
-)
-from pkg.context_pipeline import ContextAssembler, ContextBudget
-from pkg.model_calling import INTERNAL_ARTIFACT_READ_TOOL_NAME, build_artifact_read_tool, build_llm_tools
+from pkg.run_assembly import AgentRunAssembler, AgentRunAssembly, NoAuthorizedModelError
 
 
 class DefaultAgentRunner(AgentRunner):
@@ -64,14 +53,9 @@ class DefaultAgentRunner(AgentRunner):
         """
         api = self.get_run_api(ctx)
 
-        # Get authorized models
-        allowed_model_ids = set(m.model_id for m in api.get_allowed_models())
-
-        # Parse current model-fallback-selector config.
-        model_config = ctx.config.get("model")
-        model_ids = parse_model_config(model_config, allowed_model_ids)
-
-        if not model_ids:
+        try:
+            assembly = await AgentRunAssembler(api, ctx).assemble()
+        except NoAuthorizedModelError:
             yield AgentRunResult.run_failed(
                 ctx.run_id,
                 error="No authorized model for local-agent",
@@ -79,40 +63,10 @@ class DefaultAgentRunner(AgentRunner):
             )
             return
 
-        # Get allowed tools for tool calling.
-        allowed_tools = set(t.tool_name for t in api.get_allowed_tools())
-        artifact_read_available = bool(getattr(ctx.context.available_apis, "artifact_read", False))
-        if artifact_read_available:
-            allowed_tools.add(INTERNAL_ARTIFACT_READ_TOOL_NAME)
-        max_tool_iterations = get_max_tool_iterations(ctx.config)
-        max_tool_result_chars = get_max_tool_result_chars(ctx.config)
-        max_tool_result_artifact_bytes = get_max_tool_result_artifact_bytes(ctx.config)
-        tool_execution_mode = get_tool_execution_mode(ctx.config)
-        remove_think = get_remove_think(ctx.config)
-        context_budget = ContextBudget.from_context(ctx)
-
-        # Build the model context through the runner-owned context pipeline.
-        context_assembly = await ContextAssembler(api, ctx, budget=context_budget).assemble()
-        messages = context_assembly.messages
-
-        # Prefer host runtime capability so non-streaming adapters keep the
-        # same behavior as the original built-in local-agent runner.
-        use_streaming = bool(ctx.runtime.metadata.get("streaming_supported", True))
-
         async for result in self._run_agent_loop(
             run_id=ctx.run_id,
             api=api,
-            model_ids=model_ids,
-            messages=messages,
-            allowed_tools=allowed_tools,
-            streaming=use_streaming,
-            max_tool_iterations=max_tool_iterations,
-            tool_execution_mode=tool_execution_mode,
-            max_tool_result_chars=max_tool_result_chars,
-            max_tool_result_artifact_bytes=max_tool_result_artifact_bytes,
-            remove_think=remove_think,
-            context_budget=context_budget,
-            artifact_read_available=artifact_read_available,
+            assembly=assembly,
         ):
             yield result
 
@@ -120,39 +74,19 @@ class DefaultAgentRunner(AgentRunner):
         self,
         run_id: str,
         api: Any,
-        model_ids: list[str],
-        messages: list[Message],
-        allowed_tools: set[str],
-        streaming: bool,
-        max_tool_iterations: int,
-        tool_execution_mode: Any,
-        max_tool_result_chars: int,
-        max_tool_result_artifact_bytes: int,
-        remove_think: bool,
-        context_budget: ContextBudget,
-        artifact_read_available: bool,
+        assembly: AgentRunAssembly,
     ) -> AsyncGenerator[AgentRunResult, None]:
         """Run the LangBot-native Pi-style agent loop."""
-        host_tool_names = {tool_name for tool_name in allowed_tools if tool_name != INTERNAL_ARTIFACT_READ_TOOL_NAME}
-        llm_tools = await build_llm_tools(api, host_tool_names)
-        if artifact_read_available:
-            llm_tools.append(build_artifact_read_tool())
         loop = AgentLoop(
-            model_adapter=LangBotModelAdapter(api, remove_think=remove_think),
-            tool_executor=LangBotToolExecutor(
-                api,
-                allowed_tools,
-                max_result_chars=max_tool_result_chars,
-                max_artifact_bytes=max_tool_result_artifact_bytes,
-                artifact_read_available=artifact_read_available,
-            ),
-            model_ids=model_ids,
-            messages=messages,
-            tools=llm_tools,
-            streaming=streaming,
-            max_tool_iterations=max_tool_iterations,
-            tool_execution_mode=tool_execution_mode,
-            hooks=LangBotContextHooks(context_budget),
+            model_adapter=LangBotModelAdapter(api, remove_think=assembly.remove_think),
+            tool_executor=assembly.tool_executor,
+            model_ids=assembly.model_ids,
+            messages=assembly.messages,
+            tools=assembly.tools,
+            streaming=assembly.streaming,
+            max_tool_iterations=assembly.max_tool_iterations,
+            tool_execution_mode=assembly.tool_execution_mode,
+            hooks=assembly.hooks,
         )
 
         final_message: Message | None = None
@@ -171,14 +105,14 @@ class DefaultAgentRunner(AgentRunner):
                     content_base64=artifact.content_base64,
                 )
 
-            result = self._loop_event_to_result(run_id, event, streaming=streaming)
+            result = self._loop_event_to_result(run_id, event, streaming=assembly.streaming)
             if result is not None:
                 yield result
                 if result.type.value == "run.failed":
                     return
 
             if (
-                not streaming
+                not assembly.streaming
                 and event.type == AgentLoopEventType.MESSAGE_END
                 and event.message is not None
                 and event.message.role == "assistant"
@@ -187,7 +121,7 @@ class DefaultAgentRunner(AgentRunner):
                 final_message = event.message
 
             if event.type == AgentLoopEventType.AGENT_END:
-                if not streaming and final_message is not None:
+                if not assembly.streaming and final_message is not None:
                     yield AgentRunResult.message_completed(run_id, final_message)
                 yield AgentRunResult.run_completed(run_id, finish_reason="stop")
 
