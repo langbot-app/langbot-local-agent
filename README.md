@@ -24,8 +24,8 @@ documents how Local Agent consumes that contract:
 - `ctx.resources`: run-scoped authorized models, tools, knowledge bases, skills,
   files, and storage capabilities.
 - `ctx.state`: small Host-projected state for the current run.
-- `ctx.runtime`: runtime metadata such as deadline, trace id, protocol version,
-  query id from migration adapter paths, and Host metadata.
+- `ctx.runtime`: runtime metadata such as deadline, trace id, query id from
+  migration adapter paths, and Host metadata.
 - `ctx.delivery`: host delivery surface and streaming/edit capabilities.
 - `ctx.config`: runner binding config.
 - `ctx.adapter`: migration adapter fields; not part of Protocol v1 core and not
