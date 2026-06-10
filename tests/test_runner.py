@@ -732,18 +732,20 @@ class TestFormatRagResults:
 class TestDefaultAgentRunner:
     """Tests for DefaultAgentRunner behavior."""
 
-    def test_manifest_declares_event_context_capability(self):
-        """The local runner consumes Protocol v1 event-first context from Host."""
+    def test_manifest_declares_local_agent_capabilities(self):
+        """The local runner declares the capabilities it actively needs."""
         manifest = yaml.safe_load(
             (Path(__file__).resolve().parents[1] / "components/agent_runner/default.yaml").read_text()
         )
 
-        assert manifest["spec"]["capabilities"]["event_context"] is True
         assert manifest["spec"]["capabilities"]["skill_authoring"] is True
-        assert manifest["spec"]["capabilities"]["stateful_session"] is False
-        assert manifest["spec"]["permissions"]["history"] == ["page", "search"]
-        assert "storage" not in manifest["spec"]["permissions"]
-        assert "files" not in manifest["spec"]["permissions"]
+        assert manifest["spec"]["permissions"] == {
+            "models": ["invoke", "stream", "rerank"],
+            "tools": ["detail", "call"],
+            "knowledge_bases": ["list", "retrieve"],
+            "history": ["page", "search"],
+            "artifacts": ["metadata", "read"],
+        }
         config_names = {item["name"] for item in manifest["spec"]["config"]}
         assert "remove-think" in config_names
         assert "context-window-tokens" in config_names

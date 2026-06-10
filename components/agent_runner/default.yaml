@@ -148,17 +148,24 @@ spec:
     knowledge_retrieval: true
     multimodal_input: true
     skill_authoring: true
-    event_context: true
-    platform_api: false
     interrupt: false
-    stateful_session: false
   permissions:
-    models: ["invoke", "stream"]
-    tools: ["detail", "call"]
-    knowledge_bases: ["list", "retrieve"]
-    history: ["page", "search"]
-    artifacts: ["metadata", "read"]
-    platform_api: []
+    models:
+      - invoke
+      - stream
+      - rerank
+    tools:
+      - detail
+      - call
+    knowledge_bases:
+      - list
+      - retrieve
+    history:
+      - page
+      - search
+    artifacts:
+      - metadata
+      - read
 execution:
   python:
     path: default.py
