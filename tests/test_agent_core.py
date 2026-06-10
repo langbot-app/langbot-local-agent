@@ -317,7 +317,7 @@ async def test_loop_executes_same_batch_tools_in_parallel_and_preserves_source_o
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("streaming", [False, True])
-async def test_loop_auto_serializes_stateful_tool_batches(streaming):
+async def test_loop_defaults_to_parallel_without_tool_name_heuristics(streaming):
     class StatefulBatchModelAdapter:
         def __init__(self):
             self.turns = 0
@@ -364,14 +364,21 @@ async def test_loop_auto_serializes_stateful_tool_batches(streaming):
         def __init__(self):
             self.active_calls = 0
             self.max_active_calls = 0
+            self.both_started = asyncio.Event()
             self.call_order: list[str] = []
 
         async def call_tool(self, *, tool_name, parameters):
             self.active_calls += 1
             self.max_active_calls = max(self.max_active_calls, self.active_calls)
+            if self.active_calls == 2:
+                self.both_started.set()
             self.call_order.append(tool_name)
             try:
-                await asyncio.sleep(0.001)
+                await self.both_started.wait()
+                if tool_name == "activate":
+                    await asyncio.sleep(0.05)
+                else:
+                    await asyncio.sleep(0.001)
                 return {"tool": tool_name, "parameters": parameters}
             finally:
                 self.active_calls -= 1
@@ -385,25 +392,29 @@ async def test_loop_auto_serializes_stateful_tool_batches(streaming):
         tools=[],
         streaming=streaming,
         max_tool_iterations=10,
-        tool_execution_mode=ToolExecutionMode.AUTO,
     )
 
-    events = await _collect_events(loop)
+    events = await asyncio.wait_for(_collect_events(loop), timeout=1)
 
-    assert api.max_active_calls == 1
+    assert api.max_active_calls == 2
     assert api.call_order == ["activate", "read_tool"]
 
-    tool_events = [
-        (event.type, event.tool_call_id)
+    started_tool_call_ids = [
+        event.tool_call_id for event in events if event.type == AgentLoopEventType.TOOL_EXECUTION_START
+    ]
+    assert started_tool_call_ids == ["call-activate", "call-read"]
+
+    ended_tool_call_ids = [
+        event.tool_call_id for event in events if event.type == AgentLoopEventType.TOOL_EXECUTION_END
+    ]
+    assert ended_tool_call_ids == ["call-read", "call-activate"]
+
+    result_message_ids = [
+        event.message.tool_call_id
         for event in events
-        if event.type in {AgentLoopEventType.TOOL_EXECUTION_START, AgentLoopEventType.TOOL_EXECUTION_END}
+        if event.type == AgentLoopEventType.MESSAGE_END and event.message is not None and event.message.role == "tool"
     ]
-    assert tool_events == [
-        (AgentLoopEventType.TOOL_EXECUTION_START, "call-activate"),
-        (AgentLoopEventType.TOOL_EXECUTION_END, "call-activate"),
-        (AgentLoopEventType.TOOL_EXECUTION_START, "call-read"),
-        (AgentLoopEventType.TOOL_EXECUTION_END, "call-read"),
-    ]
+    assert result_message_ids == ["call-activate", "call-read"]
 
 
 @pytest.mark.asyncio

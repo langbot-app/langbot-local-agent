@@ -328,12 +328,11 @@ class TestRunnerBehaviorConfig:
         assert get_remove_think({}) is False
 
     def test_tool_execution_mode(self):
-        assert get_tool_execution_mode({"tool-execution-mode": "auto"}) == "auto"
         assert get_tool_execution_mode({"tool-execution-mode": "parallel"}) == "parallel"
         assert get_tool_execution_mode({"tool-execution-mode": "serial"}) == "serial"
-        assert get_tool_execution_mode({"tool-execution-mode": "invalid"}) == "auto"
-        assert get_tool_execution_mode({"tool-execution-mode": True}) == "auto"
-        assert get_tool_execution_mode({}) == "auto"
+        assert get_tool_execution_mode({"tool-execution-mode": "invalid"}) == "parallel"
+        assert get_tool_execution_mode({"tool-execution-mode": True}) == "parallel"
+        assert get_tool_execution_mode({}) == "parallel"
 
 
 # ==================== Message Helper Tests ====================
@@ -757,6 +756,9 @@ class TestDefaultAgentRunner:
         assert "max-tool-result-artifact-bytes" in config_names
         max_tool_iterations = next(item for item in manifest["spec"]["config"] if item["name"] == "max-tool-iterations")
         assert max_tool_iterations["default"] == DEFAULT_MAX_TOOL_ITERATIONS
+        tool_execution_mode = next(item for item in manifest["spec"]["config"] if item["name"] == "tool-execution-mode")
+        assert tool_execution_mode["default"] == "parallel"
+        assert [option["name"] for option in tool_execution_mode["options"]] == ["parallel", "serial"]
 
     @pytest.mark.asyncio
     async def test_streaming_tool_call_arguments_continue_when_later_delta_has_no_id(self):

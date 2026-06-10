@@ -34,7 +34,6 @@ class ModelTurnEventType(StrEnum):
 
 
 class ToolExecutionMode(StrEnum):
-    AUTO = "auto"
     PARALLEL = "parallel"
     SERIAL = "serial"
 

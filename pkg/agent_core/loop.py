@@ -21,17 +21,6 @@ from .types import (
     ToolExecutionOutcome,
 )
 
-STATEFUL_TOOL_NAMES = frozenset(
-    {
-        "activate",
-        "register_skill",
-        "exec",
-        "sandbox_exec",
-        "write",
-        "edit",
-    }
-)
-
 
 class AgentLoop:
     """Turn/message/tool lifecycle loop for local-agent.
@@ -50,7 +39,7 @@ class AgentLoop:
         tools: list[LLMTool],
         streaming: bool,
         max_tool_iterations: int,
-        tool_execution_mode: ToolExecutionMode | str = ToolExecutionMode.AUTO,
+        tool_execution_mode: ToolExecutionMode | str = ToolExecutionMode.PARALLEL,
         hooks: AgentLoopHooks | None = None,
     ):
         self.model_adapter = model_adapter
@@ -70,7 +59,7 @@ class AgentLoop:
         try:
             return ToolExecutionMode(str(mode))
         except ValueError:
-            return ToolExecutionMode.AUTO
+            return ToolExecutionMode.PARALLEL
 
     async def run(self) -> typing.AsyncGenerator[AgentLoopEvent, None]:
         if self.streaming:
@@ -101,12 +90,8 @@ class AgentLoop:
         self.messages = [message.model_copy(deep=True) for message in messages]
         return True
 
-    def _should_execute_serially(self, prepared_calls: list[PreparedToolCall]) -> bool:
-        if self.tool_execution_mode == ToolExecutionMode.SERIAL:
-            return True
-        if self.tool_execution_mode == ToolExecutionMode.PARALLEL:
-            return False
-        return any(prepared.request.name in STATEFUL_TOOL_NAMES for prepared in prepared_calls)
+    def _should_execute_serially(self) -> bool:
+        return self.tool_execution_mode == ToolExecutionMode.SERIAL
 
     async def _execute_prepared_tool_calls_parallel(
         self,
@@ -138,7 +123,7 @@ class AgentLoop:
             prepared_calls.append(prepared)
 
         outcomes_by_source_order: list[ToolExecutionOutcome | None] = [None] * len(prepared_calls)
-        if self._should_execute_serially(prepared_calls):
+        if self._should_execute_serially():
             for index, prepared in enumerate(prepared_calls):
                 yield AgentLoopEvent.tool_execution_start(prepared.request, prepared.parameters)
                 _, outcome = await self._execute_prepared_tool_call(index, prepared)

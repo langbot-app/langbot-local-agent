@@ -83,12 +83,8 @@ spec:
         zh_Hans: 工具执行模式
       type: select
       required: false
-      default: auto
+      default: parallel
       options:
-        - name: auto
-          label:
-            en_US: Auto
-            zh_Hans: 自动
         - name: parallel
           label:
             en_US: Parallel

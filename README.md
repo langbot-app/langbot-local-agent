@@ -58,7 +58,7 @@ plugin components use.
 | rerank-model | rerank-model-selector | no | '' | Rerank model for improved retrieval |
 | rerank-top-k | integer | no | 5 | Top-K results after reranking |
 | max-tool-iterations | integer | no | 20 | Maximum tool-call follow-up iterations |
-| tool-execution-mode | select | no | auto | Same-batch tool execution: `auto`, `parallel`, or `serial` |
+| tool-execution-mode | select | no | parallel | Same-batch tool execution: `parallel` or `serial` |
 | max-tool-result-chars | integer | no | 20000 | Maximum serialized tool result characters injected into the next model request |
 | max-tool-result-artifact-bytes | integer | no | 1048576 | Maximum inline artifact payload bytes emitted by the runner for oversized tool text results |
 | context-history-fetch-limit | integer | no | 50 | Transcript messages pulled from the Host history API |
@@ -110,10 +110,7 @@ content.
 
 `tool-execution-mode` controls tool calls emitted in the same model turn.
 `parallel` runs the batch concurrently and still writes tool-result messages
-back in source order. `serial` executes them one by one. `auto` keeps read-only
-and ordinary tools parallel, but switches the batch to serial when it includes
-stateful or side-effect tools such as `activate`, `register_skill`, `exec`,
-`write`, or `edit`.
+back in source order. `serial` executes them one by one.
 
 When a sandbox or Host tool already returns explicit `artifact_refs`,
 `artifact_id`, `file_refs`, `file_key`, or `file_id` fields, Local Agent treats

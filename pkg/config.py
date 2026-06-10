@@ -8,8 +8,8 @@ from pkg.tool_loop import DEFAULT_MAX_TOOL_ITERATIONS
 
 DEFAULT_MAX_TOOL_RESULT_CHARS = 20000
 DEFAULT_MAX_TOOL_RESULT_ARTIFACT_BYTES = 1_048_576
-DEFAULT_TOOL_EXECUTION_MODE = "auto"
-VALID_TOOL_EXECUTION_MODES = {"auto", "parallel", "serial"}
+DEFAULT_TOOL_EXECUTION_MODE = "parallel"
+VALID_TOOL_EXECUTION_MODES = {"parallel", "serial"}
 
 
 def parse_model_config(
