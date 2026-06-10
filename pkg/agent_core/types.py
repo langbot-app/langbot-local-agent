@@ -127,6 +127,7 @@ class ToolExecutionOutcome:
     error: str | None = None
     message: Message | None = None
     artifact: ToolResultArtifact | None = None
+    terminate: bool = False
 
     @property
     def is_error(self) -> bool:

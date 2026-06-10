@@ -14,7 +14,7 @@ from langbot_plugin.api.entities.builtin.resource.tool import LLMTool
 from langbot_plugin.api.proxies.agent_run_api import AgentRunAPIProxy, PermissionDeniedError
 
 from pkg.config import DEFAULT_MAX_TOOL_RESULT_ARTIFACT_BYTES, DEFAULT_MAX_TOOL_RESULT_CHARS
-from pkg.context_pipeline import ContextBudget, ContextCompactor
+from pkg.context_pipeline import ContextBudget, ContextCompactor, ContextSummarizer
 from pkg.model_calling import (
     INTERNAL_ARTIFACT_READ_TOOL_NAME,
     ModelCallError,
@@ -235,12 +235,14 @@ class LangBotToolExecutor:
         error: str | None,
     ) -> ToolExecutionOutcome:
         event_result: typing.Any = None
+        terminate = error is None and _tool_result_terminates(result)
+        model_result = _strip_tool_runtime_hints(result) if error is None else result
         if error is None:
-            references = extract_tool_result_references(result)
+            references = extract_tool_result_references(model_result)
             if references["artifact_refs"] or references["file_refs"]:
                 message, event_result = build_tool_reference_message(
                     prepared.request.id,
-                    result=result,
+                    result=model_result,
                     references=references,
                     max_result_chars=self.max_result_chars,
                 )
@@ -251,9 +253,10 @@ class LangBotToolExecutor:
                     event_result=event_result,
                     error=None,
                     message=message,
+                    terminate=terminate,
                 )
 
-            content = serialize_tool_result_content(result, is_error=False)
+            content = serialize_tool_result_content(model_result, is_error=False)
             if len(content) > self.max_result_chars:
                 preview = content[: self.max_result_chars]
                 content_bytes = content.encode("utf-8")
@@ -280,12 +283,13 @@ class LangBotToolExecutor:
                         error=None,
                         message=message,
                         artifact=artifact,
+                        terminate=terminate,
                     )
 
                 message = build_tool_call_message(
                     prepared.request.id,
                     prepared.request.name,
-                    result,
+                    model_result,
                     is_error=False,
                     max_result_chars=self.max_result_chars,
                 )
@@ -306,12 +310,13 @@ class LangBotToolExecutor:
                     event_result=event_result,
                     error=None,
                     message=message,
+                    terminate=terminate,
                 )
 
         message = build_tool_call_message(
             prepared.request.id,
             prepared.request.name,
-            error if error is not None else result,
+            error if error is not None else model_result,
             is_error=error is not None,
             max_result_chars=self.max_result_chars,
         )
@@ -322,6 +327,7 @@ class LangBotToolExecutor:
             event_result=event_result,
             error=error,
             message=message,
+            terminate=terminate,
         )
 
     async def _read_artifact(self, parameters: dict[str, typing.Any]) -> dict[str, typing.Any]:
@@ -381,11 +387,12 @@ class LangBotToolExecutor:
 class LangBotContextHooks(AgentLoopHooks):
     """LangBot-specific loop hooks for Pi-style per-turn context management."""
 
-    def __init__(self, budget: ContextBudget):
+    def __init__(self, budget: ContextBudget, summarizer: ContextSummarizer | None = None):
         self.budget = budget
+        self.summarizer = summarizer
 
     async def prepare_model_turn(self, messages: list[Message]) -> list[Message]:
-        assembly = ContextCompactor(self.budget).compact_messages(messages)
+        assembly = await ContextCompactor(self.budget, summarizer=self.summarizer).compact_messages_async(messages)
         return assembly.messages
 
     async def recover_context_overflow(self, messages: list[Message], error: Exception) -> list[Message] | None:
@@ -393,7 +400,10 @@ class LangBotContextHooks(AgentLoopHooks):
         if not is_overflow or not self.budget.enabled:
             return None
 
-        assembly = ContextCompactor(self._overflow_retry_budget()).compact_messages(messages)
+        assembly = await ContextCompactor(
+            self._overflow_retry_budget(),
+            summarizer=self.summarizer,
+        ).compact_messages_async(messages)
         if not assembly.compacted or assembly.tokens_after >= assembly.tokens_before:
             return None
         return assembly.messages
@@ -425,3 +435,15 @@ def _model_or_mapping_get(value: typing.Any, key: str, default: typing.Any = Non
     if isinstance(value, dict):
         return value.get(key, default)
     return getattr(value, key, default)
+
+
+def _tool_result_terminates(result: typing.Any) -> bool:
+    return isinstance(result, dict) and result.get("terminate") is True
+
+
+def _strip_tool_runtime_hints(result: typing.Any) -> typing.Any:
+    if not isinstance(result, dict) or "terminate" not in result:
+        return result
+    stripped = dict(result)
+    stripped.pop("terminate", None)
+    return stripped

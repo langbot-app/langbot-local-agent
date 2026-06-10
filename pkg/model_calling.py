@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import typing
@@ -70,29 +71,30 @@ async def build_llm_tools(
     Returns:
         List of LLMTool objects ready for LLM invocation
     """
-    tools: list[LLMTool] = []
+    tools = await asyncio.gather(
+        *(_build_llm_tool(api, tool_name) for tool_name in sorted(allowed_tools)),
+    )
+    return [tool for tool in tools if tool is not None]
 
-    for tool_name in allowed_tools:
-        try:
-            detail = await api.get_tool_detail(tool_name)
-            description = detail.get("description", "")
 
-            async def _placeholder_func(**kwargs):
-                return kwargs
+async def _build_llm_tool(api: AgentRunAPIProxy, tool_name: str) -> LLMTool | None:
+    try:
+        detail = await api.get_tool_detail(tool_name)
+        description = detail.get("description", "")
 
-            tool = LLMTool(
-                name=detail.get("name", tool_name),
-                human_desc=description,
-                description=description,
-                parameters=detail.get("parameters", {}),
-                func=_placeholder_func,
-            )
-            tools.append(tool)
-        except Exception:
-            logger.warning("Tool detail fetch failed; skipping tool: %s", tool_name, exc_info=True)
-            continue
+        async def _placeholder_func(**kwargs):
+            return kwargs
 
-    return tools
+        return LLMTool(
+            name=detail.get("name", tool_name),
+            human_desc=description,
+            description=description,
+            parameters=detail.get("parameters", {}),
+            func=_placeholder_func,
+        )
+    except Exception:
+        logger.warning("Tool detail fetch failed; skipping tool: %s", tool_name, exc_info=True)
+        return None
 
 
 def build_artifact_read_tool() -> LLMTool:
@@ -161,7 +163,7 @@ async def invoke_with_fallback(
         raise ModelCallError("No model configured", retryable=False)
 
     last_error: Exception | None = None
-    for model_id in model_ids:
+    for index, model_id in enumerate(model_ids):
         try:
             response = await api.invoke_llm(
                 llm_model_uuid=model_id,
@@ -172,7 +174,10 @@ async def invoke_with_fallback(
             return response, model_id
         except Exception as e:
             last_error = e
-            # Log and continue to next model
+            if index < len(model_ids) - 1:
+                logger.warning("LLM model failed; falling back to next configured model: %s", model_id, exc_info=True)
+            else:
+                logger.warning("LLM model failed and no fallback remains: %s", model_id, exc_info=True)
             continue
 
     raise ModelCallError(
@@ -263,6 +268,18 @@ class StreamingModelCaller:
             except Exception as e:
                 # Failure before first chunk - try next model
                 last_error = e
+                if model_id != self.model_ids[-1]:
+                    logger.warning(
+                        "Streaming LLM model failed before first chunk; falling back to next configured model: %s",
+                        model_id,
+                        exc_info=True,
+                    )
+                else:
+                    logger.warning(
+                        "Streaming LLM model failed before first chunk and no fallback remains: %s",
+                        model_id,
+                        exc_info=True,
+                    )
                 continue
         else:
             # All models failed before first chunk

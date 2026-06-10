@@ -4,12 +4,24 @@ from __future__ import annotations
 
 import logging
 import typing
+from dataclasses import dataclass, field, replace
 
 from langbot_plugin.api.proxies.agent_run_api import AgentRunAPIProxy, PermissionDeniedError
 
-from .messages import format_rag_results
-
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RagChunk:
+    """Structured retrieval chunk kept by the runner before prompt rendering."""
+
+    kb_id: str
+    content: str
+    source_index: int
+    chunk_id: str | None = None
+    score: float | None = None
+    rerank_score: float | None = None
+    metadata: dict[str, typing.Any] = field(default_factory=dict)
 
 
 async def retrieve_from_knowledge_bases(
@@ -22,23 +34,34 @@ async def retrieve_from_knowledge_bases(
 ) -> str:
     """Retrieve context from authorized knowledge bases with optional reranking.
 
-    Only retrieves from KBs that are in ctx.resources.knowledge_bases.
-
-    Args:
-        api: AgentRunAPIProxy for authorized access
-        kb_ids: Knowledge base IDs to query (must be in allowed set)
-        query_text: Query text for retrieval
-        top_k: Number of results per KB
-        rerank_model_id: Optional rerank model UUID for re-scoring results
-        rerank_top_k: Number of top results to keep after reranking
-
-    Returns:
-        Formatted context string for RAG prompt
+    This compatibility wrapper returns only the stable model-facing text. Use
+    retrieve_rag_chunks() when the caller needs source metadata.
     """
-    if not kb_ids or not query_text:
-        return ""
+    return format_rag_chunks(
+        await retrieve_rag_chunks(
+            api=api,
+            kb_ids=kb_ids,
+            query_text=query_text,
+            top_k=top_k,
+            rerank_model_id=rerank_model_id,
+            rerank_top_k=rerank_top_k,
+        )
+    )
 
-    all_results: list[dict[str, typing.Any]] = []
+
+async def retrieve_rag_chunks(
+    api: AgentRunAPIProxy,
+    kb_ids: list[str],
+    query_text: str,
+    top_k: int = 5,
+    rerank_model_id: str | None = None,
+    rerank_top_k: int = 5,
+) -> list[RagChunk]:
+    """Retrieve authorized knowledge chunks while preserving source metadata."""
+    if not kb_ids or not query_text:
+        return []
+
+    chunks: list[RagChunk] = []
 
     for kb_id in kb_ids:
         try:
@@ -48,7 +71,10 @@ async def retrieve_from_knowledge_bases(
                 top_k=top_k,
             )
             if results:
-                all_results.extend(results)
+                for entry in results:
+                    chunk = _chunk_from_result(kb_id, len(chunks), entry)
+                    if chunk is not None:
+                        chunks.append(chunk)
         except PermissionDeniedError:
             logger.debug("Knowledge base is not authorized for this run: %s", kb_id)
             continue
@@ -56,60 +82,123 @@ async def retrieve_from_knowledge_bases(
             logger.warning("Knowledge base retrieval failed: %s", kb_id, exc_info=True)
             continue
 
-    if not all_results:
-        return ""
+    if not chunks:
+        return []
 
-    # Rerank step: re-score results using a rerank model if configured
-    if rerank_model_id and all_results:
+    if rerank_model_id:
         try:
-            # Extract text content from results for reranking
-            doc_texts = []
-            for entry in all_results:
-                # Handle different result formats
-                if isinstance(entry, dict):
-                    content = entry.get("content", "")
-                    if isinstance(content, str):
-                        doc_texts.append(content)
-                    elif isinstance(content, list):
-                        # Multiple content parts - join text parts
-                        text_parts = []
-                        for part in content:
-                            if isinstance(part, dict) and part.get("type") == "text":
-                                text_parts.append(part.get("text", ""))
-                            elif isinstance(part, str):
-                                text_parts.append(part)
-                        doc_texts.append(" ".join(text_parts))
-                elif hasattr(entry, "content"):
-                    # Object with content attribute
-                    content = entry.content
-                    if isinstance(content, str):
-                        doc_texts.append(content)
-                    elif isinstance(content, list):
-                        text_parts = []
-                        for part in content:
-                            if hasattr(part, "type") and part.type == "text" and hasattr(part, "text"):
-                                text_parts.append(part.text)
-                        doc_texts.append(" ".join(text_parts))
-
-            if doc_texts:
-                # Invoke rerank model
-                scores = await api.invoke_rerank(
-                    rerank_model_uuid=rerank_model_id,
-                    query=query_text,
-                    documents=doc_texts,
-                    top_k=rerank_top_k,
-                )
-
-                # Sort results by rerank scores
-                if scores:
-                    # Get indices sorted by relevance score (already sorted by invoke_rerank)
-                    top_indices = [s["index"] for s in scores if s["index"] < len(all_results)]
-                    all_results = [all_results[i] for i in top_indices]
+            scores = await api.invoke_rerank(
+                rerank_model_uuid=rerank_model_id,
+                query=query_text,
+                documents=[chunk.content for chunk in chunks],
+                top_k=rerank_top_k,
+            )
+            if scores:
+                reranked = _reranked_chunks(chunks, scores)
+                if reranked:
+                    chunks = reranked
         except PermissionDeniedError:
             logger.debug("Rerank model is not authorized for this run: %s", rerank_model_id)
-            pass
         except Exception:
             logger.warning("Knowledge rerank failed: %s", rerank_model_id, exc_info=True)
-            pass
 
-    return format_rag_results(all_results)
+    return chunks
+
+
+def format_rag_chunks(chunks: list[RagChunk]) -> str:
+    """Render retrieval chunks for the model without volatile source metadata."""
+    if not chunks:
+        return ""
+
+    return "\n\n".join(f"[{index}] {chunk.content}" for index, chunk in enumerate(chunks, start=1))
+
+
+def _chunk_from_result(kb_id: str, source_index: int, entry: typing.Any) -> RagChunk | None:
+    content = _extract_text_content(_model_or_mapping_get(entry, "content", ""))
+    if not content:
+        return None
+
+    metadata = _model_or_mapping_get(entry, "metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    return RagChunk(
+        kb_id=kb_id,
+        content=content,
+        source_index=source_index,
+        chunk_id=_optional_str(
+            _model_or_mapping_get(
+                entry,
+                "chunk_id",
+                _model_or_mapping_get(entry, "id", _model_or_mapping_get(entry, "document_id")),
+            )
+        ),
+        score=_optional_float(
+            _model_or_mapping_get(entry, "score", _model_or_mapping_get(entry, "similarity"))
+        ),
+        metadata=dict(metadata),
+    )
+
+
+def _reranked_chunks(chunks: list[RagChunk], scores: typing.Any) -> list[RagChunk]:
+    reranked: list[RagChunk] = []
+    seen: set[int] = set()
+
+    for score_item in scores:
+        index = _model_or_mapping_get(score_item, "index")
+        if isinstance(index, bool) or not isinstance(index, int):
+            continue
+        if index < 0 or index >= len(chunks) or index in seen:
+            continue
+        seen.add(index)
+        reranked.append(
+            replace(
+                chunks[index],
+                rerank_score=_optional_float(
+                    _model_or_mapping_get(
+                        score_item,
+                        "score",
+                        _model_or_mapping_get(score_item, "relevance_score"),
+                    )
+                ),
+            )
+        )
+
+    return reranked
+
+
+def _extract_text_content(content: typing.Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                if part.get("type") == "text" and isinstance(part.get("text"), str):
+                    text_parts.append(part["text"])
+            elif isinstance(part, str):
+                text_parts.append(part)
+            elif getattr(part, "type", None) == "text" and isinstance(getattr(part, "text", None), str):
+                text_parts.append(part.text)
+        return " ".join(part for part in text_parts if part)
+    return ""
+
+
+def _model_or_mapping_get(value: typing.Any, key: str, default: typing.Any = None) -> typing.Any:
+    if isinstance(value, dict):
+        return value.get(key, default)
+    return getattr(value, key, default)
+
+
+def _optional_str(value: typing.Any) -> str | None:
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _optional_float(value: typing.Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        return float(value)
+    return None

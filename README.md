@@ -112,6 +112,13 @@ content.
 `parallel` runs the batch concurrently and still writes tool-result messages
 back in source order. `serial` executes them one by one.
 
+Tools can return a top-level `terminate: true` runtime hint when the tool action
+already completes the user-visible work and the automatic follow-up model call
+should be skipped. Local Agent stops early only when every finalized tool result
+in that batch sets `terminate: true`; mixed batches continue normally. The hint
+is stripped from the model-facing `role="tool"` message so it does not become
+business data for the next provider request.
+
 When a sandbox or Host tool already returns explicit `artifact_refs`,
 `artifact_id`, `file_refs`, `file_key`, or `file_id` fields, Local Agent treats
 those as authoritative references. It does not create another runner artifact
@@ -120,7 +127,7 @@ events receive the references plus a bounded preview only.
 
 ## Context Management
 
-The local agent should be treated as a self-managed or hybrid-context runner:
+The local agent should be treated as a runner-owned or hybrid-context runner:
 
 - LangBot inlines the current event/input and context handles.
 - The runner pulls transcript history through the authorized Host history API.
@@ -139,9 +146,12 @@ Local Agent currently uses a runner-owned context pipeline:
 3. Estimate message tokens with a conservative local heuristic until LangBot
    exposes tokenizer/model usage metadata to runner plugins.
 4. When the assembled context exceeds `context-window-tokens - context-reserve-tokens`,
-   replace older history with a `system` message containing
-   `<conversation_summary>...</conversation_summary>` and keep a recent history
-   tail bounded by `context-keep-recent-tokens`.
+   use the authorized Host model API to generate a structured checkpoint summary,
+   wrap it in a `system` message containing
+   `<conversation_summary>...</conversation_summary>`, and keep a recent history
+   tail bounded by `context-keep-recent-tokens`. If model summarization fails or
+   returns empty content, Local Agent falls back to a deterministic bounded
+   summary.
 5. Re-run the context transform before every model turn, including tool-call
    follow-up turns, so tool results and assistant tool calls are budgeted before
    the next provider request.
@@ -153,10 +163,9 @@ Local Agent currently uses a runner-owned context pipeline:
 This is not `max-round` behavior. History is not selected by number of rounds;
 the runner budgets prompt, current input, summary, and recent history together,
 following the Pi-style context threshold and per-turn transform shape. Future
-iterations can replace the deterministic summary generator with an LLM summary
-and persist compaction checkpoints through Host state/storage after the runner
-adds the corresponding permissions and LangBot exposes tokenizer/model usage
-metadata from the LiteLLM model-info work.
+iterations can persist compaction checkpoints through Host state/storage after
+the Host exposes the corresponding run-scoped APIs and replace local estimates
+with tokenizer/model usage metadata from the LiteLLM model-info work.
 
 Pipeline adapter data is intentionally narrow. Local Agent does not consume
 `ctx.adapter.extra.prompt`; prompt handoff goes through the run-scoped Host
@@ -167,7 +176,7 @@ and Host APIs over adapter fields.
 
 Model, prompt, history, artifact, tool, knowledge-base, and rerank access go
 through `AgentRunAPIProxy`. LangBot validates these calls with the current
-`run_id`, runner permissions, resource policy, and caller plugin identity.
+`run_id`, run-scoped resource policy / available APIs, and caller plugin identity.
 
 Local Agent must not expose the runner process filesystem as an agent
 capability. In sandboxed deployments, file access is mediated by Host/sandbox
@@ -201,8 +210,6 @@ APIs.
 - `knowledge_retrieval`: yes
 - `multimodal_input`: yes
 - `skill_authoring`: yes
-- `event_context`: yes
-- `stateful_session`: no
 
 `skill_authoring` means Local Agent can receive LangBot's Host-owned
 `ctx.resources.skills` facts plus `activate`/`register_skill` tools when skills
@@ -213,8 +220,8 @@ from those Host capabilities.
 Local Agent is currently reentrant and stateless across runs. It can pull Host
 history each run, but it does not yet persist summary checkpoints, external
 session IDs, or runner-owned memory through Host state/storage. Future
-stateful-session support should declare the required storage permissions and
-write/read checkpoints through `AgentRunAPIProxy` instead of keeping mutable
+stateful-session support should require the binding to expose storage/state APIs
+and write/read checkpoints through `AgentRunAPIProxy` instead of keeping mutable
 per-conversation state in the plugin instance.
 
 ## Event System Boundary

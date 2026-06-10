@@ -18,7 +18,7 @@ from pkg.config import (
     get_tool_execution_mode,
     parse_model_config,
 )
-from pkg.context_pipeline import ContextAssembler, ContextBudget
+from pkg.context_pipeline import ContextAssembler, ContextBudget, LLMContextSummarizer
 from pkg.model_calling import INTERNAL_ARTIFACT_READ_TOOL_NAME, build_artifact_read_tool, build_llm_tools
 
 
@@ -64,8 +64,14 @@ class AgentRunAssembler:
         tool_execution_mode = get_tool_execution_mode(self.ctx.config)
         remove_think = get_remove_think(self.ctx.config)
         context_budget = ContextBudget.from_context(self.ctx)
+        summarizer = LLMContextSummarizer(self.api, model_ids[0], remove_think=remove_think)
 
-        context_assembly = await ContextAssembler(self.api, self.ctx, budget=context_budget).assemble()
+        context_assembly = await ContextAssembler(
+            self.api,
+            self.ctx,
+            budget=context_budget,
+            summarizer=summarizer,
+        ).assemble()
         tools = await self._build_tools(allowed_tools, artifact_read_available)
 
         return AgentRunAssembly(
@@ -79,7 +85,7 @@ class AgentRunAssembler:
                 max_artifact_bytes=max_tool_result_artifact_bytes,
                 artifact_read_available=artifact_read_available,
             ),
-            hooks=LangBotContextHooks(context_budget),
+            hooks=LangBotContextHooks(context_budget, summarizer=summarizer),
             streaming=self._streaming_supported(),
             max_tool_iterations=max_tool_iterations,
             tool_execution_mode=tool_execution_mode,

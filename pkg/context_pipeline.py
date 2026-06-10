@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import logging
+import re
 import typing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from langbot_plugin.api.entities.builtin.agent_runner import AgentRunContext
 from langbot_plugin.api.entities.builtin.provider.message import Message
 
 from pkg.config import get_knowledge_base_ids, get_rerank_config, get_retrieval_top_k
-from pkg.messages import build_prompt_messages, build_user_message, get_effective_prompt_config
-from pkg.rag import retrieve_from_knowledge_bases
+from pkg.messages import (
+    build_prompt_messages,
+    build_rag_context_message,
+    build_user_message,
+    get_effective_prompt_config,
+)
+from pkg.rag import RagChunk, format_rag_chunks, retrieve_rag_chunks
 
 DEFAULT_HISTORY_FETCH_LIMIT = 50
 DEFAULT_CONTEXT_WINDOW_TOKENS = 200_000
@@ -21,6 +27,84 @@ DEFAULT_CONTEXT_SUMMARY_TOKENS = 8_000
 
 ESTIMATED_ATTACHMENT_CHARS = 4800
 ESTIMATED_CHARS_PER_TOKEN = 4
+SUMMARY_OPEN_TAG = "<conversation_summary>"
+SUMMARY_CLOSE_TAG = "</conversation_summary>"
+SUMMARY_SCHEMA_VERSION = "langbot.conversation_summary.v1"
+SUMMARY_ENTRY_RE = re.compile(r"^\s*\d+\.\s+([A-Za-z_][A-Za-z0-9_-]*):\s?(.*)$", re.DOTALL)
+SUMMARY_COUNT_RE = re.compile(r"\bcount=(\d+)\b")
+SUMMARIZATION_SYSTEM_PROMPT = """You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.
+
+Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary."""
+SUMMARIZATION_PROMPT = """The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
+
+Use this EXACT format:
+
+## Goal
+[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
+
+## Constraints & Preferences
+- [Any constraints, preferences, or requirements mentioned by user]
+- [Or "(none)" if none were mentioned]
+
+## Progress
+### Done
+- [x] [Completed tasks/changes]
+
+### In Progress
+- [ ] [Current work]
+
+### Blocked
+- [Issues preventing progress, if any]
+
+## Key Decisions
+- **[Decision]**: [Brief rationale]
+
+## Next Steps
+1. [Ordered list of what should happen next]
+
+## Critical Context
+- [Any data, examples, or references needed to continue]
+- [Or "(none)" if not applicable]
+
+Keep each section concise. Preserve exact file paths, function names, and error messages."""
+UPDATE_SUMMARIZATION_PROMPT = """The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
+
+Update the existing structured summary with new information. RULES:
+- PRESERVE all existing information from the previous summary
+- ADD new progress, decisions, and context from the new messages
+- UPDATE the Progress section: move items from "In Progress" to "Done" when completed
+- UPDATE "Next Steps" based on what was accomplished
+- PRESERVE exact file paths, function names, and error messages
+- If something is no longer relevant, you may remove it
+
+Use this EXACT format:
+
+## Goal
+[Preserve existing goals, add new ones if the task expanded]
+
+## Constraints & Preferences
+- [Preserve existing, add new ones discovered]
+
+## Progress
+### Done
+- [x] [Include previously done items AND newly completed items]
+
+### In Progress
+- [ ] [Current work - update based on progress]
+
+### Blocked
+- [Current blockers - remove if resolved]
+
+## Key Decisions
+- **[Decision]**: [Brief rationale] (preserve all previous, add new)
+
+## Next Steps
+1. [Update based on current state]
+
+## Critical Context
+- [Preserve important context, add new if needed]
+
+Keep each section concise. Preserve exact file paths, function names, and error messages."""
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +202,126 @@ class ContextAssembly:
     tokens_before: int
     tokens_after: int
     summary_message: Message | None = None
+    frame: "ContextFrame | None" = None
+    diagnostics: "ContextDiagnostics | None" = None
+
+
+@dataclass(frozen=True)
+class ContextFrame:
+    """Structured model context before provider rendering."""
+
+    prompt: list[Message] = field(default_factory=list)
+    summaries: list[Message] = field(default_factory=list)
+    history: list[Message] = field(default_factory=list)
+    rag: list[Message] = field(default_factory=list)
+    current: list[Message] = field(default_factory=list)
+    rag_chunks: list[RagChunk] = field(default_factory=list)
+
+    def to_messages(self) -> list[Message]:
+        return self.prompt + self.summaries + self.history + self.rag + self.current
+
+
+@dataclass(frozen=True)
+class ContextDiagnostics:
+    """Token diagnostics for the rendered context."""
+
+    tokens_before: int
+    tokens_after: int
+    prompt_tokens: int
+    summary_tokens: int
+    history_tokens: int
+    rag_tokens: int
+    current_tokens: int
+    compacted_message_count: int = 0
+
+
+@dataclass(frozen=True)
+class ConversationSummaryEntry:
+    index: int
+    role: str
+    text: str
+
+
+@dataclass(frozen=True)
+class ConversationSummary:
+    schema_version: str
+    message_count: int
+    entries: list[ConversationSummaryEntry]
+
+    def render(self, max_tokens: int) -> str:
+        if max_tokens <= 0:
+            return ""
+
+        lines = [
+            SUMMARY_OPEN_TAG,
+            f"v={self.schema_version.rsplit('.', 1)[-1]} count={self.message_count}",
+        ]
+
+        for entry in self.entries:
+            prefix = f"{entry.index}. {entry.role}: "
+            prefix_tokens = estimate_text_tokens(_close_summary_lines(lines + [prefix]))
+            if prefix_tokens > max_tokens:
+                break
+            text = _truncate_text_to_tokens(entry.text, max_tokens - prefix_tokens)
+            candidate = lines + [prefix + text]
+            if estimate_text_tokens(_close_summary_lines(candidate)) > max_tokens:
+                break
+            lines = candidate
+
+        rendered = _close_summary_lines(lines)
+        if estimate_text_tokens(rendered) <= max_tokens:
+            return rendered
+        return _truncate_text_to_tokens(rendered, max_tokens)
+
+
+class ContextSummarizer(typing.Protocol):
+    async def summarize(self, messages: list[Message], max_tokens: int) -> str | None:
+        """Return a model-facing summary message body or None to use deterministic fallback."""
+
+
+class LLMContextSummarizer:
+    """Generate Pi-style structured summaries through LangBot Host model APIs."""
+
+    def __init__(
+        self,
+        api: typing.Any,
+        model_id: str,
+        *,
+        remove_think: bool = False,
+    ):
+        self.api = api
+        self.model_id = model_id
+        self.remove_think = remove_think
+
+    async def summarize(self, messages: list[Message], max_tokens: int) -> str | None:
+        if not messages or max_tokens <= 0:
+            return None
+
+        previous_summary = _extract_previous_summary_text(messages)
+        current_messages = [message for message in messages if not _is_conversation_summary_message(message)]
+        if not current_messages:
+            return None
+
+        prompt = _build_llm_summary_prompt(current_messages, previous_summary=previous_summary)
+        try:
+            response = await self.api.invoke_llm(
+                llm_model_uuid=self.model_id,
+                messages=[
+                    Message(role="system", content=SUMMARIZATION_SYSTEM_PROMPT),
+                    Message(role="user", content=prompt),
+                ],
+                funcs=[],
+                remove_think=self.remove_think,
+            )
+        except Exception:
+            logger.warning("LLM context summarization failed; using deterministic fallback", exc_info=True)
+            return None
+
+        summary_text = _message_content_text(response).strip()
+        if not summary_text:
+            logger.warning("LLM context summarization returned empty content; using deterministic fallback")
+            return None
+        return _wrap_llm_summary(summary_text, max_tokens, message_count=len(messages))
 
 
 class ContextAssembler:
@@ -128,46 +332,60 @@ class ContextAssembler:
         api: typing.Any,
         ctx: AgentRunContext,
         budget: ContextBudget | None = None,
+        summarizer: ContextSummarizer | None = None,
     ):
         self.api = api
         self.ctx = ctx
         self.budget = budget or ContextBudget.from_context(ctx)
+        self.summarizer = summarizer
 
     async def assemble(self) -> ContextAssembly:
         user_text = self.ctx.input.to_text()
-        rag_context = await self._retrieve_rag_context(user_text)
+        rag_chunks = await self._retrieve_rag_chunks(user_text)
+        rag_message = build_rag_context_message(format_rag_chunks(rag_chunks))
         history_messages = await self._get_history_messages()
 
         prompt_messages = build_prompt_messages(await self._get_prompt_config())
+        rag_messages = [rag_message] if rag_message is not None else []
         current_messages = []
         user_message = build_user_message(
             user_text=user_text,
             input_contents=self.ctx.input.contents,
-            rag_context=rag_context if rag_context else None,
         )
         if user_message is not None:
             current_messages.append(user_message)
 
-        return ContextCompactor(self.budget).compact(
+        return await ContextCompactor(self.budget, summarizer=self.summarizer).compact_async(
             prompt_messages=prompt_messages,
             history_messages=history_messages,
+            rag_messages=rag_messages,
             current_messages=current_messages,
+            rag_chunks=rag_chunks,
         )
 
     async def _get_prompt_config(self) -> list[dict[str, typing.Any]]:
         available_apis = getattr(getattr(self.ctx, "context", None), "available_apis", None)
-        if bool(getattr(available_apis, "prompt_get", False)):
-            return await self.api.get_prompt()
+        prompt_get = getattr(available_apis, "prompt_get", None)
+        if bool(prompt_get) or (prompt_get is None and hasattr(self.api, "get_prompt")):
+            try:
+                prompt = await self.api.get_prompt()
+                if prompt:
+                    return prompt
+            except Exception:
+                logger.debug("Host prompt_get failed; falling back to static prompt", exc_info=True)
         return get_effective_prompt_config(self.ctx)
 
-    async def _retrieve_rag_context(self, user_text: str) -> str:
+    async def _retrieve_rag_chunks(self, user_text: str) -> list[RagChunk]:
         allowed_kb_ids = set(kb.kb_id for kb in self.api.get_allowed_knowledge_bases())
+        # TODO(agentic-rag): when AgenticRAG disables naive retrieval, Host should
+        # pass no configured KBs here, or expose an explicit retrieval mode that
+        # tells this runner to skip automatic RAG and rely on the query tool.
         kb_ids = get_knowledge_base_ids(self.ctx.config, allowed_kb_ids)
         if not kb_ids or not user_text:
-            return ""
+            return []
 
         rerank_model_id, rerank_top_k = get_rerank_config(self.ctx.config)
-        return await retrieve_from_knowledge_bases(
+        return await retrieve_rag_chunks(
             api=self.api,
             kb_ids=kb_ids,
             query_text=user_text,
@@ -203,8 +421,9 @@ class ContextAssembler:
 class ContextCompactor:
     """Compact old history into a summary message while keeping recent context."""
 
-    def __init__(self, budget: ContextBudget):
+    def __init__(self, budget: ContextBudget, summarizer: ContextSummarizer | None = None):
         self.budget = budget
+        self.summarizer = summarizer
 
     def compact_messages(self, messages: list[Message]) -> ContextAssembly:
         """Compact an already-assembled runtime message list.
@@ -215,11 +434,21 @@ class ContextCompactor:
         between them.
         """
         messages = sanitize_provider_messages(messages)
-        prompt_messages, runtime_messages = _split_leading_prompt_messages(messages)
+        prompt_messages, existing_summaries, runtime_messages = _split_leading_prompt_messages(messages)
         history_messages, current_messages = _split_runtime_history_and_current(runtime_messages)
         return self.compact(
             prompt_messages=prompt_messages,
-            history_messages=history_messages,
+            history_messages=existing_summaries + history_messages,
+            current_messages=current_messages,
+        )
+
+    async def compact_messages_async(self, messages: list[Message]) -> ContextAssembly:
+        messages = sanitize_provider_messages(messages)
+        prompt_messages, existing_summaries, runtime_messages = _split_leading_prompt_messages(messages)
+        history_messages, current_messages = _split_runtime_history_and_current(runtime_messages)
+        return await self.compact_async(
+            prompt_messages=prompt_messages,
+            history_messages=existing_summaries + history_messages,
             current_messages=current_messages,
         )
 
@@ -229,42 +458,56 @@ class ContextCompactor:
         prompt_messages: list[Message],
         history_messages: list[Message],
         current_messages: list[Message],
+        rag_messages: list[Message] | None = None,
+        rag_chunks: list[RagChunk] | None = None,
     ) -> ContextAssembly:
         prompt = sanitize_provider_messages(prompt_messages)
-        history = sanitize_provider_messages(history_messages)
+        prompt, prompt_summaries = _partition_summary_messages(prompt)
+        history = sanitize_provider_messages(prompt_summaries + history_messages)
+        rag = sanitize_provider_messages(rag_messages or [])
         current = sanitize_provider_messages(current_messages)
-        original_messages = prompt + history + current
+        original_messages = prompt + history + rag + current
         tokens_before = estimate_messages_tokens(original_messages)
 
         if not self.budget.enabled or tokens_before <= self.budget.input_tokens:
-            messages = sanitize_provider_messages(original_messages)
-            return ContextAssembly(
-                messages=messages,
+            return self._build_assembly(
+                prompt=prompt,
+                summaries=[],
+                history=history,
+                rag=rag,
+                current=current,
+                rag_chunks=rag_chunks or [],
                 compacted=False,
                 tokens_before=tokens_before,
-                tokens_after=estimate_messages_tokens(messages),
+                compacted_message_count=0,
             )
 
-        history_budget = max(self.budget.input_tokens - estimate_messages_tokens(prompt + current), 0)
+        history_budget = max(self.budget.input_tokens - estimate_messages_tokens(prompt + rag + current), 0)
         if not history:
-            messages = sanitize_provider_messages(prompt + current)
-            return ContextAssembly(
-                messages=messages,
+            return self._build_assembly(
+                prompt=prompt,
+                summaries=[],
+                history=[],
+                rag=rag,
+                current=current,
+                rag_chunks=rag_chunks or [],
                 compacted=False,
                 tokens_before=tokens_before,
-                tokens_after=estimate_messages_tokens(messages),
+                compacted_message_count=0,
             )
         if history_budget <= 0:
             summary_message = self._build_summary_message(history, self.budget.summary_tokens)
-            messages = sanitize_provider_messages(
-                prompt + ([summary_message] if summary_message is not None else []) + current
-            )
-            return ContextAssembly(
-                messages=messages,
+            return self._build_assembly(
+                prompt=prompt,
+                summaries=[summary_message] if summary_message is not None else [],
+                history=[],
+                rag=rag,
+                current=current,
+                rag_chunks=rag_chunks or [],
                 compacted=True,
                 tokens_before=tokens_before,
-                tokens_after=estimate_messages_tokens(messages),
                 summary_message=summary_message,
+                compacted_message_count=len(history),
             )
 
         summary_budget = self._summary_budget(history_budget)
@@ -274,15 +517,140 @@ class ContextCompactor:
         omitted = history[:first_kept_index]
         recent = history[first_kept_index:]
         summary_message = self._build_summary_message(omitted, summary_budget)
-        compacted_history = ([summary_message] if summary_message is not None else []) + recent
-        messages = sanitize_provider_messages(prompt + compacted_history + current)
+        return self._build_assembly(
+            prompt=prompt,
+            summaries=[summary_message] if summary_message is not None else [],
+            history=recent,
+            rag=rag,
+            current=current,
+            rag_chunks=rag_chunks or [],
+            compacted=bool(omitted),
+            tokens_before=tokens_before,
+            summary_message=summary_message,
+            compacted_message_count=len(omitted),
+        )
+
+    async def compact_async(
+        self,
+        *,
+        prompt_messages: list[Message],
+        history_messages: list[Message],
+        current_messages: list[Message],
+        rag_messages: list[Message] | None = None,
+        rag_chunks: list[RagChunk] | None = None,
+    ) -> ContextAssembly:
+        prompt = sanitize_provider_messages(prompt_messages)
+        prompt, prompt_summaries = _partition_summary_messages(prompt)
+        history = sanitize_provider_messages(prompt_summaries + history_messages)
+        rag = sanitize_provider_messages(rag_messages or [])
+        current = sanitize_provider_messages(current_messages)
+        original_messages = prompt + history + rag + current
+        tokens_before = estimate_messages_tokens(original_messages)
+
+        if not self.budget.enabled or tokens_before <= self.budget.input_tokens:
+            return self._build_assembly(
+                prompt=prompt,
+                summaries=[],
+                history=history,
+                rag=rag,
+                current=current,
+                rag_chunks=rag_chunks or [],
+                compacted=False,
+                tokens_before=tokens_before,
+                compacted_message_count=0,
+            )
+
+        history_budget = max(self.budget.input_tokens - estimate_messages_tokens(prompt + rag + current), 0)
+        if not history:
+            return self._build_assembly(
+                prompt=prompt,
+                summaries=[],
+                history=[],
+                rag=rag,
+                current=current,
+                rag_chunks=rag_chunks or [],
+                compacted=False,
+                tokens_before=tokens_before,
+                compacted_message_count=0,
+            )
+        if history_budget <= 0:
+            summary_message = await self._build_summary_message_async(history, self.budget.summary_tokens)
+            return self._build_assembly(
+                prompt=prompt,
+                summaries=[summary_message] if summary_message is not None else [],
+                history=[],
+                rag=rag,
+                current=current,
+                rag_chunks=rag_chunks or [],
+                compacted=True,
+                tokens_before=tokens_before,
+                summary_message=summary_message,
+                compacted_message_count=len(history),
+            )
+
+        summary_budget = self._summary_budget(history_budget)
+        recent_budget = max(history_budget - summary_budget, 0)
+        first_kept_index = self._select_first_kept_index(history, recent_budget)
+
+        omitted = history[:first_kept_index]
+        recent = history[first_kept_index:]
+        summary_message = await self._build_summary_message_async(omitted, summary_budget)
+        return self._build_assembly(
+            prompt=prompt,
+            summaries=[summary_message] if summary_message is not None else [],
+            history=recent,
+            rag=rag,
+            current=current,
+            rag_chunks=rag_chunks or [],
+            compacted=bool(omitted),
+            tokens_before=tokens_before,
+            summary_message=summary_message,
+            compacted_message_count=len(omitted),
+        )
+
+    def _build_assembly(
+        self,
+        *,
+        prompt: list[Message],
+        summaries: list[Message],
+        history: list[Message],
+        rag: list[Message],
+        current: list[Message],
+        rag_chunks: list[RagChunk],
+        compacted: bool,
+        tokens_before: int,
+        summary_message: Message | None = None,
+        compacted_message_count: int,
+    ) -> ContextAssembly:
+        frame = ContextFrame(
+            prompt=_copy_messages(prompt),
+            summaries=_copy_messages(summaries),
+            history=_copy_messages(history),
+            rag=_copy_messages(rag),
+            current=_copy_messages(current),
+            rag_chunks=list(rag_chunks),
+        )
+        messages = sanitize_provider_messages(frame.to_messages())
+        tokens_after = estimate_messages_tokens(messages)
+        diagnostics = ContextDiagnostics(
+            tokens_before=tokens_before,
+            tokens_after=tokens_after,
+            prompt_tokens=estimate_messages_tokens(frame.prompt),
+            summary_tokens=estimate_messages_tokens(frame.summaries),
+            history_tokens=estimate_messages_tokens(frame.history),
+            rag_tokens=estimate_messages_tokens(frame.rag),
+            current_tokens=estimate_messages_tokens(frame.current),
+            compacted_message_count=compacted_message_count,
+        )
 
         return ContextAssembly(
             messages=messages,
-            compacted=bool(omitted),
+            compacted=compacted,
             tokens_before=tokens_before,
-            tokens_after=estimate_messages_tokens(messages),
+            tokens_after=tokens_after,
             summary_message=summary_message,
+            frame=frame,
+            diagnostics=diagnostics,
         )
 
     def _summary_budget(self, history_budget: int) -> int:
@@ -315,10 +683,20 @@ class ContextCompactor:
         if not omitted or summary_budget <= 0:
             return None
 
-        # TODO(compaction-state): after Host model usage metadata and summary
-        # storage land, replace this deterministic summary with a persisted
-        # checkpoint loaded through Host state/storage.
-        summary = summarize_messages(omitted, _tokens_to_chars(summary_budget))
+        summary = summarize_messages(omitted, summary_budget)
+        if not summary:
+            return None
+        return Message(role="system", content=summary)
+
+    async def _build_summary_message_async(self, omitted: list[Message], summary_budget: int) -> Message | None:
+        if not omitted or summary_budget <= 0:
+            return None
+
+        summary = None
+        if self.summarizer is not None:
+            summary = await self.summarizer.summarize(omitted, summary_budget)
+        if summary is None:
+            summary = summarize_messages(omitted, summary_budget)
         if not summary:
             return None
         return Message(role="system", content=summary)
@@ -383,44 +761,45 @@ def sanitize_provider_messages(messages: list[Message]) -> list[Message]:
     return normalized
 
 
-def summarize_messages(messages: list[Message], max_chars: int) -> str:
+def summarize_messages(messages: list[Message], max_tokens: int) -> str:
     """Create a deterministic compacted-history summary.
 
     This is intentionally not a model call yet. It provides the same structural
     shape as Pi compaction, while future iterations can replace the summary
     generator with an LLM + host state checkpoint.
     """
-    if max_chars <= 0:
+    if max_tokens <= 0:
         return ""
 
-    lines = ["<conversation_summary>"]
+    entries: list[ConversationSummaryEntry] = []
+    message_count = 0
     for index, message in enumerate(messages, start=1):
+        parsed_summary = _parse_conversation_summary_message(message)
+        if parsed_summary is not None:
+            count, summary_entries = parsed_summary
+            message_count += count
+            for summary_entry in summary_entries:
+                entries.append(
+                    ConversationSummaryEntry(
+                        index=len(entries) + 1,
+                        role=summary_entry.role,
+                        text=summary_entry.text,
+                    )
+                )
+            continue
+
+        message_count += 1
         text = message_to_text(message)
         if not text and message.tool_calls:
             text = "; ".join(tool_call.function.name for tool_call in message.tool_calls if tool_call.function)
+        entries.append(ConversationSummaryEntry(index=len(entries) + 1, role=message.role, text=text))
 
-        remaining = max_chars - len("\n".join(lines)) - len("\n") - len("\n</conversation_summary>")
-        if remaining <= 0:
-            break
-        prefix = f"{index}. {message.role}: "
-        if remaining <= len(prefix):
-            break
-        line = prefix + _truncate_text(text, remaining - len(prefix))
-        candidate = "\n".join(lines + [line, "</conversation_summary>"])
-        if len(candidate) > max_chars:
-            break
-        lines.append(line)
-
-    count_line = f"Compacted {len(messages)} older messages."
-    with_count = "\n".join([lines[0], count_line, *lines[1:], "</conversation_summary>"])
-    if len(with_count) <= max_chars:
-        return with_count
-
-    closing_candidate = "\n".join(lines + ["</conversation_summary>"])
-    if len(closing_candidate) <= max_chars:
-        return closing_candidate
-
-    return _truncate_text("\n".join(lines), max_chars)
+    summary = ConversationSummary(
+        schema_version=SUMMARY_SCHEMA_VERSION,
+        message_count=message_count,
+        entries=entries,
+    )
+    return summary.render(max_tokens)
 
 
 def estimate_messages_tokens(messages: list[Message]) -> int:
@@ -443,7 +822,38 @@ def estimate_message_chars(message: Message) -> int:
 
 
 def estimate_message_tokens(message: Message) -> int:
-    return _chars_to_tokens(estimate_message_chars(message))
+    tokens = _chars_to_tokens(len(message.role) + 8)
+    tokens += _content_tokens(message.content)
+    if message.name:
+        tokens += estimate_text_tokens(message.name)
+    if message.tool_call_id:
+        tokens += estimate_text_tokens(message.tool_call_id)
+    if message.tool_calls:
+        for tool_call in message.tool_calls:
+            tokens += estimate_text_tokens(tool_call.id)
+            tokens += estimate_text_tokens(tool_call.type)
+            if tool_call.function:
+                tokens += estimate_text_tokens(tool_call.function.name)
+                tokens += estimate_text_tokens(tool_call.function.arguments)
+    return tokens
+
+
+def estimate_text_tokens(text: str) -> int:
+    if not text:
+        return 0
+
+    tokens = 0
+    non_cjk_chars = 0
+    for char in text:
+        if _is_cjk_token_char(char):
+            tokens += _chars_to_tokens(non_cjk_chars)
+            non_cjk_chars = 0
+            tokens += 1
+        else:
+            non_cjk_chars += 1
+
+    tokens += _chars_to_tokens(non_cjk_chars)
+    return tokens
 
 
 def message_to_text(message: Message) -> str:
@@ -561,10 +971,15 @@ def _message_has_model_content(message: Message) -> bool:
     return False
 
 
-def _split_leading_prompt_messages(messages: list[Message]) -> tuple[list[Message], list[Message]]:
+def _split_leading_prompt_messages(messages: list[Message]) -> tuple[list[Message], list[Message], list[Message]]:
     prompt_messages: list[Message] = []
+    summary_messages: list[Message] = []
     first_history_index = 0
     for index, message in enumerate(messages):
+        if _is_conversation_summary_message(message):
+            summary_messages.append(message)
+            first_history_index = index + 1
+            continue
         if message.role not in {"system", "developer"}:
             first_history_index = index
             break
@@ -572,7 +987,11 @@ def _split_leading_prompt_messages(messages: list[Message]) -> tuple[list[Messag
     else:
         first_history_index = len(messages)
 
-    return _copy_messages(prompt_messages), _copy_messages(messages[first_history_index:])
+    return (
+        _copy_messages(prompt_messages),
+        _copy_messages(summary_messages),
+        _copy_messages(messages[first_history_index:]),
+    )
 
 
 def _split_runtime_history_and_current(messages: list[Message]) -> tuple[list[Message], list[Message]]:
@@ -607,7 +1026,12 @@ def _tool_turn_tail_start(messages: list[Message]) -> int | None:
         index -= 1
 
     if index >= 0 and messages[index].role == "assistant" and messages[index].tool_calls:
-        return index
+        start = index
+        scan = index - 1
+        while scan >= 0 and messages[scan].role == "user":
+            start = scan
+            scan -= 1
+        return start
     return None
 
 
@@ -625,10 +1049,161 @@ def _content_chars(content: typing.Any) -> int:
     return 0
 
 
+def _content_tokens(content: typing.Any) -> int:
+    if isinstance(content, str):
+        return estimate_text_tokens(content)
+    if isinstance(content, list):
+        tokens = 0
+        for item in content:
+            if item.type == "text" and item.text:
+                tokens += estimate_text_tokens(item.text)
+            elif item.type.startswith(("image", "file")):
+                tokens += _chars_to_tokens(ESTIMATED_ATTACHMENT_CHARS)
+        return tokens
+    return 0
+
+
 def _move_cut_before_tool_result(history: list[Message], first_kept_index: int) -> int:
     while first_kept_index > 0 and first_kept_index < len(history) and history[first_kept_index].role == "tool":
         first_kept_index -= 1
     return first_kept_index
+
+
+def _partition_summary_messages(messages: list[Message]) -> tuple[list[Message], list[Message]]:
+    prompts: list[Message] = []
+    summaries: list[Message] = []
+    for message in messages:
+        if _is_conversation_summary_message(message):
+            summaries.append(message)
+        else:
+            prompts.append(message)
+    return _copy_messages(prompts), _copy_messages(summaries)
+
+
+def _is_conversation_summary_message(message: Message) -> bool:
+    return (
+        message.role == "system"
+        and isinstance(message.content, str)
+        and SUMMARY_OPEN_TAG in message.content
+        and SUMMARY_CLOSE_TAG in message.content
+    )
+
+
+def _conversation_summary_body(message: Message) -> str:
+    if not _is_conversation_summary_message(message):
+        return ""
+    assert isinstance(message.content, str)
+    return message.content.split(SUMMARY_OPEN_TAG, 1)[1].split(SUMMARY_CLOSE_TAG, 1)[0].strip()
+
+
+def _parse_conversation_summary_message(message: Message) -> tuple[int, list[ConversationSummaryEntry]] | None:
+    if not _is_conversation_summary_message(message):
+        return None
+
+    body = _conversation_summary_body(message)
+    lines = [line for line in body.splitlines() if line.strip()]
+    count = 0
+    entries: list[ConversationSummaryEntry] = []
+    for line in lines:
+        count_match = SUMMARY_COUNT_RE.search(line)
+        if count_match:
+            count = int(count_match.group(1))
+            continue
+
+        entry_match = SUMMARY_ENTRY_RE.match(line)
+        if entry_match:
+            entries.append(
+                ConversationSummaryEntry(
+                    index=len(entries) + 1,
+                    role=entry_match.group(1),
+                    text=entry_match.group(2),
+                )
+            )
+
+    if not entries and body:
+        entries.append(ConversationSummaryEntry(index=1, role="summary", text=body))
+
+    return max(count, len(entries), 1), entries
+
+
+def _extract_previous_summary_text(messages: list[Message]) -> str:
+    summaries = [_conversation_summary_body(message) for message in messages if _is_conversation_summary_message(message)]
+    summaries = [summary for summary in summaries if summary]
+    return "\n\n---\n\n".join(summaries)
+
+
+def _build_llm_summary_prompt(messages: list[Message], *, previous_summary: str) -> str:
+    conversation_text = _serialize_messages_for_summary(messages)
+    prompt_parts = [f"<conversation>\n{conversation_text}\n</conversation>"]
+    if previous_summary:
+        prompt_parts.append(f"<previous-summary>\n{previous_summary}\n</previous-summary>")
+        prompt_parts.append(UPDATE_SUMMARIZATION_PROMPT)
+    else:
+        prompt_parts.append(SUMMARIZATION_PROMPT)
+    return "\n\n".join(prompt_parts)
+
+
+def _serialize_messages_for_summary(messages: list[Message]) -> str:
+    parts: list[str] = []
+    for index, message in enumerate(messages, start=1):
+        text = message_to_text(message)
+        if not text:
+            text = "(empty)"
+        parts.append(f"<message index=\"{index}\" role=\"{message.role}\">\n{text}\n</message>")
+    return "\n\n".join(parts)
+
+
+def _message_content_text(message: typing.Any) -> str:
+    content = getattr(message, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts = []
+        for item in content:
+            if getattr(item, "type", None) == "text" and isinstance(getattr(item, "text", None), str):
+                text_parts.append(item.text)
+            elif isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
+                text_parts.append(item["text"])
+        return "\n".join(text_parts)
+    return ""
+
+
+def _wrap_llm_summary(summary: str, max_tokens: int, *, message_count: int) -> str | None:
+    summary = summary.strip()
+    if not summary or max_tokens <= 0:
+        return None
+
+    prefix = f"{SUMMARY_OPEN_TAG}\nv=1 source=llm count={max(message_count, 1)}\n"
+    suffix = f"\n{SUMMARY_CLOSE_TAG}"
+    fixed_tokens = estimate_text_tokens(prefix + suffix)
+    available_tokens = max_tokens - fixed_tokens
+    if available_tokens <= 0:
+        return None
+    body = _truncate_text_to_tokens(summary, available_tokens).strip()
+    if not body:
+        return None
+    return f"{prefix}{body}{suffix}"
+
+
+def _close_summary_lines(lines: list[str]) -> str:
+    return "\n".join(lines + [SUMMARY_CLOSE_TAG])
+
+
+def _truncate_text_to_tokens(text: str, max_tokens: int) -> str:
+    if max_tokens <= 0:
+        return ""
+    if estimate_text_tokens(text) <= max_tokens:
+        return text
+
+    low = 0
+    high = len(text)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if estimate_text_tokens(text[:mid]) <= max_tokens:
+            low = mid
+        else:
+            high = mid - 1
+    return text[:low]
 
 
 def _truncate_text(text: str, max_chars: int) -> str:
@@ -688,8 +1263,25 @@ def _chars_to_tokens(chars: int) -> int:
     return max(1, (chars + ESTIMATED_CHARS_PER_TOKEN - 1) // ESTIMATED_CHARS_PER_TOKEN)
 
 
-def _tokens_to_chars(tokens: int) -> int:
-    return max(tokens, 0) * ESTIMATED_CHARS_PER_TOKEN
+def _is_cjk_token_char(char: str) -> bool:
+    codepoint = ord(char)
+    return (
+        0x1100 <= codepoint <= 0x11FF
+        or 0x2E80 <= codepoint <= 0x2EFF
+        or 0x2F00 <= codepoint <= 0x2FDF
+        or 0x3000 <= codepoint <= 0x303F
+        or 0x3040 <= codepoint <= 0x309F
+        or 0x30A0 <= codepoint <= 0x30FF
+        or 0x3100 <= codepoint <= 0x312F
+        or 0x3130 <= codepoint <= 0x318F
+        or 0x31A0 <= codepoint <= 0x31BF
+        or 0x31F0 <= codepoint <= 0x31FF
+        or 0x3400 <= codepoint <= 0x4DBF
+        or 0x4E00 <= codepoint <= 0x9FFF
+        or 0xAC00 <= codepoint <= 0xD7AF
+        or 0xF900 <= codepoint <= 0xFAFF
+        or 0xFF00 <= codepoint <= 0xFFEF
+    )
 
 
 def _config_int(

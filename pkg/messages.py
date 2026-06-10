@@ -65,6 +65,27 @@ def build_user_message(
     return None
 
 
+def build_rag_context_message(rag_context: str | None) -> Message | None:
+    """Build a separate model-facing RAG message.
+
+    The runner keeps RAG separate from the current user input internally and
+    renders only the chunk text to the model. Source metadata stays out of the
+    prompt so repeated equivalent retrievals keep a stable rendered shape.
+    """
+    if not rag_context:
+        return None
+
+    return Message(
+        role="user",
+        content=f"""Retrieved context for the next user message.
+Use it only when it is relevant.
+
+<retrieved_context>
+{rag_context}
+</retrieved_context>""",
+    )
+
+
 def _build_rag_prompt(rag_context: str, user_text: str) -> str:
     """Build user message with RAG context.
 

@@ -51,6 +51,7 @@ class AgentLoop:
         self.max_tool_iterations = max_tool_iterations
         self.tool_execution_mode = self._normalize_tool_execution_mode(tool_execution_mode)
         self.hooks = hooks or AgentLoopHooks()
+        self._last_tool_batch_terminates = False
 
     @staticmethod
     def _normalize_tool_execution_mode(mode: ToolExecutionMode | str) -> ToolExecutionMode:
@@ -116,6 +117,7 @@ class AgentLoop:
         pending_tool_calls: typing.Iterable[typing.Any],
         last_model_turn: ModelTurnResult | None,
     ) -> typing.AsyncGenerator[AgentLoopEvent, None]:
+        self._last_tool_batch_terminates = False
         prepared_calls: list[PreparedToolCall] = []
         for tool_call in pending_tool_calls:
             prepared = self.tool_executor.prepare(tool_call)
@@ -150,6 +152,9 @@ class AgentLoop:
             messages = await self.hooks.prepare_next_turn(self.messages, last_model_turn, tool_results)
             self.messages = [message.model_copy(deep=True) for message in messages]
 
+        outcomes = [outcome for outcome in outcomes_by_source_order if outcome is not None]
+        self._last_tool_batch_terminates = bool(outcomes) and all(outcome.terminate for outcome in outcomes)
+
     async def _run_streaming(self) -> typing.AsyncGenerator[AgentLoopEvent, None]:
         yield AgentLoopEvent.agent_start()
 
@@ -169,8 +174,15 @@ class AgentLoop:
                     return
 
                 tool_iterations += 1
-                async for event in self._execute_tool_batch(pending_tool_calls, last_model_turn):
-                    yield event
+                try:
+                    async for event in self._execute_tool_batch(pending_tool_calls, last_model_turn):
+                        yield event
+                except Exception as e:
+                    yield AgentLoopEvent.run_failed(str(e), code="runner.tool_error")
+                    return
+                if self._last_tool_batch_terminates:
+                    yield AgentLoopEvent.agent_end(self.messages)
+                    return
 
             if committed_model_id is None:
                 turn_model_ids = self.model_ids
@@ -248,8 +260,15 @@ class AgentLoop:
                     return
 
                 tool_iterations += 1
-                async for event in self._execute_tool_batch(pending_tool_calls, last_model_turn):
-                    yield event
+                try:
+                    async for event in self._execute_tool_batch(pending_tool_calls, last_model_turn):
+                        yield event
+                except Exception as e:
+                    yield AgentLoopEvent.run_failed(str(e), code="runner.tool_error")
+                    return
+                if self._last_tool_batch_terminates:
+                    yield AgentLoopEvent.agent_end(self.messages)
+                    return
 
             yield AgentLoopEvent.turn_start()
             yield AgentLoopEvent.message_start(Message(role="assistant", content=""))

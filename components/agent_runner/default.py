@@ -148,7 +148,7 @@ class DefaultAgentRunner(AgentRunner):
                 run_id,
                 tool_call_id=event.tool_call_id,
                 tool_name=event.tool_name,
-                result=event.result,
+                result=_tool_event_result_payload(event.result),
                 error=event.error,
             )
 
@@ -161,3 +161,9 @@ class DefaultAgentRunner(AgentRunner):
             )
 
         return None
+
+
+def _tool_event_result_payload(result: Any) -> dict[str, Any] | None:
+    if result is None or isinstance(result, dict):
+        return result
+    return {"value": result}

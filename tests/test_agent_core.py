@@ -316,6 +316,121 @@ async def test_loop_executes_same_batch_tools_in_parallel_and_preserves_source_o
 
 
 @pytest.mark.asyncio
+async def test_loop_stops_after_tool_batch_when_all_results_terminate():
+    class TerminatingModelAdapter:
+        def __init__(self):
+            self.turns = 0
+
+        async def invoke_turn(self, *, model_ids, messages, tools):
+            self.turns += 1
+            return ModelTurnResult(
+                message=Message(
+                    role="assistant",
+                    content="Sending now",
+                    tool_calls=[
+                        ToolCallRequest(id="call-1", name="send_message", arguments="{}").to_tool_call()
+                    ],
+                ),
+                tool_calls=[ToolCallRequest(id="call-1", name="send_message", arguments="{}")],
+                committed_model_id="model-1",
+                visible_content="Sending now",
+            )
+
+        async def invoke_committed_turn(self, *, committed_model_id, messages, tools):
+            self.turns += 1
+            raise AssertionError("terminating tool batch should skip the follow-up model turn")
+
+    class TerminatingAPI:
+        async def call_tool(self, *, tool_name, parameters):
+            return {"content": "sent", "terminate": True}
+
+    adapter = TerminatingModelAdapter()
+    loop = AgentLoop(
+        model_adapter=adapter,
+        tool_executor=LangBotToolExecutor(TerminatingAPI(), {"send_message"}),
+        model_ids=["model-1"],
+        messages=[Message(role="user", content="Send it")],
+        tools=[],
+        streaming=False,
+        max_tool_iterations=10,
+    )
+
+    events = await _collect_events(loop)
+
+    assert adapter.turns == 1
+    assert events[-1].type == AgentLoopEventType.AGENT_END
+    tool_messages = [
+        event.message
+        for event in events
+        if event.type == AgentLoopEventType.MESSAGE_END and event.message is not None and event.message.role == "tool"
+    ]
+    assert len(tool_messages) == 1
+    assert "sent" in tool_messages[0].content
+    assert "terminate" not in tool_messages[0].content
+
+
+@pytest.mark.asyncio
+async def test_loop_continues_after_mixed_terminate_tool_batch():
+    class MixedModelAdapter:
+        def __init__(self):
+            self.turns = 0
+
+        async def invoke_turn(self, *, model_ids, messages, tools):
+            self.turns += 1
+            return ModelTurnResult(
+                message=Message(
+                    role="assistant",
+                    content="Need tools",
+                    tool_calls=[
+                        ToolCallRequest(id="call-a", name="tool_a", arguments="{}").to_tool_call(),
+                        ToolCallRequest(id="call-b", name="tool_b", arguments="{}").to_tool_call(),
+                    ],
+                ),
+                tool_calls=[
+                    ToolCallRequest(id="call-a", name="tool_a", arguments="{}"),
+                    ToolCallRequest(id="call-b", name="tool_b", arguments="{}"),
+                ],
+                committed_model_id="model-1",
+            )
+
+        async def invoke_committed_turn(self, *, committed_model_id, messages, tools):
+            self.turns += 1
+            return ModelTurnResult(
+                message=Message(role="assistant", content="Done"),
+                tool_calls=[],
+                committed_model_id=committed_model_id,
+                visible_content="Done",
+            )
+
+    class MixedAPI:
+        async def call_tool(self, *, tool_name, parameters):
+            return {"content": tool_name, "terminate": tool_name == "tool_a"}
+
+    adapter = MixedModelAdapter()
+    loop = AgentLoop(
+        model_adapter=adapter,
+        tool_executor=LangBotToolExecutor(MixedAPI(), {"tool_a", "tool_b"}),
+        model_ids=["model-1"],
+        messages=[Message(role="user", content="Use tools")],
+        tools=[],
+        streaming=False,
+        max_tool_iterations=10,
+    )
+
+    events = await _collect_events(loop)
+
+    assert adapter.turns == 2
+    assert events[-1].type == AgentLoopEventType.AGENT_END
+    assert any(
+        event.type == AgentLoopEventType.MESSAGE_END
+        and event.message is not None
+        and event.message.role == "assistant"
+        and event.message.content == "Done"
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("streaming", [False, True])
 async def test_loop_defaults_to_parallel_without_tool_name_heuristics(streaming):
     class StatefulBatchModelAdapter:
@@ -562,6 +677,96 @@ async def test_loop_runs_pi_style_hooks_around_turns_and_tools():
     assert hooks.after_tool_ids == ["call-1"]
     assert hooks.prepare_next_turn_tool_ids == ["call-1"]
     assert hooks.stop_checks == 2
+
+
+@pytest.mark.asyncio
+async def test_loop_converts_before_tool_hook_exception_to_run_failed():
+    class ToolRequestModelAdapter:
+        async def invoke_turn(self, *, model_ids, messages, tools):
+            return ModelTurnResult(
+                message=Message(
+                    role="assistant",
+                    content="",
+                    tool_calls=[
+                        ToolCallRequest(id="call-1", name="allowed_tool", arguments="{}").to_tool_call()
+                    ],
+                ),
+                tool_calls=[ToolCallRequest(id="call-1", name="allowed_tool", arguments="{}")],
+                committed_model_id="model-1",
+            )
+
+        async def invoke_committed_turn(self, *, committed_model_id, messages, tools):
+            raise AssertionError("tool hook failure should stop before next model turn")
+
+    class HookAPI:
+        async def call_tool(self, *, tool_name, parameters):
+            return {"ok": True}
+
+    class FailingHooks(AgentLoopHooks):
+        async def before_tool_call(self, prepared):
+            raise RuntimeError("before hook failed")
+
+    loop = AgentLoop(
+        model_adapter=ToolRequestModelAdapter(),
+        tool_executor=LangBotToolExecutor(HookAPI(), {"allowed_tool"}),
+        model_ids=["model-1"],
+        messages=[Message(role="user", content="Use tool")],
+        tools=[],
+        streaming=False,
+        max_tool_iterations=10,
+        hooks=FailingHooks(),
+    )
+
+    events = await _collect_events(loop)
+
+    assert events[-1].type == AgentLoopEventType.RUN_FAILED
+    assert events[-1].code == "runner.tool_error"
+    assert "before hook failed" in events[-1].error
+
+
+@pytest.mark.asyncio
+async def test_loop_converts_prepare_next_turn_hook_exception_to_run_failed():
+    class ToolRequestModelAdapter:
+        async def invoke_turn(self, *, model_ids, messages, tools):
+            return ModelTurnResult(
+                message=Message(
+                    role="assistant",
+                    content="",
+                    tool_calls=[
+                        ToolCallRequest(id="call-1", name="allowed_tool", arguments="{}").to_tool_call()
+                    ],
+                ),
+                tool_calls=[ToolCallRequest(id="call-1", name="allowed_tool", arguments="{}")],
+                committed_model_id="model-1",
+            )
+
+        async def invoke_committed_turn(self, *, committed_model_id, messages, tools):
+            raise AssertionError("prepare_next_turn failure should stop before next model turn")
+
+    class HookAPI:
+        async def call_tool(self, *, tool_name, parameters):
+            return {"ok": True}
+
+    class FailingHooks(AgentLoopHooks):
+        async def prepare_next_turn(self, messages, result, tool_results):
+            raise RuntimeError("next turn preparation failed")
+
+    loop = AgentLoop(
+        model_adapter=ToolRequestModelAdapter(),
+        tool_executor=LangBotToolExecutor(HookAPI(), {"allowed_tool"}),
+        model_ids=["model-1"],
+        messages=[Message(role="user", content="Use tool")],
+        tools=[],
+        streaming=False,
+        max_tool_iterations=10,
+        hooks=FailingHooks(),
+    )
+
+    events = await _collect_events(loop)
+
+    assert events[-1].type == AgentLoopEventType.RUN_FAILED
+    assert events[-1].code == "runner.tool_error"
+    assert "next turn preparation failed" in events[-1].error
 
 
 @pytest.mark.asyncio

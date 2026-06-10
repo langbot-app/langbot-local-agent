@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import os
 
 # Import modules to test
@@ -66,8 +67,11 @@ from pkg.context_pipeline import (
     DEFAULT_CONTEXT_RESERVE_TOKENS,
     DEFAULT_CONTEXT_SUMMARY_TOKENS,
     DEFAULT_CONTEXT_WINDOW_TOKENS,
+    ContextAssembler,
     ContextBudget,
     ContextCompactor,
+    LLMContextSummarizer,
+    estimate_message_tokens,
     sanitize_provider_messages,
 )
 from pkg.messages import build_prompt_messages, build_user_message, format_rag_results, get_effective_prompt_config
@@ -77,7 +81,9 @@ from pkg.model_calling import (
     TOOL_RESULT_REFERENCE_MARKER,
     TOOL_RESULT_TRUNCATION_MARKER,
     StreamingModelCaller,
+    build_llm_tools,
     build_tool_call_message,
+    invoke_with_fallback,
 )
 
 # ==================== Fixtures ====================
@@ -548,6 +554,101 @@ class TestContextCompaction:
         assert "recent assistant sentinel" in contents
         assert contents[-1] == "current request"
 
+    def test_cjk_text_is_estimated_more_conservatively_than_latin_text(self):
+        """CJK content is roughly one token per character, not chars/4."""
+        latin = Message(role="user", content="a" * 80)
+        cjk = Message(role="user", content="你" * 80)
+
+        assert estimate_message_tokens(cjk) >= 80
+        assert estimate_message_tokens(cjk) > estimate_message_tokens(latin) * 3
+
+    def test_flat_compaction_recompacts_existing_summary_instead_of_piling_up(self):
+        """Generated summaries are runtime history, not immutable prompt messages."""
+        old_summary = Message(
+            role="system",
+            content=(
+                "<conversation_summary>\n"
+                "v=1 count=2\n"
+                "1. user: old summary sentinel\n"
+                "2. assistant: old answer\n"
+                "</conversation_summary>"
+            ),
+        )
+        messages = [
+            Message(role="system", content="Static prompt"),
+            old_summary,
+            Message(role="user", content="recent user " + "u" * 220),
+            Message(role="assistant", content="recent assistant " + "a" * 220),
+            Message(role="user", content="current request"),
+        ]
+        budget = ContextBudget(
+            window_tokens=100,
+            reserve_tokens=20,
+            keep_recent_tokens=25,
+            summary_tokens=45,
+        )
+
+        assembly = ContextCompactor(budget).compact_messages(messages)
+
+        summary_messages = [
+            message
+            for message in assembly.messages
+            if isinstance(message.content, str) and "<conversation_summary>" in message.content
+        ]
+        assert assembly.messages[0].content == "Static prompt"
+        assert len(summary_messages) == 1
+        assert summary_messages[0].content.count("<conversation_summary>") == 1
+        assert summary_messages[0].content.count("</conversation_summary>") == 1
+        assert "old summary sentinel" in summary_messages[0].content
+
+    @pytest.mark.asyncio
+    async def test_async_compaction_uses_llm_summary_and_previous_checkpoint(self):
+        """Compaction can use Host model APIs for Pi-style checkpoint summaries."""
+        fake_api = FakeAgentRunAPIProxy(models=[ModelResource(model_id="model-1")])
+        fake_api.invoke_llm = AsyncMock(
+            return_value=Message(role="assistant", content="## Goal\nLLM checkpoint sentinel")
+        )
+        old_summary = Message(
+            role="system",
+            content=(
+                "<conversation_summary>\n"
+                "v=1 source=llm count=2\n"
+                "## Goal\nold checkpoint sentinel\n"
+                "</conversation_summary>"
+            ),
+        )
+        history = [
+            old_summary,
+            Message(role="user", content="new user context " + "u" * 700),
+            Message(role="assistant", content="new assistant context " + "a" * 300),
+        ]
+        budget = ContextBudget(
+            window_tokens=180,
+            reserve_tokens=20,
+            keep_recent_tokens=0,
+            summary_tokens=120,
+        )
+        summarizer = LLMContextSummarizer(fake_api, "model-1", remove_think=True)
+
+        assembly = await ContextCompactor(budget, summarizer=summarizer).compact_async(
+            prompt_messages=[],
+            history_messages=history,
+            current_messages=[Message(role="user", content="current request")],
+        )
+
+        assert assembly.summary_message is not None
+        assert "source=llm" in assembly.summary_message.content
+        assert "LLM checkpoint sentinel" in assembly.summary_message.content
+        fake_api.invoke_llm.assert_awaited_once()
+        kwargs = fake_api.invoke_llm.await_args.kwargs
+        assert kwargs["llm_model_uuid"] == "model-1"
+        assert kwargs["funcs"] == []
+        assert kwargs["remove_think"] is True
+        prompt_text = kwargs["messages"][1].content
+        assert "<previous-summary>" in prompt_text
+        assert "old checkpoint sentinel" in prompt_text
+        assert "new user context" in prompt_text
+
     def test_compactor_can_transform_flat_runtime_messages(self):
         """Follow-up turns can compact the loop's already-assembled message list."""
         messages = [
@@ -726,6 +827,49 @@ class TestFormatRagResults:
         assert "[1] Plain text content" in result
 
 
+class TestContextAssembler:
+    """Tests for structured context assembly."""
+
+    @pytest.mark.asyncio
+    async def test_rag_context_is_separate_from_current_user_message(self):
+        """RAG chunks keep metadata internally while rendered context stays stable."""
+        fake_api = FakeAgentRunAPIProxy(
+            knowledge_bases=[KnowledgeBaseResource(kb_id="kb-1")],
+        )
+        fake_api.retrieve_knowledge = AsyncMock(
+            return_value=[
+                {
+                    "id": "chunk-1",
+                    "score": 0.87,
+                    "metadata": {"source": "doc-a"},
+                    "content": [{"type": "text", "text": "KB content sentinel"}],
+                }
+            ]
+        )
+        ctx = make_context(
+            config={
+                "prompt": [{"role": "system", "content": "Static prompt"}],
+                "knowledge-bases": ["kb-1"],
+            },
+            resources=AgentResources(knowledge_bases=[KnowledgeBaseResource(kb_id="kb-1")]),
+            input_text="current question",
+        )
+
+        assembly = await ContextAssembler(fake_api, ctx).assemble()
+
+        assert assembly.frame is not None
+        assert assembly.diagnostics is not None
+        assert [message.role for message in assembly.messages] == ["system", "user", "user"]
+        assert assembly.messages[0].content == "Static prompt"
+        assert "<retrieved_context>" in assembly.messages[1].content
+        assert "KB content sentinel" in assembly.messages[1].content
+        assert assembly.messages[-1].content == "current question"
+        assert assembly.frame.rag_chunks[0].kb_id == "kb-1"
+        assert assembly.frame.rag_chunks[0].chunk_id == "chunk-1"
+        assert assembly.frame.rag_chunks[0].metadata == {"source": "doc-a"}
+        assert assembly.diagnostics.rag_tokens > 0
+
+
 # ==================== Runner Integration Tests ====================
 
 
@@ -810,6 +954,49 @@ class TestDefaultAgentRunner:
         assert final_tool_calls[0].id == "call-real"
         assert final_tool_calls[0].function.name == "allowed_tool"
         assert final_tool_calls[0].function.arguments == '{"a": 1}'
+
+    @pytest.mark.asyncio
+    async def test_build_llm_tools_skips_failed_detail_fetches(self, caplog):
+        fake_api = FakeAgentRunAPIProxy()
+
+        async def get_tool_detail(tool_name):
+            if tool_name == "broken_tool":
+                raise RuntimeError("detail unavailable")
+            return {
+                "name": tool_name,
+                "description": f"Tool {tool_name}",
+                "parameters": {"type": "object", "properties": {}},
+            }
+
+        fake_api.get_tool_detail = AsyncMock(side_effect=get_tool_detail)
+        caplog.set_level(logging.WARNING, logger="pkg.model_calling")
+
+        tools = await build_llm_tools(fake_api, {"tool_b", "broken_tool", "tool_a"})
+
+        assert [tool.name for tool in tools] == ["tool_a", "tool_b"]
+        assert fake_api.get_tool_detail.await_count == 3
+        assert "Tool detail fetch failed; skipping tool: broken_tool" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_invoke_with_fallback_logs_failed_primary_model(self, caplog):
+        fake_api = FakeAgentRunAPIProxy()
+        fake_api.invoke_llm = AsyncMock(
+            side_effect=[
+                RuntimeError("primary unavailable"),
+                Message(role="assistant", content="fallback response"),
+            ]
+        )
+        caplog.set_level(logging.WARNING, logger="pkg.model_calling")
+
+        response, committed_model_id = await invoke_with_fallback(
+            fake_api,
+            ["model-1", "model-2"],
+            [Message(role="user", content="hello")],
+        )
+
+        assert response.content == "fallback response"
+        assert committed_model_id == "model-2"
+        assert "LLM model failed; falling back to next configured model: model-1" in caplog.text
 
     @pytest.fixture
     def runner(self):
@@ -1233,6 +1420,8 @@ class TestDefaultAgentRunner:
         results = [result async for result in runner.run(ctx)]
 
         assert any(r.type == AgentRunResultType.RUN_COMPLETED for r in results)
+        completed = [r for r in results if r.type == AgentRunResultType.TOOL_CALL_COMPLETED]
+        assert completed[0].data["result"]["value"].startswith("tool result ")
         assert len(captured_turn_messages) == 2
         assert not any(
             isinstance(message.content, str) and "<conversation_summary>" in message.content
@@ -2095,8 +2284,10 @@ class TestDefaultAgentRunner:
             top_k=1,
         )
         assert any(r.type == AgentRunResultType.RUN_COMPLETED for r in results)
-        assert "high relevance sentinel" in captured_messages[-1].content
-        assert "low relevance" not in captured_messages[-1].content
+        assert "<retrieved_context>" in captured_messages[-2].content
+        assert "high relevance sentinel" in captured_messages[-2].content
+        assert "low relevance" not in captured_messages[-2].content
+        assert captured_messages[-1].content == "find sentinel"
 
     @pytest.mark.asyncio
     async def test_streaming_failure_after_first_chunk_no_fallback(self, runner, monkeypatch):
