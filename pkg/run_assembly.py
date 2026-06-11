@@ -10,6 +10,7 @@ from langbot_plugin.api.entities.builtin.provider.message import Message
 from langbot_plugin.api.entities.builtin.resource.tool import LLMTool
 
 from pkg.agent_core import AgentLoopHooks, LangBotContextHooks, LangBotToolExecutor
+from pkg.agent_core.langbot import LangBotSteeringPuller
 from pkg.config import (
     get_max_tool_iterations,
     get_max_tool_result_artifact_bytes,
@@ -85,7 +86,11 @@ class AgentRunAssembler:
                 max_artifact_bytes=max_tool_result_artifact_bytes,
                 artifact_read_available=artifact_read_available,
             ),
-            hooks=LangBotContextHooks(context_budget, summarizer=summarizer),
+            hooks=LangBotContextHooks(
+                context_budget,
+                summarizer=summarizer,
+                steering_puller=LangBotSteeringPuller(self.api),
+            ),
             streaming=self._streaming_supported(),
             max_tool_iterations=max_tool_iterations,
             tool_execution_mode=tool_execution_mode,

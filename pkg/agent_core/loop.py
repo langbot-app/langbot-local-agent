@@ -229,6 +229,7 @@ class AgentLoop:
             last_model_turn = model_turn
             yield AgentLoopEvent.message_end(model_turn.message)
 
+            message_count_before_hook = len(self.messages)
             if await self.hooks.should_stop_after_turn(model_turn, self.messages):
                 yield AgentLoopEvent.turn_end(model_turn.message, [])
                 yield AgentLoopEvent.agent_end(self.messages)
@@ -237,6 +238,9 @@ class AgentLoop:
             pending_tool_calls = model_turn.tool_calls
             if not pending_tool_calls:
                 yield AgentLoopEvent.turn_end(model_turn.message, [])
+                if len(self.messages) > message_count_before_hook:
+                    pending_tool_calls = None
+                    continue
                 yield AgentLoopEvent.agent_end(self.messages)
                 return
 
@@ -305,6 +309,7 @@ class AgentLoop:
             last_model_turn = model_turn
             yield AgentLoopEvent.message_end(model_turn.message)
 
+            message_count_before_hook = len(self.messages)
             if await self.hooks.should_stop_after_turn(model_turn, self.messages):
                 yield AgentLoopEvent.turn_end(model_turn.message, [])
                 yield AgentLoopEvent.agent_end(self.messages)
@@ -313,5 +318,8 @@ class AgentLoop:
             pending_tool_calls = model_turn.tool_calls
             if not pending_tool_calls:
                 yield AgentLoopEvent.turn_end(model_turn.message, [])
+                if len(self.messages) > message_count_before_hook:
+                    pending_tool_calls = None
+                    continue
                 yield AgentLoopEvent.agent_end(self.messages)
                 return

@@ -5,16 +5,18 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import re
 import typing
 import uuid
 
-from langbot_plugin.api.entities.builtin.provider.message import Message, MessageChunk
+from langbot_plugin.api.entities.builtin.provider.message import ContentElement, Message, MessageChunk
 from langbot_plugin.api.entities.builtin.resource.tool import LLMTool
 from langbot_plugin.api.proxies.agent_run_api import AgentRunAPIProxy, PermissionDeniedError
 
 from pkg.config import DEFAULT_MAX_TOOL_RESULT_ARTIFACT_BYTES, DEFAULT_MAX_TOOL_RESULT_CHARS
 from pkg.context_pipeline import ContextBudget, ContextCompactor, ContextSummarizer
+from pkg.messages import build_user_message
 from pkg.model_calling import (
     INTERNAL_ARTIFACT_READ_TOOL_NAME,
     ModelCallError,
@@ -38,6 +40,7 @@ from .types import (
 )
 
 THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+logger = logging.getLogger(__name__)
 
 
 def _strip_thinking_blocks(content: str) -> str:
@@ -387,12 +390,37 @@ class LangBotToolExecutor:
 class LangBotContextHooks(AgentLoopHooks):
     """LangBot-specific loop hooks for Pi-style per-turn context management."""
 
-    def __init__(self, budget: ContextBudget, summarizer: ContextSummarizer | None = None):
+    def __init__(
+        self,
+        budget: ContextBudget,
+        summarizer: ContextSummarizer | None = None,
+        steering_puller: "LangBotSteeringPuller | None" = None,
+    ):
         self.budget = budget
         self.summarizer = summarizer
+        self.steering_puller = steering_puller
 
     async def prepare_model_turn(self, messages: list[Message]) -> list[Message]:
         assembly = await ContextCompactor(self.budget, summarizer=self.summarizer).compact_messages_async(messages)
+        return assembly.messages
+
+    async def should_stop_after_turn(self, result: ModelTurnResult, messages: list[Message]) -> bool:
+        if result.tool_calls:
+            return False
+        steering_messages = await self._pull_steering_messages(mode="all")
+        if steering_messages:
+            messages.extend(steering_messages)
+        return False
+
+    async def prepare_next_turn(
+        self,
+        messages: list[Message],
+        result: ModelTurnResult,
+        tool_results: list[Message],
+    ) -> list[Message]:
+        next_messages = [message.model_copy(deep=True) for message in messages]
+        next_messages.extend(await self._pull_steering_messages(mode="all"))
+        assembly = await ContextCompactor(self.budget, summarizer=self.summarizer).compact_messages_async(next_messages)
         return assembly.messages
 
     async def recover_context_overflow(self, messages: list[Message], error: Exception) -> list[Message] | None:
@@ -417,6 +445,71 @@ class LangBotContextHooks(AgentLoopHooks):
             summary_tokens=min(self.budget.summary_tokens, max(0, retry_input_tokens // 4)),
             history_fetch_limit=self.budget.history_fetch_limit,
         )
+
+    async def _pull_steering_messages(self, *, mode: str) -> list[Message]:
+        if self.steering_puller is None:
+            return []
+        return await self.steering_puller.pull_messages(mode=mode)
+
+
+class LangBotSteeringPuller:
+    """Pull and adapt Host-claimed steering inputs into user messages."""
+
+    def __init__(self, api: AgentRunAPIProxy):
+        self.api = api
+
+    async def pull_messages(self, *, mode: str = "all") -> list[Message]:
+        if not hasattr(self.api, "steering_pull"):
+            return []
+
+        try:
+            response = await self.api.steering_pull(mode=mode)
+        except PermissionDeniedError:
+            return []
+        except Exception:
+            logger.debug("Failed to pull steering inputs", exc_info=True)
+            return []
+
+        items = response.get("items", []) if isinstance(response, dict) else []
+        if not isinstance(items, list):
+            return []
+
+        messages: list[Message] = []
+        for item in items:
+            message = self._message_from_item(item)
+            if message is not None:
+                messages.append(message)
+        return messages
+
+    def _message_from_item(self, item: typing.Any) -> Message | None:
+        if not isinstance(item, dict):
+            return None
+
+        input_data = item.get("input")
+        if not isinstance(input_data, dict):
+            return None
+
+        text = input_data.get("text")
+        contents = self._content_elements(input_data.get("contents"))
+        return build_user_message(
+            user_text=text if isinstance(text, str) else "",
+            input_contents=contents,
+        )
+
+    def _content_elements(self, raw_contents: typing.Any) -> list[ContentElement]:
+        if not isinstance(raw_contents, list):
+            return []
+
+        contents: list[ContentElement] = []
+        for raw_content in raw_contents:
+            try:
+                if isinstance(raw_content, ContentElement):
+                    contents.append(raw_content.model_copy(deep=True))
+                elif isinstance(raw_content, dict):
+                    contents.append(ContentElement.model_validate(raw_content))
+            except Exception:
+                logger.debug("Ignoring invalid steering content element", exc_info=True)
+        return contents
 
 
 def _non_negative_int(value: typing.Any, *, default: int) -> int:
