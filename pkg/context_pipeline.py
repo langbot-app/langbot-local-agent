@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 import typing
 from dataclasses import dataclass, field
 
@@ -30,6 +31,8 @@ ESTIMATED_CHARS_PER_TOKEN = 4
 SUMMARY_OPEN_TAG = "<conversation_summary>"
 SUMMARY_CLOSE_TAG = "</conversation_summary>"
 SUMMARY_SCHEMA_VERSION = "langbot.conversation_summary.v1"
+CHECKPOINT_STATE_KEY = "runner.compaction.checkpoint"
+CHECKPOINT_SCHEMA_VERSION = "langbot.local_agent.compaction_checkpoint.v1"
 SUMMARY_ENTRY_RE = re.compile(r"^\s*\d+\.\s+([A-Za-z_][A-Za-z0-9_-]*):\s?(.*)$", re.DOTALL)
 SUMMARY_COUNT_RE = re.compile(r"\bcount=(\d+)\b")
 SUMMARIZATION_SYSTEM_PROMPT = """You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.
@@ -274,6 +277,14 @@ class ConversationSummary:
         return _truncate_text_to_tokens(rendered, max_tokens)
 
 
+@dataclass(frozen=True)
+class CompactionCheckpoint:
+    summary: str
+    covers_until: str | None
+    tokens_before: int | None = None
+    created_at: int | None = None
+
+
 class ContextSummarizer(typing.Protocol):
     async def summarize(self, messages: list[Message], max_tokens: int) -> str | None:
         """Return a model-facing summary message body or None to use deterministic fallback."""
@@ -343,9 +354,12 @@ class ContextAssembler:
         user_text = self.ctx.input.to_text()
         rag_chunks = await self._retrieve_rag_chunks(user_text)
         rag_message = build_rag_context_message(format_rag_chunks(rag_chunks))
-        history_messages = await self._get_history_messages()
+        checkpoint = await self._load_compaction_checkpoint()
+        history_messages, history_cursors = await self._get_history_messages(checkpoint)
 
         prompt_messages = build_prompt_messages(await self._get_prompt_config())
+        checkpoint_messages = self._checkpoint_messages(checkpoint)
+        checkpoint_cursors = [checkpoint.covers_until for _ in checkpoint_messages] if checkpoint else []
         rag_messages = [rag_message] if rag_message is not None else []
         current_messages = []
         user_message = build_user_message(
@@ -355,13 +369,19 @@ class ContextAssembler:
         if user_message is not None:
             current_messages.append(user_message)
 
-        return await ContextCompactor(self.budget, summarizer=self.summarizer).compact_async(
+        assembly = await ContextCompactor(self.budget, summarizer=self.summarizer).compact_async(
             prompt_messages=prompt_messages,
-            history_messages=history_messages,
+            history_messages=checkpoint_messages + history_messages,
             rag_messages=rag_messages,
             current_messages=current_messages,
             rag_chunks=rag_chunks,
         )
+        await self._store_compaction_checkpoint(
+            assembly,
+            checkpoint=checkpoint,
+            compaction_cursors=checkpoint_cursors + history_cursors,
+        )
+        return assembly
 
     async def _get_prompt_config(self) -> list[dict[str, typing.Any]]:
         available_apis = getattr(getattr(self.ctx, "context", None), "available_apis", None)
@@ -394,28 +414,124 @@ class ContextAssembler:
             rerank_top_k=rerank_top_k,
         )
 
-    async def _get_history_messages(self) -> list[Message]:
+    async def _get_history_messages(
+        self,
+        checkpoint: CompactionCheckpoint | None = None,
+    ) -> tuple[list[Message], list[str | None]]:
         context = self.ctx.context
         if not context.available_apis.history_page or not context.conversation_id:
-            return []
+            return [], []
 
-        page = await self.api.history_page(
-            conversation_id=context.conversation_id,
-            limit=self.budget.history_fetch_limit,
-            direction="backward",
-            include_artifacts=True,
-        )
+        direction = "forward" if checkpoint and checkpoint.covers_until else "backward"
+        kwargs: dict[str, typing.Any] = {
+            "conversation_id": context.conversation_id,
+            "limit": self.budget.history_fetch_limit,
+            "direction": direction,
+            "include_artifacts": True,
+        }
+        if direction == "forward":
+            kwargs["after_cursor"] = checkpoint.covers_until if checkpoint else None
+
+        try:
+            page = await self.api.history_page(**kwargs)
+        except Exception:
+            if checkpoint is not None:
+                logger.warning("Compaction checkpoint history cursor failed; falling back to recent tail", exc_info=True)
+                return await self._get_history_messages(None)
+            raise
 
         messages: list[Message] = []
-        for raw_item in reversed(_model_or_mapping_get(page, "items", [])):
+        cursors: list[str | None] = []
+        raw_items = list(_model_or_mapping_get(page, "items", []))
+        iterable = raw_items if direction == "forward" else list(reversed(raw_items))
+        for raw_item in iterable:
             item = _as_mapping(raw_item)
             if item is None:
                 continue
             message = _message_from_transcript_item(item, self.ctx.event.event_id)
             if message is not None:
                 messages.append(message)
+                cursor = item.get("cursor") or item.get("seq")
+                cursors.append(str(cursor) if cursor is not None else None)
 
-        return messages
+        return messages, cursors
+
+    def _state_api_available(self) -> bool:
+        available_apis = getattr(getattr(self.ctx, "context", None), "available_apis", None)
+        return bool(getattr(available_apis, "state", False)) and hasattr(self.api, "state_get") and hasattr(self.api, "state_set")
+
+    async def _load_compaction_checkpoint(self) -> CompactionCheckpoint | None:
+        if not self._state_api_available():
+            return None
+
+        try:
+            response = await self.api.state_get("conversation", CHECKPOINT_STATE_KEY)
+        except Exception:
+            logger.debug("Failed to read compaction checkpoint state", exc_info=True)
+            return None
+
+        value = response.get("value") if isinstance(response, dict) else None
+        if not isinstance(value, dict):
+            return None
+        if value.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
+            return None
+
+        conversation_id = getattr(getattr(self.ctx, "context", None), "conversation_id", None)
+        stored_conversation_id = value.get("conversation_id")
+        if stored_conversation_id and conversation_id and stored_conversation_id != conversation_id:
+            return None
+
+        summary = value.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            return None
+
+        covers_until = value.get("covers_until")
+        return CompactionCheckpoint(
+            summary=summary,
+            covers_until=str(covers_until) if covers_until is not None else None,
+            tokens_before=value.get("tokens_before") if isinstance(value.get("tokens_before"), int) else None,
+            created_at=value.get("created_at") if isinstance(value.get("created_at"), int) else None,
+        )
+
+    def _checkpoint_messages(self, checkpoint: CompactionCheckpoint | None) -> list[Message]:
+        if checkpoint is None or not checkpoint.summary:
+            return []
+        return [Message(role="system", content=checkpoint.summary)]
+
+    async def _store_compaction_checkpoint(
+        self,
+        assembly: ContextAssembly,
+        *,
+        checkpoint: CompactionCheckpoint | None,
+        compaction_cursors: list[str | None],
+    ) -> None:
+        if not self._state_api_available() or not assembly.compacted or assembly.summary_message is None:
+            return
+
+        compacted_count = assembly.diagnostics.compacted_message_count if assembly.diagnostics else 0
+        covered_cursor = _last_non_empty(compaction_cursors[:compacted_count])
+        if covered_cursor is None and checkpoint is not None:
+            covered_cursor = checkpoint.covers_until
+        if covered_cursor is None:
+            return
+
+        summary = _message_content_text(assembly.summary_message).strip()
+        if not summary:
+            return
+
+        payload = {
+            "schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "summary": summary,
+            "covers_until": covered_cursor,
+            "tokens_before": assembly.tokens_before,
+            "created_at": int(time.time()),
+            "conversation_id": getattr(getattr(self.ctx, "context", None), "conversation_id", None),
+        }
+
+        try:
+            await self.api.state_set("conversation", CHECKPOINT_STATE_KEY, payload)
+        except Exception:
+            logger.debug("Failed to write compaction checkpoint state", exc_info=True)
 
 
 class ContextCompactor:
@@ -911,6 +1027,13 @@ def _model_or_mapping_get(value: typing.Any, key: str, default: typing.Any = Non
     if isinstance(value, dict):
         return value.get(key, default)
     return getattr(value, key, default)
+
+
+def _last_non_empty(values: list[str | None]) -> str | None:
+    for value in reversed(values):
+        if value:
+            return value
+    return None
 
 
 def _copy_messages(messages: list[Message]) -> list[Message]:

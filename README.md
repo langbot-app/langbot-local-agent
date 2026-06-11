@@ -149,9 +149,12 @@ Local Agent currently uses a runner-owned context pipeline:
    use the authorized Host model API to generate a structured checkpoint summary,
    wrap it in a `system` message containing
    `<conversation_summary>...</conversation_summary>`, and keep a recent history
-   tail bounded by `context-keep-recent-tokens`. If model summarization fails or
-   returns empty content, Local Agent falls back to a deterministic bounded
-   summary.
+   tail bounded by `context-keep-recent-tokens`. If Host exposes the state API,
+   Local Agent persists that summary as a conversation-scoped compaction
+   checkpoint at `runner.compaction.checkpoint`, anchored by `covers_until`, and
+   later runs reuse it before pulling transcript entries after that cursor. If
+   model summarization fails or returns empty content, Local Agent falls back to
+   a deterministic bounded summary.
 5. Re-run the context transform before every model turn, including tool-call
    follow-up turns, so tool results and assistant tool calls are budgeted before
    the next provider request.
@@ -162,10 +165,11 @@ Local Agent currently uses a runner-owned context pipeline:
 
 This is not `max-round` behavior. History is not selected by number of rounds;
 the runner budgets prompt, current input, summary, and recent history together,
-following the Pi-style context threshold and per-turn transform shape. Future
-iterations can persist compaction checkpoints through Host state/storage after
-the Host exposes the corresponding run-scoped APIs and replace local estimates
-with tokenizer/model usage metadata from the LiteLLM model-info work.
+following the Pi-style context threshold and per-turn transform shape. When the
+Host does not expose the state API or a checkpoint cannot be parsed, Local Agent
+falls back to the previous tail-history behavior. Future iterations can replace
+local estimates with tokenizer/model usage metadata from the LiteLLM model-info
+work.
 
 Pipeline adapter data is intentionally narrow. Local Agent does not consume
 `ctx.adapter.extra.prompt`; prompt handoff goes through the run-scoped Host
@@ -174,8 +178,8 @@ and Host APIs over adapter fields.
 
 ## Host APIs Consumed
 
-Model, prompt, history, artifact, tool, knowledge-base, and rerank access go
-through `AgentRunAPIProxy`. LangBot validates these calls with the current
+Model, prompt, history, state, artifact, tool, knowledge-base, and rerank access
+go through `AgentRunAPIProxy`. LangBot validates these calls with the current
 `run_id`, run-scoped resource policy / available APIs, and caller plugin identity.
 
 Local Agent must not expose the runner process filesystem as an agent

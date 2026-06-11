@@ -63,6 +63,7 @@ from pkg.config import (
     parse_model_config,
 )
 from pkg.context_pipeline import (
+    CHECKPOINT_STATE_KEY,
     DEFAULT_CONTEXT_KEEP_RECENT_TOKENS,
     DEFAULT_CONTEXT_RESERVE_TOKENS,
     DEFAULT_CONTEXT_SUMMARY_TOKENS,
@@ -117,6 +118,10 @@ class FakeAgentRunAPIProxy:
         self.invoke_rerank = AsyncMock()
         self.get_prompt = AsyncMock(return_value=[])
         self.artifact_read = AsyncMock()
+        self.state_get = AsyncMock(return_value={"value": None})
+        self.state_set = AsyncMock(return_value={"ok": True})
+        self.state_delete = AsyncMock(return_value={"ok": True})
+        self.state_list = AsyncMock(return_value={"keys": []})
         self.history_page = AsyncMock(
             return_value={
                 "items": [],
@@ -868,6 +873,113 @@ class TestContextAssembler:
         assert assembly.frame.rag_chunks[0].chunk_id == "chunk-1"
         assert assembly.frame.rag_chunks[0].metadata == {"source": "doc-a"}
         assert assembly.diagnostics.rag_tokens > 0
+
+    @pytest.mark.asyncio
+    async def test_compaction_checkpoint_reads_state_and_fetches_incremental_history(self):
+        """A persisted checkpoint is reused and history resumes after covers_until."""
+        fake_api = FakeAgentRunAPIProxy()
+        fake_api.state_get = AsyncMock(
+            return_value={
+                "value": {
+                    "schema_version": "langbot.local_agent.compaction_checkpoint.v1",
+                    "summary": "<conversation_summary>\ncheckpoint read sentinel\n</conversation_summary>",
+                    "covers_until": "cursor-1",
+                    "tokens_before": 9000,
+                    "created_at": 1710000000,
+                    "conversation_id": "conv-1",
+                }
+            }
+        )
+        fake_api.history_page = AsyncMock(
+            return_value={
+                "items": [
+                    {
+                        "transcript_id": "t-2",
+                        "event_id": "event-2",
+                        "conversation_id": "conv-1",
+                        "cursor": "cursor-2",
+                        "role": "user",
+                        "item_type": "message",
+                        "content": "incremental history sentinel",
+                    }
+                ],
+                "next_cursor": None,
+                "prev_cursor": None,
+                "has_more": False,
+            }
+        )
+        ctx = make_context(input_text="current question")
+        ctx.context.conversation_id = "conv-1"
+        ctx.context.available_apis.history_page = True
+        ctx.context.available_apis.state = True
+
+        assembly = await ContextAssembler(fake_api, ctx).assemble()
+
+        fake_api.state_get.assert_awaited_once_with("conversation", CHECKPOINT_STATE_KEY)
+        fake_api.history_page.assert_awaited_once()
+        assert fake_api.history_page.await_args.kwargs["direction"] == "forward"
+        assert fake_api.history_page.await_args.kwargs["after_cursor"] == "cursor-1"
+        assert any("checkpoint read sentinel" in message.content for message in assembly.messages)
+        assert any("incremental history sentinel" in message.content for message in assembly.messages)
+        fake_api.state_set.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_compaction_checkpoint_writes_state_after_compaction(self):
+        """A compacted assembly persists the new summary and covered transcript cursor."""
+
+        class SentinelSummarizer:
+            async def summarize(self, messages: list[Message], max_tokens: int) -> str:
+                return "<conversation_summary>\ncheckpoint write sentinel\n</conversation_summary>"
+
+        fake_api = FakeAgentRunAPIProxy()
+        fake_api.history_page = AsyncMock(
+            return_value={
+                "items": [
+                    {
+                        "transcript_id": f"t-{index}",
+                        "event_id": f"event-{index}",
+                        "conversation_id": "conv-1",
+                        "cursor": f"cursor-{index}",
+                        "role": "user" if index % 2 else "assistant",
+                        "item_type": "message",
+                        "content": f"history {index} " + ("long checkpoint content " * 80),
+                    }
+                    for index in range(1, 6)
+                ],
+                "next_cursor": None,
+                "prev_cursor": None,
+                "has_more": False,
+            }
+        )
+        ctx = make_context(input_text="current question")
+        ctx.context.conversation_id = "conv-1"
+        ctx.context.available_apis.history_page = True
+        ctx.context.available_apis.state = True
+        budget = ContextBudget(
+            window_tokens=90,
+            reserve_tokens=10,
+            keep_recent_tokens=5,
+            summary_tokens=50,
+            history_fetch_limit=10,
+        )
+
+        assembly = await ContextAssembler(
+            fake_api,
+            ctx,
+            budget=budget,
+            summarizer=SentinelSummarizer(),
+        ).assemble()
+
+        assert assembly.compacted is True
+        fake_api.state_set.assert_awaited_once()
+        scope, key, payload = fake_api.state_set.await_args.args
+        assert scope == "conversation"
+        assert key == CHECKPOINT_STATE_KEY
+        assert payload["schema_version"] == "langbot.local_agent.compaction_checkpoint.v1"
+        assert "checkpoint write sentinel" in payload["summary"]
+        assert payload["covers_until"] in {"cursor-1", "cursor-2", "cursor-3", "cursor-4", "cursor-5"}
+        assert payload["tokens_before"] == assembly.tokens_before
+        assert payload["conversation_id"] == "conv-1"
 
 
 # ==================== Runner Integration Tests ====================
