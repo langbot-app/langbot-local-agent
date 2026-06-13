@@ -4,16 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 from langbot_plugin.api.entities.builtin.agent_runner.artifact import ArtifactReadResult
+from langbot_plugin.api.entities.builtin.agent_runner.steering import SteeringPullResult
 from langbot_plugin.api.entities.builtin.provider.message import FunctionCall, Message, MessageChunk, ToolCall
+from langbot_plugin.api.proxies.agent_run_api import PermissionDeniedError
+from langbot_plugin.entities.io.actions.enums import PluginToRuntimeAction
 
 from pkg.agent_core import (
     AgentLoop,
     AgentLoopEventType,
     AgentLoopHooks,
+    LangBotContextHooks,
     LangBotModelAdapter,
     LangBotToolExecutor,
     ModelTurnEvent,
@@ -21,11 +26,131 @@ from pkg.agent_core import (
     ToolCallRequest,
     ToolExecutionMode,
 )
+from pkg.agent_core.langbot import LangBotSteeringPuller
+from pkg.context_pipeline import ContextBudget
 from pkg.model_calling import INTERNAL_ARTIFACT_READ_TOOL_NAME, ModelCallError
 
 
 async def _collect_events(loop: AgentLoop):
     return [event async for event in loop.run()]
+
+
+@pytest.mark.asyncio
+async def test_steering_puller_accepts_sdk_result_models():
+    """Host steering_pull returns SDK DTOs, not plain dicts."""
+
+    class SteeringAPI:
+        async def steering_pull(self, mode="all"):
+            assert mode == "all"
+            return SteeringPullResult.model_validate(
+                {
+                    "items": [
+                        {
+                            "claimed_run_id": "run-1",
+                            "runner_id": "plugin:langbot/local-agent/default",
+                            "event": {
+                                "event_id": "evt-follow-up",
+                                "event_type": "message.received",
+                                "source": "host_adapter",
+                            },
+                            "input": {
+                                "text": "follow-up sentinel",
+                                "contents": [],
+                                "attachments": [],
+                            },
+                        }
+                    ]
+                }
+            )
+
+    messages = await LangBotSteeringPuller(SteeringAPI()).pull_messages(mode="all")
+
+    assert len(messages) == 1
+    assert messages[0].role == "user"
+    assert messages[0].content == "follow-up sentinel"
+
+
+@pytest.mark.asyncio
+async def test_steering_puller_falls_back_to_host_authorization():
+    """Host authorization is authoritative when local SDK context gates disagree."""
+
+    runtime_handler = SimpleNamespace()
+    runtime_handler.call_action = AsyncMock(
+        return_value={
+            "items": [
+                {
+                    "claimed_run_id": "run-1",
+                    "runner_id": "plugin:langbot/local-agent/default",
+                    "event": {
+                        "event_id": "evt-follow-up",
+                        "event_type": "message.received",
+                        "source": "host_adapter",
+                    },
+                    "input": {
+                        "text": "fallback follow-up",
+                        "contents": [],
+                        "attachments": [],
+                    },
+                }
+            ]
+        }
+    )
+
+    class SteeringAPI:
+        run_id = "run-1"
+        _api = SimpleNamespace(plugin_runtime_handler=runtime_handler)
+
+        async def steering_pull(self, mode="all"):
+            raise PermissionDeniedError("steering_pull is not available locally")
+
+    messages = await LangBotSteeringPuller(SteeringAPI()).pull_messages(mode="all")
+
+    assert len(messages) == 1
+    assert messages[0].content == "fallback follow-up"
+    runtime_handler.call_action.assert_awaited_once()
+    call_args = runtime_handler.call_action.call_args
+    assert call_args[0][0] == PluginToRuntimeAction.STEERING_PULL
+    assert call_args[0][1]["run_id"] == "run-1"
+
+
+@pytest.mark.asyncio
+async def test_steering_puller_uses_host_authorization_when_sdk_method_missing():
+    """Older SDK proxies may not expose steering_pull even when Host authorizes it."""
+
+    runtime_handler = SimpleNamespace()
+    runtime_handler.call_action = AsyncMock(
+        return_value={
+            "items": [
+                {
+                    "claimed_run_id": "run-1",
+                    "runner_id": "plugin:langbot/local-agent/default",
+                    "event": {
+                        "event_id": "evt-follow-up",
+                        "event_type": "message.received",
+                        "source": "host_adapter",
+                    },
+                    "input": {
+                        "text": "host-authorized follow-up",
+                        "contents": [],
+                        "attachments": [],
+                    },
+                }
+            ]
+        }
+    )
+
+    class SteeringAPI:
+        run_id = "run-1"
+        _api = SimpleNamespace(plugin_runtime_handler=runtime_handler)
+
+    messages = await LangBotSteeringPuller(SteeringAPI()).pull_messages(mode="all")
+
+    assert len(messages) == 1
+    assert messages[0].content == "host-authorized follow-up"
+    runtime_handler.call_action.assert_awaited_once()
+    call_args = runtime_handler.call_action.call_args
+    assert call_args[0][0] == PluginToRuntimeAction.STEERING_PULL
+    assert call_args[0][1]["run_id"] == "run-1"
 
 
 def test_tool_call_request_generates_uuid_ids_for_raw_calls_without_id():
@@ -106,6 +231,109 @@ async def test_streaming_loop_emits_turn_message_and_tool_events():
     ]
     assert deltas == ["Checking", "CheckingDone"]
     api.call_tool.assert_awaited_once_with(tool_name="allowed_tool", parameters={"arg": "value"})
+
+
+@pytest.mark.asyncio
+async def test_streaming_loop_pulls_steering_after_tool_batch():
+    class RecordingModelAdapter:
+        def __init__(self):
+            self.turns = 0
+            self.messages_by_turn: list[list[Message]] = []
+
+        async def stream_turn(self, *, model_ids, messages, tools, visible_prefix=""):
+            self.messages_by_turn.append([message.model_copy(deep=True) for message in messages])
+            self.turns += 1
+
+            if self.turns == 1:
+                result = ModelTurnResult(
+                    message=Message(
+                        role="assistant",
+                        content="Need tool",
+                        tool_calls=[
+                            ToolCallRequest(
+                                id="call-sleep",
+                                name="sleep_tool",
+                                arguments="{}",
+                            ).to_tool_call()
+                        ],
+                    ),
+                    tool_calls=[
+                        ToolCallRequest(
+                            id="call-sleep",
+                            name="sleep_tool",
+                            arguments="{}",
+                        )
+                    ],
+                    committed_model_id="model-1",
+                    visible_content="Need tool",
+                )
+                yield ModelTurnEvent.message_delta(
+                    MessageChunk(role="assistant", content="Need tool", is_final=True)
+                )
+                yield ModelTurnEvent.message_end(result)
+                return
+
+            saw_followup = any(
+                message.role == "user" and message.content == "steering follow-up"
+                for message in messages
+            )
+            content = "saw steering follow-up" if saw_followup else "missing steering follow-up"
+            yield ModelTurnEvent.message_delta(
+                MessageChunk(role="assistant", content=content, is_final=True)
+            )
+            yield ModelTurnEvent.message_end(
+                ModelTurnResult(
+                    message=Message(role="assistant", content=content),
+                    tool_calls=[],
+                    committed_model_id="model-1",
+                    visible_content=content,
+                )
+            )
+
+    class ToolAPI:
+        async def call_tool(self, *, tool_name, parameters):
+            return {"value": "done"}
+
+    class SteeringPuller:
+        def __init__(self):
+            self.calls = 0
+
+        async def pull_messages(self, *, mode="all"):
+            self.calls += 1
+            if self.calls == 1:
+                return [Message(role="user", content="steering follow-up")]
+            return []
+
+    model_adapter = RecordingModelAdapter()
+    steering_puller = SteeringPuller()
+    loop = AgentLoop(
+        model_adapter=model_adapter,
+        tool_executor=LangBotToolExecutor(ToolAPI(), {"sleep_tool"}),
+        model_ids=["model-1"],
+        messages=[Message(role="user", content="Use the tool")],
+        tools=[],
+        streaming=True,
+        max_tool_iterations=10,
+        hooks=LangBotContextHooks(
+            ContextBudget(window_tokens=0, reserve_tokens=0),
+            steering_puller=steering_puller,
+        ),
+    )
+
+    events = await _collect_events(loop)
+
+    assert steering_puller.calls == 2
+    assert len(model_adapter.messages_by_turn) == 2
+    assert any(
+        message.role == "user" and message.content == "steering follow-up"
+        for message in model_adapter.messages_by_turn[1]
+    )
+    assert any(
+        event.type == AgentLoopEventType.MESSAGE_END
+        and event.message is not None
+        and event.message.content == "saw steering follow-up"
+        for event in events
+    )
 
 
 @pytest.mark.asyncio

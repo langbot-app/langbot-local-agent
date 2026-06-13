@@ -13,6 +13,7 @@ import uuid
 from langbot_plugin.api.entities.builtin.provider.message import ContentElement, Message, MessageChunk
 from langbot_plugin.api.entities.builtin.resource.tool import LLMTool
 from langbot_plugin.api.proxies.agent_run_api import AgentRunAPIProxy, PermissionDeniedError
+from langbot_plugin.entities.io.actions.enums import PluginToRuntimeAction
 
 from pkg.config import DEFAULT_MAX_TOOL_RESULT_ARTIFACT_BYTES, DEFAULT_MAX_TOOL_RESULT_CHARS
 from pkg.context_pipeline import ContextBudget, ContextCompactor, ContextSummarizer
@@ -459,18 +460,23 @@ class LangBotSteeringPuller:
         self.api = api
 
     async def pull_messages(self, *, mode: str = "all") -> list[Message]:
-        if not hasattr(self.api, "steering_pull"):
-            return []
-
+        steering_pull = getattr(self.api, "steering_pull", None)
         try:
-            response = await self.api.steering_pull(mode=mode)
+            if callable(steering_pull):
+                response = await steering_pull(mode=mode)
+            else:
+                response = await self._pull_with_host_authorization(mode=mode)
+                if response is None:
+                    return []
         except PermissionDeniedError:
-            return []
+            response = await self._pull_with_host_authorization(mode=mode)
+            if response is None:
+                return []
         except Exception:
             logger.debug("Failed to pull steering inputs", exc_info=True)
             return []
 
-        items = response.get("items", []) if isinstance(response, dict) else []
+        items = _model_or_mapping_get(response, "items", [])
         if not isinstance(items, list):
             return []
 
@@ -482,15 +488,15 @@ class LangBotSteeringPuller:
         return messages
 
     def _message_from_item(self, item: typing.Any) -> Message | None:
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) and not hasattr(item, "input"):
             return None
 
-        input_data = item.get("input")
-        if not isinstance(input_data, dict):
+        input_data = _model_or_mapping_get(item, "input")
+        if not isinstance(input_data, dict) and not hasattr(input_data, "text"):
             return None
 
-        text = input_data.get("text")
-        contents = self._content_elements(input_data.get("contents"))
+        text = _model_or_mapping_get(input_data, "text")
+        contents = self._content_elements(_model_or_mapping_get(input_data, "contents"))
         return build_user_message(
             user_text=text if isinstance(text, str) else "",
             input_contents=contents,
@@ -510,6 +516,26 @@ class LangBotSteeringPuller:
             except Exception:
                 logger.debug("Ignoring invalid steering content element", exc_info=True)
         return contents
+
+    async def _pull_with_host_authorization(self, *, mode: str) -> typing.Any | None:
+        """Fallback when local SDK context gates miss a Host-authorized run API.
+
+        Host remains the authority: the runtime handler injects caller identity
+        and LangBot validates the run session before returning any input.
+        """
+        try:
+            return await self.api._api.plugin_runtime_handler.call_action(
+                PluginToRuntimeAction.STEERING_PULL,
+                {
+                    "run_id": self.api.run_id,
+                    "mode": mode,
+                    "limit": None,
+                },
+                timeout=10.0,
+            )
+        except Exception:
+            logger.debug("Failed to pull steering inputs via host authorization", exc_info=True)
+            return None
 
 
 def _non_negative_int(value: typing.Any, *, default: int) -> int:
