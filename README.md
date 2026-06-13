@@ -62,8 +62,8 @@ plugin components use.
 | max-tool-result-chars | integer | no | 20000 | Maximum serialized tool result characters injected into the next model request |
 | max-tool-result-artifact-bytes | integer | no | 1048576 | Maximum inline artifact payload bytes emitted by the runner for oversized tool text results |
 | context-history-fetch-limit | integer | no | 50 | Transcript messages pulled from the Host history API |
-| context-window-tokens | integer | no | 200000 | Approximate context window when Host model metadata is not available |
-| context-reserve-tokens | integer | no | 16384 | Tokens reserved for the model response and provider overhead |
+| context-window-tokens | integer | no | 200000 | Fallback context window, and an upper cap when Host model metadata is available |
+| context-reserve-tokens | integer | no | 16384 | Tokens reserved for the model response and provider overhead, clamped to at most 25% of the effective window |
 | context-keep-recent-tokens | integer | no | 20000 | Approximate recent history tokens to retain when compaction triggers |
 | context-summary-tokens | integer | no | 8000 | Maximum deterministic summary tokens inserted for compacted older history |
 
@@ -141,11 +141,13 @@ Local Agent currently uses a runner-owned context pipeline:
 1. Assemble effective prompt, host transcript history, RAG context, and current
    structured input.
 2. Use the Host-provided model context window from `ctx.runtime.metadata` when
-   available; otherwise use the runner binding's `context-window-tokens`,
-   which defaults to 200k tokens.
+   available, capped by the runner binding's `context-window-tokens`. If Host
+   metadata is unavailable, `context-window-tokens` is the fallback window and
+   defaults to 200k tokens.
 3. Estimate message tokens with a conservative local heuristic until LangBot
    exposes tokenizer/model usage metadata to runner plugins.
-4. When the assembled context exceeds `context-window-tokens - context-reserve-tokens`,
+4. When the assembled context exceeds the effective input budget
+   (`window - reserve`, with reserve clamped for small windows),
    use the authorized Host model API to generate a structured checkpoint summary,
    wrap it in a `system` message containing
    `<conversation_summary>...</conversation_summary>`, and keep a recent history
@@ -178,9 +180,10 @@ and Host APIs over adapter fields.
 
 ## Host APIs Consumed
 
-Model, prompt, history, state, artifact, tool, knowledge-base, and rerank access
-go through `AgentRunAPIProxy`. LangBot validates these calls with the current
-`run_id`, run-scoped resource policy / available APIs, and caller plugin identity.
+Model, prompt, history, state, artifact, tool, knowledge-base, rerank, and
+steering access go through `AgentRunAPIProxy`. LangBot validates these calls
+with the current `run_id`, run-scoped resource policy / available APIs, and
+caller plugin identity.
 
 Local Agent must not expose the runner process filesystem as an agent
 capability. In sandboxed deployments, file access is mediated by Host/sandbox
@@ -199,9 +202,9 @@ Typical local-agent usage:
 - Invoke authorized LangBot-hosted models.
 - Call authorized tools.
 - Retrieve authorized knowledge bases and rerank results.
-- Page transcript history for the model request and search history when the
-  runner decides it is needed.
-- Read artifact metadata/content for files, images, or large tool results.
+- Page transcript history for the model request.
+- Pull authorized steering inputs at turn boundaries.
+- Read artifact content for files, images, or large tool results.
 
 The runner must not bypass `ctx.resources` or call host-private managers to
 access unauthorized models, tools, knowledge bases, files, storage, or platform
@@ -214,6 +217,7 @@ APIs.
 - `knowledge_retrieval`: yes
 - `multimodal_input`: yes
 - `skill_authoring`: yes
+- `steering`: yes
 
 `skill_authoring` means Local Agent can receive LangBot's Host-owned
 `ctx.resources.skills` facts plus `activate`/`register_skill` tools when skills
@@ -221,12 +225,12 @@ are available. Skills remain owned by LangBot/Box; the runner owns how
 model-facing prompts, tool schemas, tool results, or MCP adapters are assembled
 from those Host capabilities.
 
-Local Agent is currently reentrant and stateless across runs. It can pull Host
-history each run, but it does not yet persist summary checkpoints, external
-session IDs, or runner-owned memory through Host state/storage. Future
-stateful-session support should require the binding to expose storage/state APIs
-and write/read checkpoints through `AgentRunAPIProxy` instead of keeping mutable
-per-conversation state in the plugin instance.
+Local Agent is reentrant and does not keep mutable per-conversation state in
+the plugin instance. It can pull Host history each run. When Host state APIs
+are available, it persists compacted summary checkpoints through
+`AgentRunAPIProxy` so later runs can resume from
+`runner.compaction.checkpoint`. It does not persist external session IDs or
+runner-owned memory outside Host-managed state/storage.
 
 ## Event System Boundary
 

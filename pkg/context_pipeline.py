@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
 import typing
+import unicodedata
 from dataclasses import dataclass, field
 
 from langbot_plugin.api.entities.builtin.agent_runner import AgentRunContext
@@ -27,7 +29,9 @@ DEFAULT_CONTEXT_KEEP_RECENT_TOKENS = 20_000
 DEFAULT_CONTEXT_SUMMARY_TOKENS = 8_000
 
 ESTIMATED_ATTACHMENT_CHARS = 4800
+ESTIMATED_ATTACHMENT_TOKENS = 1600
 ESTIMATED_CHARS_PER_TOKEN = 4
+SUMMARY_REFERENCE_LIMIT = 40
 SUMMARY_OPEN_TAG = "<conversation_summary>"
 SUMMARY_CLOSE_TAG = "</conversation_summary>"
 SUMMARY_SCHEMA_VERSION = "langbot.conversation_summary.v1"
@@ -35,6 +39,14 @@ CHECKPOINT_STATE_KEY = "runner.compaction.checkpoint"
 CHECKPOINT_SCHEMA_VERSION = "langbot.local_agent.compaction_checkpoint.v1"
 SUMMARY_ENTRY_RE = re.compile(r"^\s*\d+\.\s+([A-Za-z_][A-Za-z0-9_-]*):\s?(.*)$", re.DOTALL)
 SUMMARY_COUNT_RE = re.compile(r"\bcount=(\d+)\b")
+CRITICAL_REF_RE = re.compile(
+    r"(?<![A-Za-z0-9_./:-])"
+    r"(?:[A-Za-z][A-Za-z0-9]*[_.:/-]){2,}[A-Za-z0-9][A-Za-z0-9_.:/-]*"
+)
+CRITICAL_REF_GUIDANCE = (
+    "Instruction: exact opaque values from omitted messages; when asked for a remembered "
+    "passcode, secret, sentinel, or identifier, reply with the full matching value verbatim."
+)
 SUMMARIZATION_SYSTEM_PROMPT = """You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.
 
 Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary."""
@@ -131,16 +143,21 @@ class ContextBudget:
             metadata = {}
 
         host_window_tokens = _runtime_context_window_tokens(metadata)
+        host_max_output_tokens = _runtime_max_output_tokens(metadata)
         config_window_tokens = _config_token_value(
             config,
             "context-window-tokens",
-            None,
+            DEFAULT_CONTEXT_WINDOW_TOKENS,
             minimum=0,
         )
+        window_tokens = config_window_tokens
+        if host_window_tokens is not None:
+            window_tokens = min(host_window_tokens, config_window_tokens)
 
         return cls.from_config(
             config,
-            window_tokens=host_window_tokens if host_window_tokens is not None else config_window_tokens,
+            window_tokens=window_tokens,
+            max_output_tokens=host_max_output_tokens,
         )
 
     @classmethod
@@ -149,34 +166,46 @@ class ContextBudget:
         config: dict[str, typing.Any],
         *,
         window_tokens: int | None = None,
+        max_output_tokens: int | None = None,
     ) -> "ContextBudget":
-        return cls(
-            window_tokens=window_tokens
+        resolved_window_tokens = (
+            window_tokens
             if window_tokens is not None
             else _config_token_value(
                 config,
                 "context-window-tokens",
                 DEFAULT_CONTEXT_WINDOW_TOKENS,
                 minimum=0,
-            ),
-            reserve_tokens=_config_token_value(
+            )
+        )
+        reserve_tokens = _clamp_reserve_tokens(
+            resolved_window_tokens,
+            _config_token_value(
                 config,
                 "context-reserve-tokens",
                 DEFAULT_CONTEXT_RESERVE_TOKENS,
                 minimum=0,
             ),
+        )
+        summary_tokens = _config_token_value(
+            config,
+            "context-summary-tokens",
+            DEFAULT_CONTEXT_SUMMARY_TOKENS,
+            minimum=0,
+        )
+        if max_output_tokens is not None and max_output_tokens > 0:
+            summary_tokens = min(summary_tokens, max_output_tokens, max(1, (reserve_tokens * 4) // 5))
+
+        return cls(
+            window_tokens=resolved_window_tokens,
+            reserve_tokens=reserve_tokens,
             keep_recent_tokens=_config_token_value(
                 config,
                 "context-keep-recent-tokens",
                 DEFAULT_CONTEXT_KEEP_RECENT_TOKENS,
                 minimum=0,
             ),
-            summary_tokens=_config_token_value(
-                config,
-                "context-summary-tokens",
-                DEFAULT_CONTEXT_SUMMARY_TOKENS,
-                minimum=0,
-            ),
+            summary_tokens=summary_tokens,
             history_fetch_limit=_config_int(
                 config,
                 "context-history-fetch-limit",
@@ -236,6 +265,15 @@ class ContextDiagnostics:
     rag_tokens: int
     current_tokens: int
     compacted_message_count: int = 0
+
+
+@dataclass(frozen=True)
+class ContextUsageAnchor:
+    """Provider-reported token usage for an already-rendered message prefix."""
+
+    message_count: int
+    total_tokens: int
+    model_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -423,36 +461,51 @@ class ContextAssembler:
             return [], []
 
         direction = "forward" if checkpoint and checkpoint.covers_until else "backward"
-        kwargs: dict[str, typing.Any] = {
-            "conversation_id": context.conversation_id,
-            "limit": self.budget.history_fetch_limit,
-            "direction": direction,
-            "include_artifacts": True,
-        }
-        if direction == "forward":
-            kwargs["after_cursor"] = checkpoint.covers_until if checkpoint else None
-
-        try:
-            page = await self.api.history_page(**kwargs)
-        except Exception:
-            if checkpoint is not None:
-                logger.warning("Compaction checkpoint history cursor failed; falling back to recent tail", exc_info=True)
-                return await self._get_history_messages(None)
-            raise
-
         messages: list[Message] = []
         cursors: list[str | None] = []
-        raw_items = list(_model_or_mapping_get(page, "items", []))
-        iterable = raw_items if direction == "forward" else list(reversed(raw_items))
-        for raw_item in iterable:
-            item = _as_mapping(raw_item)
-            if item is None:
-                continue
-            message = _message_from_transcript_item(item, self.ctx.event.event_id)
-            if message is not None:
-                messages.append(message)
-                cursor = item.get("cursor") or item.get("seq")
-                cursors.append(str(cursor) if cursor is not None else None)
+
+        after_cursor = checkpoint.covers_until if direction == "forward" and checkpoint else None
+        seen_page_cursors = {after_cursor} if after_cursor is not None else set()
+        while True:
+            kwargs: dict[str, typing.Any] = {
+                "conversation_id": context.conversation_id,
+                "limit": self.budget.history_fetch_limit,
+                "direction": direction,
+                "include_artifacts": True,
+            }
+            if direction == "forward":
+                kwargs["after_cursor"] = after_cursor
+
+            try:
+                page = await self.api.history_page(**kwargs)
+            except Exception:
+                if checkpoint is not None:
+                    logger.warning("Compaction checkpoint history cursor failed; falling back to recent tail", exc_info=True)
+                    return await self._get_history_messages(None)
+                raise
+
+            raw_items = list(_model_or_mapping_get(page, "items", []))
+            iterable = raw_items if direction == "forward" else list(reversed(raw_items))
+            for raw_item in iterable:
+                item = _as_mapping(raw_item)
+                if item is None:
+                    continue
+                message = _message_from_transcript_item(item, self.ctx.event.event_id)
+                if message is not None:
+                    messages.append(message)
+                    cursor = item.get("cursor") or item.get("seq")
+                    cursors.append(str(cursor) if cursor is not None else None)
+
+            if direction != "forward" or not bool(_model_or_mapping_get(page, "has_more", False)):
+                break
+
+            raw_next_cursor = _model_or_mapping_get(page, "next_cursor")
+            next_cursor = str(raw_next_cursor) if raw_next_cursor is not None else None
+            if not next_cursor or next_cursor in seen_page_cursors:
+                logger.warning("Compaction checkpoint history pagination stopped due to invalid next_cursor")
+                break
+            seen_page_cursors.add(next_cursor)
+            after_cursor = next_cursor
 
         return messages, cursors
 
@@ -537,9 +590,15 @@ class ContextAssembler:
 class ContextCompactor:
     """Compact old history into a summary message while keeping recent context."""
 
-    def __init__(self, budget: ContextBudget, summarizer: ContextSummarizer | None = None):
+    def __init__(
+        self,
+        budget: ContextBudget,
+        summarizer: ContextSummarizer | None = None,
+        usage_anchor: ContextUsageAnchor | None = None,
+    ):
         self.budget = budget
         self.summarizer = summarizer
+        self.usage_anchor = usage_anchor
 
     def compact_messages(self, messages: list[Message]) -> ContextAssembly:
         """Compact an already-assembled runtime message list.
@@ -583,7 +642,7 @@ class ContextCompactor:
         rag = sanitize_provider_messages(rag_messages or [])
         current = sanitize_provider_messages(current_messages)
         original_messages = prompt + history + rag + current
-        tokens_before = estimate_messages_tokens(original_messages)
+        tokens_before = estimate_messages_tokens_with_anchor(original_messages, self.usage_anchor)
 
         if not self.budget.enabled or tokens_before <= self.budget.input_tokens:
             return self._build_assembly(
@@ -661,7 +720,7 @@ class ContextCompactor:
         rag = sanitize_provider_messages(rag_messages or [])
         current = sanitize_provider_messages(current_messages)
         original_messages = prompt + history + rag + current
-        tokens_before = estimate_messages_tokens(original_messages)
+        tokens_before = estimate_messages_tokens_with_anchor(original_messages, self.usage_anchor)
 
         if not self.budget.enabled or tokens_before <= self.budget.input_tokens:
             return self._build_assembly(
@@ -738,6 +797,13 @@ class ContextCompactor:
         summary_message: Message | None = None,
         compacted_message_count: int,
     ) -> ContextAssembly:
+        prompt, summaries, history, rag, current = self._fit_frame_to_budget(
+            prompt=prompt,
+            summaries=summaries,
+            history=history,
+            rag=rag,
+            current=current,
+        )
         frame = ContextFrame(
             prompt=_copy_messages(prompt),
             summaries=_copy_messages(summaries),
@@ -769,6 +835,61 @@ class ContextCompactor:
             diagnostics=diagnostics,
         )
 
+    def _fit_frame_to_budget(
+        self,
+        *,
+        prompt: list[Message],
+        summaries: list[Message],
+        history: list[Message],
+        rag: list[Message],
+        current: list[Message],
+    ) -> tuple[list[Message], list[Message], list[Message], list[Message], list[Message]]:
+        if not self.budget.enabled:
+            return prompt, summaries, history, rag, current
+
+        input_budget = self.budget.input_tokens
+        if estimate_messages_tokens(prompt + summaries + history + rag + current) <= input_budget:
+            return prompt, summaries, history, rag, current
+
+        summaries = _fit_messages_to_budget(
+            summaries,
+            input_budget - estimate_messages_tokens(prompt + history + rag + current),
+            keep_tail=False,
+        )
+        if estimate_messages_tokens(prompt + summaries + history + rag + current) <= input_budget:
+            return prompt, summaries, history, rag, current
+
+        rag = _fit_messages_to_budget(
+            rag,
+            input_budget - estimate_messages_tokens(prompt + summaries + history + current),
+            keep_tail=False,
+        )
+        if estimate_messages_tokens(prompt + summaries + history + rag + current) <= input_budget:
+            return prompt, summaries, history, rag, current
+
+        history = _fit_messages_to_budget(
+            history,
+            input_budget - estimate_messages_tokens(prompt + summaries + rag + current),
+            keep_tail=True,
+        )
+        if estimate_messages_tokens(prompt + summaries + history + rag + current) <= input_budget:
+            return prompt, summaries, history, rag, current
+
+        prompt = _fit_messages_to_budget(
+            prompt,
+            input_budget - estimate_messages_tokens(summaries + history + rag + current),
+            keep_tail=True,
+        )
+        if estimate_messages_tokens(prompt + summaries + history + rag + current) <= input_budget:
+            return prompt, summaries, history, rag, current
+
+        current = _fit_messages_to_budget(
+            current,
+            input_budget - estimate_messages_tokens(prompt + summaries + history + rag),
+            keep_tail=True,
+        )
+        return prompt, summaries, history, rag, current
+
     def _summary_budget(self, history_budget: int) -> int:
         if self.budget.summary_tokens <= 0:
             return 0
@@ -799,7 +920,11 @@ class ContextCompactor:
         if not omitted or summary_budget <= 0:
             return None
 
-        summary = summarize_messages(omitted, summary_budget)
+        summary = _attach_summary_references(
+            summarize_messages(omitted, summary_budget),
+            omitted,
+            summary_budget,
+        )
         if not summary:
             return None
         return Message(role="system", content=summary)
@@ -813,6 +938,7 @@ class ContextCompactor:
             summary = await self.summarizer.summarize(omitted, summary_budget)
         if summary is None:
             summary = summarize_messages(omitted, summary_budget)
+        summary = _attach_summary_references(summary, omitted, summary_budget)
         if not summary:
             return None
         return Message(role="system", content=summary)
@@ -922,6 +1048,17 @@ def estimate_messages_tokens(messages: list[Message]) -> int:
     return sum(estimate_message_tokens(message) for message in messages)
 
 
+def estimate_messages_tokens_with_anchor(messages: list[Message], anchor: ContextUsageAnchor | None) -> int:
+    if (
+        anchor is None
+        or anchor.message_count < 0
+        or anchor.total_tokens <= 0
+        or anchor.message_count > len(messages)
+    ):
+        return estimate_messages_tokens(messages)
+    return anchor.total_tokens + estimate_messages_tokens(messages[anchor.message_count :])
+
+
 def estimate_message_chars(message: Message) -> int:
     chars = len(message.role) + 8
     chars += _content_chars(message.content)
@@ -961,7 +1098,7 @@ def estimate_text_tokens(text: str) -> int:
     tokens = 0
     non_cjk_chars = 0
     for char in text:
-        if _is_cjk_token_char(char):
+        if _is_cjk_token_char(char) or _is_symbol_token_char(char):
             tokens += _chars_to_tokens(non_cjk_chars)
             non_cjk_chars = 0
             tokens += 1
@@ -1167,7 +1304,7 @@ def _content_chars(content: typing.Any) -> int:
             if item.type == "text" and item.text:
                 chars += len(item.text)
             elif item.type.startswith(("image", "file")):
-                chars += ESTIMATED_ATTACHMENT_CHARS
+                chars += _attachment_tokens(item) * ESTIMATED_CHARS_PER_TOKEN
         return chars
     return 0
 
@@ -1181,9 +1318,26 @@ def _content_tokens(content: typing.Any) -> int:
             if item.type == "text" and item.text:
                 tokens += estimate_text_tokens(item.text)
             elif item.type.startswith(("image", "file")):
-                tokens += _chars_to_tokens(ESTIMATED_ATTACHMENT_CHARS)
+                tokens += _attachment_tokens(item)
         return tokens
     return 0
+
+
+def _attachment_tokens(item: typing.Any) -> int:
+    payload_chars = 0
+    for attr in ("image_base64", "file_base64"):
+        value = getattr(item, attr, None)
+        if isinstance(value, str):
+            payload_chars += len(value)
+
+    descriptor_tokens = 0
+    for attr in ("image_url", "file_url", "file_name"):
+        value = getattr(item, attr, None)
+        if isinstance(value, str):
+            descriptor_tokens += estimate_text_tokens(value)
+
+    payload_tokens = _chars_to_tokens(payload_chars)
+    return max(ESTIMATED_ATTACHMENT_TOKENS, payload_tokens, descriptor_tokens)
 
 
 def _move_cut_before_tool_result(history: list[Message], first_kept_index: int) -> int:
@@ -1308,6 +1462,141 @@ def _wrap_llm_summary(summary: str, max_tokens: int, *, message_count: int) -> s
     return f"{prefix}{body}{suffix}"
 
 
+def _attach_summary_references(summary: str | None, messages: list[Message], max_tokens: int) -> str:
+    if not summary or max_tokens <= 0:
+        return ""
+
+    block = _summary_reference_block(messages)
+    if not block:
+        return summary
+
+    summary = summary.strip()
+    if SUMMARY_CLOSE_TAG in summary:
+        body, close = summary.rsplit(SUMMARY_CLOSE_TAG, 1)
+        combined = f"{body.rstrip()}\n\n{block}\n{SUMMARY_CLOSE_TAG}{close}"
+    else:
+        combined = f"{summary}\n\n{block}"
+    if estimate_text_tokens(combined) <= max_tokens:
+        return combined
+
+    if SUMMARY_CLOSE_TAG in summary:
+        minimal = f"{SUMMARY_OPEN_TAG}\nv=1 references=preserved\n{block}\n{SUMMARY_CLOSE_TAG}"
+        if estimate_text_tokens(minimal) <= max_tokens:
+            return minimal
+
+    block_tokens = estimate_text_tokens(f"\n\n{block}\n{SUMMARY_CLOSE_TAG}")
+    if SUMMARY_CLOSE_TAG in summary and block_tokens < max_tokens:
+        body, close = summary.rsplit(SUMMARY_CLOSE_TAG, 1)
+        truncated_body = _truncate_text_to_tokens(body.rstrip(), max_tokens - block_tokens).rstrip()
+        return f"{truncated_body}\n\n{block}\n{SUMMARY_CLOSE_TAG}{close}"
+
+    return _truncate_text_to_tokens(combined, max_tokens)
+
+
+def _summary_reference_block(messages: list[Message]) -> str:
+    critical_refs: list[str] = []
+    artifacts: list[str] = []
+    files: list[str] = []
+    seen_critical_refs: set[str] = set()
+    seen_artifacts: set[str] = set()
+    seen_files: set[str] = set()
+
+    def add_critical_ref(ref: str) -> None:
+        ref = ref.strip().strip(".,;:)")
+        if not ref or ref in seen_critical_refs:
+            return
+        seen_critical_refs.add(ref)
+        critical_refs.append(f"- {ref}")
+
+    def add_artifact(value: dict[str, typing.Any]) -> None:
+        artifact_id = value.get("artifact_id")
+        if not isinstance(artifact_id, str) or not artifact_id or artifact_id in seen_artifacts:
+            return
+        seen_artifacts.add(artifact_id)
+        fields = [f"artifact_id={artifact_id}"]
+        artifacts.append("- " + " ".join(str(field) for field in fields))
+
+    def add_file(value: dict[str, typing.Any]) -> None:
+        file_id = value.get("file_key") or value.get("file_id")
+        if not isinstance(file_id, str) or not file_id or file_id in seen_files:
+            return
+        seen_files.add(file_id)
+        fields = [f"file_id={file_id}"]
+        files.append("- " + " ".join(str(field) for field in fields))
+
+    def walk(value: typing.Any, depth: int = 0) -> None:
+        if depth > 6 or len(critical_refs) + len(artifacts) + len(files) >= SUMMARY_REFERENCE_LIMIT:
+            return
+        if isinstance(value, dict):
+            add_artifact(value)
+            add_file(value)
+            for nested in value.values():
+                if isinstance(nested, (dict, list, tuple)):
+                    walk(nested, depth + 1)
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                walk(item, depth + 1)
+            return
+        if isinstance(value, str):
+            for ref in CRITICAL_REF_RE.findall(value):
+                add_critical_ref(ref)
+
+    for message in messages:
+        if _is_conversation_summary_message(message):
+            _copy_existing_reference_lines(_conversation_summary_body(message), critical_refs, artifacts, files)
+        content = message.content
+        if isinstance(content, str):
+            try:
+                walk(json.loads(content))
+            except Exception:
+                for ref in CRITICAL_REF_RE.findall(content):
+                    add_critical_ref(ref)
+        elif isinstance(content, list):
+            for item in content:
+                if item.type == "text" and item.text:
+                    for ref in CRITICAL_REF_RE.findall(item.text):
+                        add_critical_ref(ref)
+                elif item.type.startswith(("image", "file")) and item.file_name:
+                    for ref in CRITICAL_REF_RE.findall(item.file_name):
+                        add_critical_ref(ref)
+
+    blocks: list[str] = []
+    if critical_refs:
+        blocks.append(
+            "<critical_refs>\n"
+            + CRITICAL_REF_GUIDANCE
+            + "\n"
+            + "\n".join(critical_refs[:SUMMARY_REFERENCE_LIMIT])
+            + "\n</critical_refs>"
+        )
+    remaining = max(0, SUMMARY_REFERENCE_LIMIT - len(critical_refs))
+    if artifacts and remaining:
+        blocks.append("<artifacts>\n" + "\n".join(artifacts[:remaining]) + "\n</artifacts>")
+        remaining = max(0, remaining - len(artifacts))
+    if files and remaining:
+        blocks.append("<files>\n" + "\n".join(files[:remaining]) + "\n</files>")
+    return "\n".join(blocks)
+
+
+def _copy_existing_reference_lines(
+    summary: str,
+    critical_refs: list[str],
+    artifacts: list[str],
+    files: list[str],
+) -> None:
+    for tag, target in (("critical_refs", critical_refs), ("artifacts", artifacts), ("files", files)):
+        open_tag = f"<{tag}>"
+        close_tag = f"</{tag}>"
+        if open_tag not in summary or close_tag not in summary:
+            continue
+        block = summary.split(open_tag, 1)[1].split(close_tag, 1)[0]
+        for line in block.splitlines():
+            line = line.strip()
+            if line.startswith("- ") and line not in target:
+                target.append(line)
+
+
 def _close_summary_lines(lines: list[str]) -> str:
     return "\n".join(lines + [SUMMARY_CLOSE_TAG])
 
@@ -1327,6 +1616,165 @@ def _truncate_text_to_tokens(text: str, max_tokens: int) -> str:
         else:
             high = mid - 1
     return text[:low]
+
+
+def _fit_messages_to_budget(messages: list[Message], max_tokens: int, *, keep_tail: bool) -> list[Message]:
+    if max_tokens <= 0 or not messages:
+        return []
+
+    copied = _copy_messages(messages)
+    if estimate_messages_tokens(copied) <= max_tokens:
+        return copied
+
+    selected: list[Message] = []
+    used_tokens = 0
+
+    if keep_tail:
+        end = len(copied)
+        while end > 0:
+            start = _tail_unit_start(copied, end)
+            unit = copied[start:end]
+            unit_tokens = estimate_messages_tokens(unit)
+            remaining = max_tokens - used_tokens
+            if remaining <= 0:
+                break
+            if unit_tokens <= remaining:
+                selected[0:0] = _copy_messages(unit)
+                used_tokens += unit_tokens
+                end = start
+                continue
+            if not selected:
+                truncated = _fit_unit_to_budget(unit, remaining, keep_tail=True)
+                selected[0:0] = truncated
+            break
+        return selected
+
+    for message in copied:
+        remaining = max_tokens - used_tokens
+        if remaining <= 0:
+            break
+        message_tokens = estimate_message_tokens(message)
+        if message_tokens <= remaining:
+            selected.append(message.model_copy(deep=True))
+            used_tokens += message_tokens
+            continue
+        truncated = _truncate_message_to_tokens(message, remaining)
+        if truncated is not None:
+            selected.append(truncated)
+        break
+
+    return selected
+
+
+def _fit_unit_to_budget(unit: list[Message], max_tokens: int, *, keep_tail: bool) -> list[Message]:
+    if max_tokens <= 0 or not unit:
+        return []
+    if len(unit) == 1:
+        message = _truncate_message_to_tokens(unit[0], max_tokens)
+        return [message] if message is not None else []
+
+    if unit[0].role == "assistant" and unit[0].tool_calls:
+        assistant_tokens = estimate_message_tokens(unit[0])
+        if assistant_tokens > max_tokens:
+            return []
+        selected = [unit[0].model_copy(deep=True)]
+        used_tokens = assistant_tokens
+        for message in unit[1:]:
+            remaining = max_tokens - used_tokens
+            if remaining <= 0:
+                break
+            message_tokens = estimate_message_tokens(message)
+            if message_tokens <= remaining:
+                selected.append(message.model_copy(deep=True))
+                used_tokens += message_tokens
+                continue
+            truncated = _truncate_message_to_tokens(message, remaining)
+            if truncated is not None:
+                selected.append(truncated)
+            break
+        return selected
+
+    selected: list[Message] = []
+    used_tokens = 0
+    iterable = reversed(unit) if keep_tail else iter(unit)
+    for message in iterable:
+        remaining = max_tokens - used_tokens
+        if remaining <= 0:
+            break
+        message_tokens = estimate_message_tokens(message)
+        if message_tokens <= remaining:
+            if keep_tail:
+                selected.insert(0, message.model_copy(deep=True))
+            else:
+                selected.append(message.model_copy(deep=True))
+            used_tokens += message_tokens
+            continue
+        truncated = _truncate_message_to_tokens(message, remaining)
+        if truncated is not None:
+            if keep_tail:
+                selected.insert(0, truncated)
+            else:
+                selected.append(truncated)
+        break
+    return selected
+
+
+def _tail_unit_start(messages: list[Message], end: int) -> int:
+    index = end - 1
+    while index > 0 and messages[index].role == "tool":
+        index -= 1
+    if index >= 0 and messages[index].role == "assistant" and messages[index].tool_calls:
+        return index
+    return end - 1
+
+
+def _truncate_message_to_tokens(message: Message, max_tokens: int) -> Message | None:
+    if max_tokens <= 0:
+        return None
+    if estimate_message_tokens(message) <= max_tokens:
+        return message.model_copy(deep=True)
+
+    copied = message.model_copy(deep=True)
+    content = copied.content
+    copied.content = ""
+    fixed_tokens = estimate_message_tokens(copied)
+    available_tokens = max_tokens - fixed_tokens
+    if available_tokens <= 0:
+        return None
+
+    if isinstance(content, str):
+        copied.content = _truncate_text_to_tokens(content, available_tokens)
+        return copied if _message_has_model_content(copied) or copied.role == "tool" else None
+
+    if isinstance(content, list):
+        fitted_content = []
+        used_tokens = 0
+        for item in content:
+            remaining = available_tokens - used_tokens
+            if remaining <= 0:
+                break
+            item_type = getattr(item, "type", "")
+            if item_type == "text" and getattr(item, "text", None):
+                item_tokens = estimate_text_tokens(item.text)
+                fitted_item = item.model_copy(deep=True)
+                if item_tokens > remaining:
+                    fitted_item.text = _truncate_text_to_tokens(item.text, remaining)
+                    if not fitted_item.text:
+                        break
+                    fitted_content.append(fitted_item)
+                    break
+                fitted_content.append(fitted_item)
+                used_tokens += item_tokens
+            elif isinstance(item_type, str) and item_type.startswith(("image", "file")):
+                item_tokens = _attachment_tokens(item)
+                if item_tokens > remaining:
+                    continue
+                fitted_content.append(item.model_copy(deep=True))
+                used_tokens += item_tokens
+        copied.content = fitted_content
+        return copied if _message_has_model_content(copied) or copied.role == "tool" else None
+
+    return None
 
 
 def _truncate_text(text: str, max_chars: int) -> str:
@@ -1368,6 +1816,37 @@ def _runtime_context_window_tokens(metadata: dict[str, typing.Any]) -> int | Non
     return None
 
 
+def _runtime_max_output_tokens(metadata: dict[str, typing.Any]) -> int | None:
+    for key in (
+        "model_max_output_tokens",
+        "max_output_tokens",
+        "model_output_tokens",
+        "maxOutputTokens",
+    ):
+        value = metadata.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int) and value > 0:
+            return value
+
+    model = metadata.get("model")
+    if isinstance(model, dict):
+        for key in ("max_output_tokens", "maxOutputTokens", "output_tokens"):
+            value = model.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int) and value > 0:
+                return value
+
+    return None
+
+
+def _clamp_reserve_tokens(window_tokens: int, reserve_tokens: int) -> int:
+    if window_tokens <= 0 or reserve_tokens <= 0:
+        return 0
+    return min(reserve_tokens, max(1, window_tokens // 4))
+
+
 def _config_token_value(
     config: dict[str, typing.Any],
     key: str,
@@ -1407,6 +1886,17 @@ def _is_cjk_token_char(char: str) -> bool:
     )
 
 
+def _is_symbol_token_char(char: str) -> bool:
+    codepoint = ord(char)
+    if (
+        0x1F000 <= codepoint <= 0x1FAFF
+        or 0x2600 <= codepoint <= 0x27BF
+        or 0xFE00 <= codepoint <= 0xFE0F
+    ):
+        return True
+    return unicodedata.category(char) == "So"
+
+
 def _config_int(
     config: dict[str, typing.Any],
     key: str,
@@ -1421,4 +1911,27 @@ def _config_int(
         return default
     if value < minimum:
         return default
+    return value
+
+
+def usage_total_tokens(usage: typing.Any) -> int | None:
+    usage_map = _as_mapping(usage)
+    if usage_map is None:
+        return None
+
+    total_tokens = _positive_usage_int(usage_map.get("total_tokens"))
+    if total_tokens is not None:
+        return total_tokens
+
+    prompt_tokens = _positive_usage_int(usage_map.get("prompt_tokens")) or 0
+    completion_tokens = _positive_usage_int(usage_map.get("completion_tokens")) or 0
+    if prompt_tokens or completion_tokens:
+        return prompt_tokens + completion_tokens
+
+    return None
+
+
+def _positive_usage_int(value: typing.Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
     return value

@@ -13,10 +13,15 @@ import uuid
 from langbot_plugin.api.entities.builtin.provider.message import ContentElement, Message, MessageChunk
 from langbot_plugin.api.entities.builtin.resource.tool import LLMTool
 from langbot_plugin.api.proxies.agent_run_api import AgentRunAPIProxy, PermissionDeniedError
-from langbot_plugin.entities.io.actions.enums import PluginToRuntimeAction
 
 from pkg.config import DEFAULT_MAX_TOOL_RESULT_ARTIFACT_BYTES, DEFAULT_MAX_TOOL_RESULT_CHARS
-from pkg.context_pipeline import ContextBudget, ContextCompactor, ContextSummarizer
+from pkg.context_pipeline import (
+    ContextBudget,
+    ContextCompactor,
+    ContextSummarizer,
+    ContextUsageAnchor,
+    usage_total_tokens,
+)
 from pkg.messages import build_user_message
 from pkg.model_calling import (
     INTERNAL_ARTIFACT_READ_TOOL_NAME,
@@ -26,7 +31,8 @@ from pkg.model_calling import (
     build_tool_call_message,
     build_tool_reference_message,
     extract_tool_result_references,
-    invoke_with_fallback,
+    invoke_with_fallback_result,
+    normalize_llm_call_result,
     serialize_tool_result_content,
 )
 
@@ -116,6 +122,7 @@ class LangBotModelAdapter:
                 tool_calls=tool_calls,
                 committed_model_id=caller.get_committed_model_id(),
                 visible_content=content,
+                usage=caller.get_usage(),
             )
         )
 
@@ -126,19 +133,21 @@ class LangBotModelAdapter:
         messages: list[Message],
         tools: list[LLMTool],
     ) -> ModelTurnResult:
-        response, committed_model_id = await invoke_with_fallback(
+        call_result, committed_model_id = await invoke_with_fallback_result(
             api=self.api,
             model_ids=model_ids,
             messages=messages,
             tools=tools,
             remove_think=self.remove_think,
         )
+        response = call_result.message
         tool_calls = [ToolCallRequest.from_raw(tool_call) for tool_call in response.tool_calls or []]
         return ModelTurnResult(
             message=_context_message_for_tool_follow_up(response, tool_calls),
             tool_calls=tool_calls,
             committed_model_id=committed_model_id,
             visible_content=response.content if isinstance(response.content, str) else "",
+            usage=call_result.usage,
         )
 
     async def invoke_committed_turn(
@@ -149,7 +158,10 @@ class LangBotModelAdapter:
         tools: list[LLMTool],
     ) -> ModelTurnResult:
         try:
-            response = await self.api.invoke_llm(
+            invoke = getattr(self.api, "invoke_llm_with_usage", None)
+            if not callable(invoke):
+                invoke = self.api.invoke_llm
+            raw_response = await invoke(
                 llm_model_uuid=committed_model_id,
                 messages=messages,
                 funcs=tools,
@@ -158,12 +170,16 @@ class LangBotModelAdapter:
         except Exception as e:
             raise ModelCallError(f"LLM call in tool loop failed: {e}", retryable=True) from e
 
+        call_result = normalize_llm_call_result(raw_response)
+        response = call_result.message
+        usage = call_result.usage
         tool_calls = [ToolCallRequest.from_raw(tool_call) for tool_call in response.tool_calls or []]
         return ModelTurnResult(
             message=_context_message_for_tool_follow_up(response, tool_calls),
             tool_calls=tool_calls,
             committed_model_id=committed_model_id,
             visible_content=response.content if isinstance(response.content, str) else "",
+            usage=usage,
         )
 
 
@@ -400,18 +416,30 @@ class LangBotContextHooks(AgentLoopHooks):
         self.budget = budget
         self.summarizer = summarizer
         self.steering_puller = steering_puller
+        self._usage_anchor: ContextUsageAnchor | None = None
 
     async def prepare_model_turn(self, messages: list[Message]) -> list[Message]:
-        assembly = await ContextCompactor(self.budget, summarizer=self.summarizer).compact_messages_async(messages)
+        usage_anchor = self._usage_anchor
+        self._usage_anchor = None
+        assembly = await ContextCompactor(
+            self.budget,
+            summarizer=self.summarizer,
+            usage_anchor=usage_anchor,
+        ).compact_messages_async(messages)
         return assembly.messages
 
     async def should_stop_after_turn(self, result: ModelTurnResult, messages: list[Message]) -> bool:
+        return False
+
+    async def after_model_turn(self, result: ModelTurnResult, messages: list[Message]) -> list[Message]:
+        next_messages = [message.model_copy(deep=True) for message in messages]
         if result.tool_calls:
-            return False
+            return next_messages
         steering_messages = await self._pull_steering_messages(mode="all")
         if steering_messages:
-            messages.extend(steering_messages)
-        return False
+            next_messages.extend(steering_messages)
+            self._usage_anchor = self._usage_anchor_from_result(result, len(messages))
+        return next_messages
 
     async def prepare_next_turn(
         self,
@@ -420,8 +448,14 @@ class LangBotContextHooks(AgentLoopHooks):
         tool_results: list[Message],
     ) -> list[Message]:
         next_messages = [message.model_copy(deep=True) for message in messages]
+        usage_anchor = self._usage_anchor_from_result(result, max(0, len(messages) - len(tool_results)))
         next_messages.extend(await self._pull_steering_messages(mode="all"))
-        assembly = await ContextCompactor(self.budget, summarizer=self.summarizer).compact_messages_async(next_messages)
+        assembly = await ContextCompactor(
+            self.budget,
+            summarizer=self.summarizer,
+            usage_anchor=usage_anchor,
+        ).compact_messages_async(next_messages)
+        self._usage_anchor = None
         return assembly.messages
 
     async def recover_context_overflow(self, messages: list[Message], error: Exception) -> list[Message] | None:
@@ -452,6 +486,16 @@ class LangBotContextHooks(AgentLoopHooks):
             return []
         return await self.steering_puller.pull_messages(mode=mode)
 
+    def _usage_anchor_from_result(self, result: ModelTurnResult, message_count: int) -> ContextUsageAnchor | None:
+        total_tokens = usage_total_tokens(result.usage)
+        if total_tokens is None:
+            return None
+        return ContextUsageAnchor(
+            message_count=message_count,
+            total_tokens=total_tokens,
+            model_id=result.committed_model_id,
+        )
+
 
 class LangBotSteeringPuller:
     """Pull and adapt Host-claimed steering inputs into user messages."""
@@ -461,17 +505,13 @@ class LangBotSteeringPuller:
 
     async def pull_messages(self, *, mode: str = "all") -> list[Message]:
         steering_pull = getattr(self.api, "steering_pull", None)
+        if not callable(steering_pull):
+            return []
+
         try:
-            if callable(steering_pull):
-                response = await steering_pull(mode=mode)
-            else:
-                response = await self._pull_with_host_authorization(mode=mode)
-                if response is None:
-                    return []
+            response = await steering_pull(mode=mode)
         except PermissionDeniedError:
-            response = await self._pull_with_host_authorization(mode=mode)
-            if response is None:
-                return []
+            return []
         except Exception:
             logger.debug("Failed to pull steering inputs", exc_info=True)
             return []
@@ -516,26 +556,6 @@ class LangBotSteeringPuller:
             except Exception:
                 logger.debug("Ignoring invalid steering content element", exc_info=True)
         return contents
-
-    async def _pull_with_host_authorization(self, *, mode: str) -> typing.Any | None:
-        """Fallback when local SDK context gates miss a Host-authorized run API.
-
-        Host remains the authority: the runtime handler injects caller identity
-        and LangBot validates the run session before returning any input.
-        """
-        try:
-            return await self.api._api.plugin_runtime_handler.call_action(
-                PluginToRuntimeAction.STEERING_PULL,
-                {
-                    "run_id": self.api.run_id,
-                    "mode": mode,
-                    "limit": None,
-                },
-                timeout=10.0,
-            )
-        except Exception:
-            logger.debug("Failed to pull steering inputs via host authorization", exc_info=True)
-            return None
 
 
 def _non_negative_int(value: typing.Any, *, default: int) -> int:

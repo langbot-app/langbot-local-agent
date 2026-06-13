@@ -140,6 +140,7 @@ class ModelTurnResult:
     tool_calls: list[ToolCallRequest]
     committed_model_id: str | None
     visible_content: str = ""
+    usage: dict[str, typing.Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -174,6 +175,9 @@ class AgentLoopHooks:
 
     async def should_stop_after_turn(self, result: ModelTurnResult, messages: list[Message]) -> bool:
         return False
+
+    async def after_model_turn(self, result: ModelTurnResult, messages: list[Message]) -> list[Message]:
+        return [message.model_copy(deep=True) for message in messages]
 
     async def prepare_next_turn(
         self,

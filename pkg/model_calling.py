@@ -7,6 +7,7 @@ import json
 import logging
 import typing
 import uuid
+from dataclasses import dataclass
 
 from langbot_plugin.api.entities.builtin.provider.message import Message, MessageChunk
 from langbot_plugin.api.entities.builtin.resource.tool import LLMTool
@@ -32,6 +33,12 @@ CONTEXT_OVERFLOW_PATTERNS = (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class LLMCallResult:
+    message: Message
+    usage: dict[str, typing.Any] | None = None
 
 
 class ModelCallError(Exception):
@@ -186,6 +193,43 @@ async def invoke_with_fallback(
     )
 
 
+async def invoke_with_fallback_result(
+    api: AgentRunAPIProxy,
+    model_ids: list[str],
+    messages: list[Message],
+    tools: list[LLMTool] | None = None,
+    remove_think: bool = False,
+) -> tuple[LLMCallResult, str]:
+    if not model_ids:
+        raise ModelCallError("No model configured", retryable=False)
+
+    last_error: Exception | None = None
+    for index, model_id in enumerate(model_ids):
+        try:
+            invoke = getattr(api, "invoke_llm_with_usage", None)
+            if not callable(invoke):
+                invoke = api.invoke_llm
+            response = await invoke(
+                llm_model_uuid=model_id,
+                messages=messages,
+                funcs=tools or [],
+                remove_think=remove_think,
+            )
+            return normalize_llm_call_result(response), model_id
+        except Exception as e:
+            last_error = e
+            if index < len(model_ids) - 1:
+                logger.warning("LLM model failed; falling back to next configured model: %s", model_id, exc_info=True)
+            else:
+                logger.warning("LLM model failed and no fallback remains: %s", model_id, exc_info=True)
+            continue
+
+    raise ModelCallError(
+        f"All models failed. Last error: {last_error}",
+        retryable=True,
+    )
+
+
 class StreamingModelCaller:
     """Handles streaming LLM calls with fallback and accumulation.
 
@@ -214,10 +258,14 @@ class StreamingModelCaller:
         self._tool_call_position_keys: dict[str, str] = {}
         self._msg_idx = 0
         self._msg_sequence = 0
+        self._usage: dict[str, typing.Any] | None = None
 
-    async def _next_non_empty_chunk(self, stream: typing.AsyncIterator[MessageChunk | None]) -> MessageChunk:
+    async def _next_non_empty_chunk(self, stream: typing.AsyncIterator[typing.Any]) -> MessageChunk:
         while True:
-            chunk = await stream.__anext__()
+            raw_chunk = await stream.__anext__()
+            chunk, usage = _normalize_stream_chunk(raw_chunk)
+            if usage is not None:
+                self._usage = usage
             if chunk is not None:
                 return chunk
 
@@ -244,7 +292,10 @@ class StreamingModelCaller:
         for model_id in self.model_ids:
             try:
                 # Try to get first chunk to verify stream works
-                stream = self.api.invoke_llm_stream(
+                stream_invoke = getattr(self.api, "invoke_llm_stream_events", None)
+                if not callable(stream_invoke):
+                    stream_invoke = self.api.invoke_llm_stream
+                stream = stream_invoke(
                     llm_model_uuid=model_id,
                     messages=self.messages,
                     funcs=self.tools,
@@ -291,7 +342,10 @@ class StreamingModelCaller:
         # Continue with rest of stream (no fallback allowed after this point)
         # Any failure here is terminal for the run
         try:
-            async for raw_chunk in stream:
+            async for raw_stream_item in stream:
+                raw_chunk, usage = _normalize_stream_chunk(raw_stream_item)
+                if usage is not None:
+                    self._usage = usage
                 if raw_chunk is None:
                     continue
                 chunk, is_final = self._process_chunk(raw_chunk)
@@ -385,6 +439,10 @@ class StreamingModelCaller:
     def get_committed_model_id(self) -> str | None:
         """Get the model ID that was committed for this stream."""
         return self._committed_model_id
+
+    def get_usage(self) -> dict[str, typing.Any] | None:
+        """Get provider usage reported by the committed stream, if available."""
+        return dict(self._usage) if self._usage is not None else None
 
     def _tool_call_accumulation_key(self, tool_call: typing.Any, position: int) -> str:
         tc_id = _normalized_tool_call_id(getattr(tool_call, "id", None))
@@ -606,6 +664,71 @@ def _tool_call_position_key(tool_call: typing.Any, position: int) -> str:
 
 def _new_tool_call_id() -> str:
     return f"call_{uuid.uuid4().hex}"
+
+
+def normalize_llm_call_result(response: typing.Any) -> LLMCallResult:
+    if isinstance(response, Message):
+        return LLMCallResult(message=response, usage=_normalize_usage(_model_or_mapping_get(response, "usage")))
+
+    message = _model_or_mapping_get(response, "message")
+    if message is None:
+        data = _model_or_mapping_get(response, "data")
+        if isinstance(data, dict):
+            message = data.get("message")
+    if isinstance(message, Message):
+        normalized_message = message
+    elif isinstance(message, dict):
+        normalized_message = Message.model_validate(message)
+    else:
+        normalized_message = Message.model_validate(response)
+
+    usage = _normalize_usage(_model_or_mapping_get(response, "usage"))
+    if usage is None and isinstance(response, dict):
+        usage = _normalize_usage(response.get("token_usage") or response.get("model_usage"))
+    return LLMCallResult(message=normalized_message, usage=usage)
+
+
+def _normalize_stream_chunk(raw_chunk: typing.Any) -> tuple[MessageChunk | None, dict[str, typing.Any] | None]:
+    if raw_chunk is None:
+        return None, None
+    if isinstance(raw_chunk, MessageChunk):
+        return raw_chunk, _normalize_usage(_model_or_mapping_get(raw_chunk, "usage"))
+
+    usage = _normalize_usage(_model_or_mapping_get(raw_chunk, "usage"))
+    chunk = _model_or_mapping_get(raw_chunk, "chunk")
+    if chunk is None:
+        chunk = _model_or_mapping_get(raw_chunk, "message")
+    if isinstance(chunk, MessageChunk):
+        return chunk, usage
+    if isinstance(chunk, dict):
+        return MessageChunk.model_validate(chunk), usage
+    if isinstance(raw_chunk, dict):
+        chunk_payload = raw_chunk.get("chunk") or raw_chunk.get("message")
+        if isinstance(chunk_payload, MessageChunk):
+            return chunk_payload, usage
+        if isinstance(chunk_payload, dict):
+            return MessageChunk.model_validate(chunk_payload), usage
+        if usage is not None:
+            return None, usage
+    return MessageChunk.model_validate(raw_chunk), usage
+
+
+def _normalize_usage(usage: typing.Any) -> dict[str, typing.Any] | None:
+    if usage is None:
+        return None
+    if isinstance(usage, dict):
+        return dict(usage)
+    if hasattr(usage, "model_dump"):
+        dumped = usage.model_dump()
+        if isinstance(dumped, dict):
+            return dumped
+    return None
+
+
+def _model_or_mapping_get(value: typing.Any, key: str, default: typing.Any = None) -> typing.Any:
+    if isinstance(value, dict):
+        return value.get(key, default)
+    return getattr(value, key, default)
 
 
 def _copy_reference_fields(

@@ -108,7 +108,7 @@ class DefaultAgentRunner(AgentRunner):
             result = self._loop_event_to_result(run_id, event, streaming=assembly.streaming)
             if result is not None:
                 yield result
-                if result.type.value == "run.failed":
+                if getattr(result.type, "value", result.type) == "run.failed":
                     return
 
             if (

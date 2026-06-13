@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import typing
 
-from langbot_plugin.api.entities.builtin.provider.message import Message
+from langbot_plugin.api.entities.builtin.provider.message import Message, MessageChunk
 from langbot_plugin.api.entities.builtin.resource.tool import LLMTool
 
 from pkg.model_calling import ModelCallError
@@ -17,9 +17,13 @@ from .types import (
     ModelTurnEventType,
     ModelTurnResult,
     PreparedToolCall,
+    ToolCallRequest,
     ToolExecutionMode,
     ToolExecutionOutcome,
 )
+
+TOOL_LOOP_LIMIT_MESSAGE = "Tool call iteration limit reached. I stopped before calling more tools."
+TOOL_LOOP_LIMIT_TOOL_RESULT = "Tool call was not executed because the runner tool iteration limit was reached."
 
 
 class AgentLoop:
@@ -155,6 +159,41 @@ class AgentLoop:
         outcomes = [outcome for outcome in outcomes_by_source_order if outcome is not None]
         self._last_tool_batch_terminates = bool(outcomes) and all(outcome.terminate for outcome in outcomes)
 
+    async def _complete_tool_loop_limit(
+        self,
+        pending_tool_calls: typing.Iterable[typing.Any],
+        last_model_turn: ModelTurnResult | None,
+        *,
+        streaming: bool,
+    ) -> typing.AsyncGenerator[AgentLoopEvent, None]:
+        tool_results: list[Message] = []
+        for raw_call in pending_tool_calls:
+            request = ToolCallRequest.from_raw(raw_call)
+            tool_result = Message(
+                role="tool",
+                tool_call_id=request.id,
+                content=TOOL_LOOP_LIMIT_TOOL_RESULT,
+            )
+            self.messages.append(tool_result)
+            tool_results.append(tool_result)
+            yield AgentLoopEvent.message_start(tool_result)
+            yield AgentLoopEvent.message_end(tool_result)
+
+        if last_model_turn is not None:
+            yield AgentLoopEvent.turn_end(last_model_turn.message, tool_results)
+
+        final_message = Message(role="assistant", content=TOOL_LOOP_LIMIT_MESSAGE)
+        self.messages.append(final_message)
+        yield AgentLoopEvent.turn_start()
+        yield AgentLoopEvent.message_start(final_message)
+        if streaming:
+            yield AgentLoopEvent.message_update(
+                MessageChunk(role="assistant", content=TOOL_LOOP_LIMIT_MESSAGE, is_final=True)
+            )
+        yield AgentLoopEvent.message_end(final_message)
+        yield AgentLoopEvent.turn_end(final_message, [])
+        yield AgentLoopEvent.agent_end(self.messages)
+
     async def _run_streaming(self) -> typing.AsyncGenerator[AgentLoopEvent, None]:
         yield AgentLoopEvent.agent_start()
 
@@ -167,10 +206,12 @@ class AgentLoop:
         while True:
             if pending_tool_calls is not None:
                 if tool_iterations >= self.max_tool_iterations:
-                    yield AgentLoopEvent.run_failed(
-                        f"Tool call iteration limit reached ({self.max_tool_iterations})",
-                        code="runner.tool_loop_limit",
-                    )
+                    async for event in self._complete_tool_loop_limit(
+                        pending_tool_calls,
+                        last_model_turn,
+                        streaming=True,
+                    ):
+                        yield event
                     return
 
                 tool_iterations += 1
@@ -229,16 +270,18 @@ class AgentLoop:
             last_model_turn = model_turn
             yield AgentLoopEvent.message_end(model_turn.message)
 
-            message_count_before_hook = len(self.messages)
             if await self.hooks.should_stop_after_turn(model_turn, self.messages):
                 yield AgentLoopEvent.turn_end(model_turn.message, [])
                 yield AgentLoopEvent.agent_end(self.messages)
                 return
+            messages_after_turn = await self.hooks.after_model_turn(model_turn, self.messages)
+            has_follow_up_messages = len(messages_after_turn) > len(self.messages)
+            self.messages = [message.model_copy(deep=True) for message in messages_after_turn]
 
             pending_tool_calls = model_turn.tool_calls
             if not pending_tool_calls:
                 yield AgentLoopEvent.turn_end(model_turn.message, [])
-                if len(self.messages) > message_count_before_hook:
+                if has_follow_up_messages:
                     pending_tool_calls = None
                     continue
                 yield AgentLoopEvent.agent_end(self.messages)
@@ -257,10 +300,12 @@ class AgentLoop:
         while True:
             if pending_tool_calls is not None:
                 if tool_iterations >= self.max_tool_iterations:
-                    yield AgentLoopEvent.run_failed(
-                        f"Tool call iteration limit reached ({self.max_tool_iterations})",
-                        code="runner.tool_loop_limit",
-                    )
+                    async for event in self._complete_tool_loop_limit(
+                        pending_tool_calls,
+                        last_model_turn,
+                        streaming=False,
+                    ):
+                        yield event
                     return
 
                 tool_iterations += 1
@@ -309,16 +354,18 @@ class AgentLoop:
             last_model_turn = model_turn
             yield AgentLoopEvent.message_end(model_turn.message)
 
-            message_count_before_hook = len(self.messages)
             if await self.hooks.should_stop_after_turn(model_turn, self.messages):
                 yield AgentLoopEvent.turn_end(model_turn.message, [])
                 yield AgentLoopEvent.agent_end(self.messages)
                 return
+            messages_after_turn = await self.hooks.after_model_turn(model_turn, self.messages)
+            has_follow_up_messages = len(messages_after_turn) > len(self.messages)
+            self.messages = [message.model_copy(deep=True) for message in messages_after_turn]
 
             pending_tool_calls = model_turn.tool_calls
             if not pending_tool_calls:
                 yield AgentLoopEvent.turn_end(model_turn.message, [])
-                if len(self.messages) > message_count_before_hook:
+                if has_follow_up_messages:
                     pending_tool_calls = None
                     continue
                 yield AgentLoopEvent.agent_end(self.messages)

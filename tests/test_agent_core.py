@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -12,7 +11,6 @@ from langbot_plugin.api.entities.builtin.agent_runner.artifact import ArtifactRe
 from langbot_plugin.api.entities.builtin.agent_runner.steering import SteeringPullResult
 from langbot_plugin.api.entities.builtin.provider.message import FunctionCall, Message, MessageChunk, ToolCall
 from langbot_plugin.api.proxies.agent_run_api import PermissionDeniedError
-from langbot_plugin.entities.io.actions.enums import PluginToRuntimeAction
 
 from pkg.agent_core import (
     AgentLoop,
@@ -71,86 +69,28 @@ async def test_steering_puller_accepts_sdk_result_models():
 
 
 @pytest.mark.asyncio
-async def test_steering_puller_falls_back_to_host_authorization():
-    """Host authorization is authoritative when local SDK context gates disagree."""
-
-    runtime_handler = SimpleNamespace()
-    runtime_handler.call_action = AsyncMock(
-        return_value={
-            "items": [
-                {
-                    "claimed_run_id": "run-1",
-                    "runner_id": "plugin:langbot/local-agent/default",
-                    "event": {
-                        "event_id": "evt-follow-up",
-                        "event_type": "message.received",
-                        "source": "host_adapter",
-                    },
-                    "input": {
-                        "text": "fallback follow-up",
-                        "contents": [],
-                        "attachments": [],
-                    },
-                }
-            ]
-        }
-    )
-
+async def test_steering_puller_treats_permission_denied_as_authoritative():
+    """The public proxy authorization gate is authoritative for steering."""
     class SteeringAPI:
         run_id = "run-1"
-        _api = SimpleNamespace(plugin_runtime_handler=runtime_handler)
 
         async def steering_pull(self, mode="all"):
             raise PermissionDeniedError("steering_pull is not available locally")
 
     messages = await LangBotSteeringPuller(SteeringAPI()).pull_messages(mode="all")
 
-    assert len(messages) == 1
-    assert messages[0].content == "fallback follow-up"
-    runtime_handler.call_action.assert_awaited_once()
-    call_args = runtime_handler.call_action.call_args
-    assert call_args[0][0] == PluginToRuntimeAction.STEERING_PULL
-    assert call_args[0][1]["run_id"] == "run-1"
+    assert messages == []
 
 
 @pytest.mark.asyncio
-async def test_steering_puller_uses_host_authorization_when_sdk_method_missing():
-    """Older SDK proxies may not expose steering_pull even when Host authorizes it."""
-
-    runtime_handler = SimpleNamespace()
-    runtime_handler.call_action = AsyncMock(
-        return_value={
-            "items": [
-                {
-                    "claimed_run_id": "run-1",
-                    "runner_id": "plugin:langbot/local-agent/default",
-                    "event": {
-                        "event_id": "evt-follow-up",
-                        "event_type": "message.received",
-                        "source": "host_adapter",
-                    },
-                    "input": {
-                        "text": "host-authorized follow-up",
-                        "contents": [],
-                        "attachments": [],
-                    },
-                }
-            ]
-        }
-    )
-
+async def test_steering_puller_noops_when_sdk_method_missing():
+    """Older SDK proxies without steering_pull degrade to no-op."""
     class SteeringAPI:
         run_id = "run-1"
-        _api = SimpleNamespace(plugin_runtime_handler=runtime_handler)
 
     messages = await LangBotSteeringPuller(SteeringAPI()).pull_messages(mode="all")
 
-    assert len(messages) == 1
-    assert messages[0].content == "host-authorized follow-up"
-    runtime_handler.call_action.assert_awaited_once()
-    call_args = runtime_handler.call_action.call_args
-    assert call_args[0][0] == PluginToRuntimeAction.STEERING_PULL
-    assert call_args[0][1]["run_id"] == "run-1"
+    assert messages == []
 
 
 def test_tool_call_request_generates_uuid_ids_for_raw_calls_without_id():

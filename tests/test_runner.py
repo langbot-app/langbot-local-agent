@@ -71,21 +71,28 @@ from pkg.context_pipeline import (
     ContextAssembler,
     ContextBudget,
     ContextCompactor,
+    ContextUsageAnchor,
     LLMContextSummarizer,
     estimate_message_tokens,
+    estimate_messages_tokens_with_anchor,
+    estimate_text_tokens,
     sanitize_provider_messages,
+    usage_total_tokens,
 )
-from pkg.messages import build_prompt_messages, build_user_message, format_rag_results, get_effective_prompt_config
+from pkg.messages import build_prompt_messages, build_user_message, get_effective_prompt_config
 from pkg.model_calling import (
     INTERNAL_ARTIFACT_READ_TOOL_NAME,
     TOOL_RESULT_ARTIFACT_MARKER,
     TOOL_RESULT_REFERENCE_MARKER,
     TOOL_RESULT_TRUNCATION_MARKER,
+    LLMCallResult,
     StreamingModelCaller,
     build_llm_tools,
     build_tool_call_message,
     invoke_with_fallback,
+    invoke_with_fallback_result,
 )
+from pkg.rag import retrieve_rag_chunks
 
 # ==================== Fixtures ====================
 
@@ -118,6 +125,7 @@ class FakeAgentRunAPIProxy:
         self.invoke_rerank = AsyncMock()
         self.get_prompt = AsyncMock(return_value=[])
         self.artifact_read = AsyncMock()
+        self.steering_pull = AsyncMock(return_value={"items": []})
         self.state_get = AsyncMock(return_value={"value": None})
         self.state_set = AsyncMock(return_value={"ok": True})
         self.state_delete = AsyncMock(return_value={"ok": True})
@@ -352,19 +360,6 @@ class TestRunnerBehaviorConfig:
 class TestMessageHelpers:
     """Tests for production message helper functions."""
 
-    def test_rag_context(self):
-        """RAG context is prepended to user message."""
-        message = build_user_message(
-            user_text="What is X?",
-            rag_context="[1] X is a variable.",
-        )
-
-        assert message is not None
-        assert "<context>" in message.content
-        assert "[1] X is a variable." in message.content
-        assert "<user_message>" in message.content
-        assert "What is X?" in message.content
-
     def test_static_prompt_config_is_used(self):
         """Static binding prompt config is used for system prompt."""
         messages = build_prompt_messages([{"role": "system", "content": "Static prompt"}])
@@ -404,24 +399,6 @@ class TestMessageHelpers:
         assert message is not None
         assert isinstance(message.content, list)
         assert message.content[0].text == "Look at this"
-        assert message.content[1].type == "image_base64"
-
-    def test_rag_context_replaces_text_and_preserves_multimodal_parts(self):
-        """RAG modifies only the text content and keeps attachments."""
-        contents = [
-            ContentElement.from_text("What is in this image?"),
-            ContentElement.from_image_base64("base64-image"),
-        ]
-
-        message = build_user_message(
-            user_text="What is in this image?",
-            input_contents=contents,
-            rag_context="[1] Image metadata",
-        )
-
-        assert message is not None
-        assert isinstance(message.content, list)
-        assert "<context>" in message.content[0].text
         assert message.content[1].type == "image_base64"
 
 
@@ -500,8 +477,8 @@ class TestContextCompaction:
         assert budget.keep_recent_tokens == 80
         assert budget.summary_tokens == 120
 
-    def test_budget_from_context_prefers_host_window_metadata(self):
-        """Host model metadata can provide the effective context window."""
+    def test_budget_from_context_uses_host_window_capped_by_config(self):
+        """Host model metadata provides the window, capped by runner config."""
         ctx = make_context(
             config={"context-window-tokens": 300},
             runtime_metadata={"context_window_tokens": 512},
@@ -509,7 +486,38 @@ class TestContextCompaction:
 
         budget = ContextBudget.from_context(ctx)
 
-        assert budget.window_tokens == 512
+        assert budget.window_tokens == 300
+
+    def test_budget_from_context_clamps_reserve_for_small_windows(self):
+        """Large-model reserve defaults should not collapse small model budgets."""
+        ctx = make_context(
+            config={"context-window-tokens": 200000, "context-reserve-tokens": 16384},
+            runtime_metadata={"model_context_window_tokens": 8192},
+        )
+
+        budget = ContextBudget.from_context(ctx)
+
+        assert budget.window_tokens == 8192
+        assert budget.reserve_tokens == 2048
+        assert budget.input_tokens == 6144
+
+    def test_budget_caps_summary_by_host_max_output_when_available(self):
+        """Summary budget stays within model output capacity when Host exposes it."""
+        ctx = make_context(
+            config={
+                "context-window-tokens": 200000,
+                "context-reserve-tokens": 10000,
+                "context-summary-tokens": 8000,
+            },
+            runtime_metadata={
+                "model_context_window_tokens": 32000,
+                "model_max_output_tokens": 4096,
+            },
+        )
+
+        budget = ContextBudget.from_context(ctx)
+
+        assert budget.summary_tokens == 4096
 
     def test_budget_ignores_unpublished_character_fields(self):
         """Unpublished character-based config keys are not compatibility aliases."""
@@ -566,6 +574,29 @@ class TestContextCompaction:
 
         assert estimate_message_tokens(cjk) >= 80
         assert estimate_message_tokens(cjk) > estimate_message_tokens(latin) * 3
+
+    def test_symbol_and_attachment_tokens_are_conservative(self):
+        """Emoji and multimodal payloads should not follow Latin chars/4."""
+        assert estimate_text_tokens("🙂" * 16) >= 16
+
+        image_message = Message(
+            role="user",
+            content=[ContentElement.from_image_base64("a" * 128)],
+        )
+
+        assert estimate_message_tokens(image_message) >= 1600
+
+    def test_usage_anchor_mixes_real_prefix_usage_with_tail_estimate(self):
+        """Provider usage is authoritative for the rendered prefix only."""
+        messages = [
+            Message(role="user", content="old"),
+            Message(role="assistant", content="answer"),
+            Message(role="tool", tool_call_id="call-1", content="tail"),
+        ]
+        anchor = ContextUsageAnchor(message_count=2, total_tokens=120, model_id="model-1")
+
+        assert estimate_messages_tokens_with_anchor(messages, anchor) == 120 + estimate_message_tokens(messages[2])
+        assert usage_total_tokens({"prompt_tokens": 10, "completion_tokens": 5}) == 15
 
     def test_flat_compaction_recompacts_existing_summary_instead_of_piling_up(self):
         """Generated summaries are runtime history, not immutable prompt messages."""
@@ -698,6 +729,102 @@ class TestContextCompaction:
         assert assembly.messages[-1].role == "user"
         assert assembly.messages[-1].content == "current user sentinel"
 
+    def test_usage_anchor_can_trigger_compaction_when_local_estimate_is_low(self):
+        """Real provider usage can trip compaction before local estimates would."""
+        messages = [
+            Message(role="system", content="Static prompt"),
+            Message(role="user", content="old user sentinel"),
+            Message(role="assistant", content="old assistant sentinel"),
+            Message(role="user", content="current request"),
+        ]
+        local_tokens = estimate_messages_tokens_with_anchor(messages, None)
+        budget = ContextBudget(
+            window_tokens=50,
+            reserve_tokens=10,
+            keep_recent_tokens=0,
+            summary_tokens=40,
+        )
+
+        assembly = ContextCompactor(
+            budget,
+            usage_anchor=ContextUsageAnchor(message_count=3, total_tokens=160, model_id="model-1"),
+        ).compact_messages(messages)
+
+        assert local_tokens <= budget.input_tokens
+        assert assembly.tokens_before > budget.input_tokens
+        assert assembly.compacted is True
+        assert assembly.messages[-1].content == "current request"
+
+    def test_compaction_summary_preserves_machine_readable_refs(self):
+        """Omitted artifact and file refs remain available after compaction."""
+        tool_call = ToolCall(
+            id="call-refs",
+            type="function",
+            function=FunctionCall(name="allowed_tool", arguments="{}"),
+        )
+        history = [
+            Message(role="assistant", content="", tool_calls=[tool_call]),
+            Message(
+                role="tool",
+                tool_call_id="call-refs",
+                content=json.dumps(
+                    {
+                        "artifact_refs": [
+                            {
+                                "artifact_id": "artifact-1",
+                                "name": "result.txt",
+                                "mime_type": "text/plain",
+                            }
+                        ],
+                        "file_refs": [
+                            {
+                                "file_key": "sandbox-file-1",
+                                "file_name": "notes.md",
+                            }
+                        ],
+                    }
+                ),
+            ),
+        ]
+        budget = ContextBudget(
+            window_tokens=60,
+            reserve_tokens=10,
+            keep_recent_tokens=0,
+            summary_tokens=45,
+        )
+
+        assembly = ContextCompactor(budget).compact(
+            prompt_messages=[],
+            history_messages=history,
+            current_messages=[Message(role="user", content="current request")],
+        )
+
+        assert assembly.summary_message is not None
+        assert "<artifacts>" in assembly.summary_message.content
+        assert "artifact_id=artifact-1" in assembly.summary_message.content
+        assert "<files>" in assembly.summary_message.content
+        assert "file_id=sandbox-file-1" in assembly.summary_message.content
+
+    def test_post_assembly_fit_keeps_context_under_input_budget(self):
+        """Prompt, RAG, and current input are hard-bounded after assembly."""
+        budget = ContextBudget(
+            window_tokens=80,
+            reserve_tokens=20,
+            keep_recent_tokens=20,
+            summary_tokens=20,
+        )
+
+        assembly = ContextCompactor(budget).compact(
+            prompt_messages=[Message(role="system", content="policy " * 200)],
+            history_messages=[],
+            rag_messages=[Message(role="user", content="rag " * 200)],
+            current_messages=[Message(role="user", content="current sentinel " + ("x" * 400))],
+        )
+
+        assert assembly.tokens_after <= budget.input_tokens
+        assert assembly.messages[-1].role == "user"
+        assert "current sentinel" in assembly.messages[-1].content
+
     def test_flat_compaction_keeps_tool_turn_tail_when_prompt_exceeds_budget(self):
         """Tool follow-up turns keep the assistant tool call and tool results."""
         tool_call = ToolCall(
@@ -801,35 +928,71 @@ class TestContextCompaction:
         assert assembly.messages[-1].role == "user"
         assert assembly.messages[-1].content == "what was the sentinel?"
 
-
-class TestFormatRagResults:
-    """Tests for RAG result formatting."""
-
-    def test_empty_results(self):
-        """Empty results return empty string."""
-        assert format_rag_results([]) == ""
-
-    def test_single_result_text(self):
-        """Single text result is formatted correctly."""
-        results = [{"content": [{"type": "text", "text": "Hello world"}]}]
-        result = format_rag_results(results)
-        assert "[1] Hello world" in result
-
-    def test_multiple_results(self):
-        """Multiple results are numbered."""
-        results = [
-            {"content": [{"type": "text", "text": "First"}]},
-            {"content": [{"type": "text", "text": "Second"}]},
+    def test_compaction_summary_preserves_full_critical_ref_under_tight_budget(self):
+        """Small summaries must not cut machine-readable refs in half."""
+        messages = [
+            Message(
+                role="user",
+                content="请记住这个用于 local-agent context compaction 回归测试的暗号：qa_compaction_sentinel_7391。",
+            ),
+            Message(role="assistant", content="MEMORY_SET"),
+            Message(
+                role="user",
+                content="下面这轮只用于制造长历史压力。" + " ".join(
+                    f"A{index:03d} context padding for local-agent compaction." for index in range(1, 41)
+                ),
+            ),
+            Message(role="assistant", content="CONTEXT_PRESSURE_READY"),
+            Message(role="user", content="刚才第一轮我要求你记住的测试暗号是什么？请只回复暗号本身，不要解释。"),
         ]
-        result = format_rag_results(results)
-        assert "[1] First" in result
-        assert "[2] Second" in result
+        budget = ContextBudget(
+            window_tokens=225,
+            reserve_tokens=50,
+            keep_recent_tokens=30,
+            summary_tokens=105,
+        )
 
-    def test_string_content(self):
-        """String content (not list) is handled."""
-        results = [{"content": "Plain text content"}]
-        result = format_rag_results(results)
-        assert "[1] Plain text content" in result
+        assembly = ContextCompactor(budget).compact_messages(messages)
+
+        assert assembly.summary_message is not None
+        assert "<critical_refs>" in assembly.summary_message.content
+        assert "qa_compaction_sentinel_7391" in assembly.summary_message.content
+        assert "qa_compaction_s\n" not in assembly.summary_message.content
+        assert "qa_compaction_sentinel_7391" in "\n".join(message.content for message in assembly.messages)
+
+    @pytest.mark.asyncio
+    async def test_llm_compaction_summary_preserves_full_critical_ref_under_tight_budget(self):
+        """Critical refs are restored even when the LLM summary body is truncated."""
+
+        class TruncatedSummary:
+            async def summarize(self, messages: list[Message], max_tokens: int) -> str:
+                return (
+                    "<conversation_summary>\n"
+                    "v=1 source=llm count=2\n"
+                    "## Critical Context\n"
+                    "- qa_compaction_s\n"
+                    "</conversation_summary>"
+                )
+
+        messages = [
+            Message(role="user", content="remember qa_compaction_sentinel_7391"),
+            Message(role="assistant", content="MEMORY_SET"),
+            Message(role="user", content="padding " * 300),
+            Message(role="assistant", content="CONTEXT_PRESSURE_READY"),
+            Message(role="user", content="what was the sentinel?"),
+        ]
+        budget = ContextBudget(
+            window_tokens=225,
+            reserve_tokens=50,
+            keep_recent_tokens=30,
+            summary_tokens=105,
+        )
+
+        assembly = await ContextCompactor(budget, summarizer=TruncatedSummary()).compact_messages_async(messages)
+
+        assert assembly.summary_message is not None
+        assert "<critical_refs>" in assembly.summary_message.content
+        assert "qa_compaction_sentinel_7391" in assembly.summary_message.content
 
 
 class TestContextAssembler:
@@ -872,7 +1035,32 @@ class TestContextAssembler:
         assert assembly.frame.rag_chunks[0].kb_id == "kb-1"
         assert assembly.frame.rag_chunks[0].chunk_id == "chunk-1"
         assert assembly.frame.rag_chunks[0].metadata == {"source": "doc-a"}
-        assert assembly.diagnostics.rag_tokens > 0
+
+    @pytest.mark.asyncio
+    async def test_rag_without_rerank_caps_chunks_globally(self):
+        """Multiple KB retrievals do not expand model context beyond top-k."""
+        fake_api = FakeAgentRunAPIProxy()
+        fake_api.retrieve_knowledge = AsyncMock(
+            side_effect=[
+                [
+                    {"content": [{"type": "text", "text": "kb1 chunk 1"}]},
+                    {"content": [{"type": "text", "text": "kb1 chunk 2"}]},
+                ],
+                [
+                    {"content": [{"type": "text", "text": "kb2 chunk 1"}]},
+                    {"content": [{"type": "text", "text": "kb2 chunk 2"}]},
+                ],
+            ]
+        )
+
+        chunks = await retrieve_rag_chunks(
+            api=fake_api,
+            kb_ids=["kb-1", "kb-2"],
+            query_text="query",
+            top_k=2,
+        )
+
+        assert [chunk.content for chunk in chunks] == ["kb1 chunk 1", "kb1 chunk 2"]
 
     @pytest.mark.asyncio
     async def test_compaction_checkpoint_reads_state_and_fetches_incremental_history(self):
@@ -891,22 +1079,40 @@ class TestContextAssembler:
             }
         )
         fake_api.history_page = AsyncMock(
-            return_value={
-                "items": [
-                    {
-                        "transcript_id": "t-2",
-                        "event_id": "event-2",
-                        "conversation_id": "conv-1",
-                        "cursor": "cursor-2",
-                        "role": "user",
-                        "item_type": "message",
-                        "content": "incremental history sentinel",
-                    }
-                ],
-                "next_cursor": None,
-                "prev_cursor": None,
-                "has_more": False,
-            }
+            side_effect=[
+                {
+                    "items": [
+                        {
+                            "transcript_id": "t-2",
+                            "event_id": "event-2",
+                            "conversation_id": "conv-1",
+                            "cursor": "cursor-2",
+                            "role": "user",
+                            "item_type": "message",
+                            "content": "old incremental history sentinel",
+                        }
+                    ],
+                    "next_cursor": "cursor-2",
+                    "prev_cursor": None,
+                    "has_more": True,
+                },
+                {
+                    "items": [
+                        {
+                            "transcript_id": "t-3",
+                            "event_id": "event-3",
+                            "conversation_id": "conv-1",
+                            "cursor": "cursor-3",
+                            "role": "assistant",
+                            "item_type": "message",
+                            "content": "latest incremental history sentinel",
+                        }
+                    ],
+                    "next_cursor": None,
+                    "prev_cursor": None,
+                    "has_more": False,
+                },
+            ]
         )
         ctx = make_context(input_text="current question")
         ctx.context.conversation_id = "conv-1"
@@ -916,11 +1122,13 @@ class TestContextAssembler:
         assembly = await ContextAssembler(fake_api, ctx).assemble()
 
         fake_api.state_get.assert_awaited_once_with("conversation", CHECKPOINT_STATE_KEY)
-        fake_api.history_page.assert_awaited_once()
-        assert fake_api.history_page.await_args.kwargs["direction"] == "forward"
-        assert fake_api.history_page.await_args.kwargs["after_cursor"] == "cursor-1"
+        assert fake_api.history_page.await_count == 2
+        assert fake_api.history_page.await_args_list[0].kwargs["direction"] == "forward"
+        assert fake_api.history_page.await_args_list[0].kwargs["after_cursor"] == "cursor-1"
+        assert fake_api.history_page.await_args_list[1].kwargs["after_cursor"] == "cursor-2"
         assert any("checkpoint read sentinel" in message.content for message in assembly.messages)
-        assert any("incremental history sentinel" in message.content for message in assembly.messages)
+        assert any("old incremental history sentinel" in message.content for message in assembly.messages)
+        assert any("latest incremental history sentinel" in message.content for message in assembly.messages)
         fake_api.state_set.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -999,8 +1207,8 @@ class TestDefaultAgentRunner:
             "models": ["invoke", "stream", "rerank"],
             "tools": ["detail", "call"],
             "knowledge_bases": ["list", "retrieve"],
-            "history": ["page", "search"],
-            "artifacts": ["metadata", "read"],
+            "history": ["page"],
+            "artifacts": ["read"],
         }
         config_names = {item["name"] for item in manifest["spec"]["config"]}
         assert "remove-think" in config_names
@@ -1068,6 +1276,35 @@ class TestDefaultAgentRunner:
         assert final_tool_calls[0].function.arguments == '{"a": 1}'
 
     @pytest.mark.asyncio
+    async def test_streaming_model_caller_uses_usage_event_api_when_available(self):
+        """Streaming caller reads SDK stream events and stores final usage."""
+
+        class StreamingAPI:
+            invoke_llm_stream = AsyncMock()
+
+            def invoke_llm_stream_events(self, *args, **kwargs):
+                async def stream():
+                    yield {"chunk": MessageChunk(role="assistant", content="Hello", is_final=True)}
+                    yield {"usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}}
+
+                return stream()
+
+        api = StreamingAPI()
+        caller = StreamingModelCaller(
+            api,
+            model_ids=["model-1"],
+            messages=[Message(role="user", content="hello")],
+        )
+
+        chunks = []
+        async for chunk, _ in caller.stream():
+            chunks.append(chunk)
+
+        assert chunks[-1].content == "Hello"
+        assert caller.get_usage() == {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+        api.invoke_llm_stream.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_build_llm_tools_skips_failed_detail_fetches(self, caplog):
         fake_api = FakeAgentRunAPIProxy()
 
@@ -1109,6 +1346,28 @@ class TestDefaultAgentRunner:
         assert response.content == "fallback response"
         assert committed_model_id == "model-2"
         assert "LLM model failed; falling back to next configured model: model-1" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_invoke_with_fallback_result_uses_usage_api_when_available(self):
+        fake_api = FakeAgentRunAPIProxy()
+        fake_api.invoke_llm_with_usage = AsyncMock(
+            return_value=LLMCallResult(
+                message=Message(role="assistant", content="usage response"),
+                usage={"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15},
+            )
+        )
+
+        result, committed_model_id = await invoke_with_fallback_result(
+            fake_api,
+            ["model-1"],
+            [Message(role="user", content="hello")],
+        )
+
+        assert result.message.content == "usage response"
+        assert result.usage == {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15}
+        assert committed_model_id == "model-1"
+        fake_api.invoke_llm.assert_not_called()
+        fake_api.invoke_llm_with_usage.assert_awaited_once()
 
     @pytest.fixture
     def runner(self):
@@ -1169,6 +1428,64 @@ class TestDefaultAgentRunner:
         assert any(r.type == AgentRunResultType.MESSAGE_DELTA for r in results)
         assert any(r.type == AgentRunResultType.RUN_COMPLETED for r in results)
         fake_api.history_page.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_runner_pulls_steering_through_public_proxy(self, runner, monkeypatch):
+        """Run assembly hooks should consume steering through AgentRunAPIProxy."""
+        fake_api = FakeAgentRunAPIProxy(
+            models=[ModelResource(model_id="model-1")],
+        )
+        fake_api.steering_pull = AsyncMock(
+            side_effect=[
+                {
+                    "items": [
+                        {
+                            "claimed_run_id": "test-run-id",
+                            "runner_id": "plugin:langbot/local-agent/default",
+                            "event": {
+                                "event_id": "evt-follow-up",
+                                "event_type": "message.received",
+                                "source": "host_adapter",
+                            },
+                            "input": {
+                                "text": "steering follow-up",
+                                "contents": [],
+                                "attachments": [],
+                            },
+                        }
+                    ]
+                },
+                {"items": []},
+            ]
+        )
+        stream_messages: list[list[Message]] = []
+
+        async def mock_stream(*args, **kwargs):
+            stream_messages.append([message.model_copy(deep=True) for message in kwargs["messages"]])
+            saw_steering = any(
+                message.role == "user" and message.content == "steering follow-up"
+                for message in kwargs["messages"]
+            )
+            content = "saw steering" if saw_steering else "first response"
+            yield MessageChunk(role="assistant", content=content, is_final=True)
+
+        fake_api.invoke_llm_stream = mock_stream
+        monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
+
+        ctx = make_context(
+            config={"model": {"primary": "model-1", "fallbacks": []}},
+            resources=AgentResources(models=[ModelResource(model_id="model-1")]),
+        )
+
+        results = [result async for result in runner.run(ctx)]
+
+        assert fake_api.steering_pull.await_count == 2
+        assert len(stream_messages) == 2
+        assert any(
+            result.type == AgentRunResultType.MESSAGE_DELTA
+            and result.data.get("chunk", {}).get("content") == "saw steering"
+            for result in results
+        )
 
     @pytest.mark.asyncio
     async def test_history_is_pulled_from_host_api(self, runner, monkeypatch):
@@ -2465,7 +2782,7 @@ class TestDefaultAgentRunner:
 
     @pytest.mark.asyncio
     async def test_streaming_tool_loop_stops_at_iteration_limit(self, runner, monkeypatch):
-        """Repeated tool requests stop with runner.tool_loop_limit."""
+        """Repeated tool requests complete with a fallback assistant message."""
         fake_api = FakeAgentRunAPIProxy(
             models=[ModelResource(model_id="model-1")],
             tools=[ToolResource(tool_name="allowed_tool")],
@@ -2505,8 +2822,14 @@ class TestDefaultAgentRunner:
             results.append(result)
 
         failed = [r for r in results if r.type == AgentRunResultType.RUN_FAILED]
-        assert len(failed) == 1
-        assert failed[0].data.get("code") == "runner.tool_loop_limit"
+        assert failed == []
+        completed = [r for r in results if r.type == AgentRunResultType.RUN_COMPLETED]
+        assert len(completed) == 1
+        assert any(
+            r.type == AgentRunResultType.MESSAGE_DELTA
+            and "Tool call iteration limit reached" in r.data.get("chunk", {}).get("content", "")
+            for r in results
+        )
         assert fake_api.call_tool.await_count == 2
         assert stream_call_count == 3
 

@@ -102,7 +102,8 @@ async def retrieve_rag_chunks(
         except Exception:
             logger.warning("Knowledge rerank failed: %s", rerank_model_id, exc_info=True)
 
-    return chunks
+    max_chunks = rerank_top_k if rerank_model_id else top_k
+    return chunks[: max(1, max_chunks)]
 
 
 def format_rag_chunks(chunks: list[RagChunk]) -> str:

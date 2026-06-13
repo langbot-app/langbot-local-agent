@@ -43,24 +43,14 @@ def build_prompt_messages(
 def build_user_message(
     user_text: str,
     input_contents: list[ContentElement] | None = None,
-    rag_context: str | None = None,
 ) -> Message | None:
     """Build the current user message, preserving structured/multimodal input."""
-    final_user_text = _build_rag_prompt(rag_context, user_text) if rag_context else user_text
-
     if input_contents:
         contents = [content.model_copy(deep=True) for content in input_contents]
-        if rag_context:
-            for content in contents:
-                if content.type == "text":
-                    content.text = final_user_text
-                    break
-            else:
-                contents.insert(0, ContentElement.from_text(final_user_text))
         return Message(role="user", content=contents)
 
-    if final_user_text:
-        return Message(role="user", content=final_user_text)
+    if user_text:
+        return Message(role="user", content=user_text)
 
     return None
 
@@ -84,55 +74,3 @@ Use it only when it is relevant.
 {rag_context}
 </retrieved_context>""",
     )
-
-
-def _build_rag_prompt(rag_context: str, user_text: str) -> str:
-    """Build user message with RAG context.
-
-    Matches original localagent template:
-    - Instructions
-    - <context>...</context>
-    - <user_message>...</user_message>
-    """
-    return f"""The following are relevant context entries retrieved from the knowledge base.
-Please use them to answer the user's message.
-Respond in the same language as the user's input.
-
-<context>
-{rag_context}
-</context>
-
-<user_message>
-{user_text}
-</user_message>"""
-
-
-def format_rag_results(results: list[dict[str, typing.Any]]) -> str:
-    """Format knowledge base retrieval results for context.
-
-    Args:
-        results: List of retrieval result entries from API
-
-    Returns:
-        Formatted context string
-    """
-    if not results:
-        return ""
-
-    texts: list[str] = []
-    idx = 1
-
-    for entry in results:
-        content = entry.get("content", [])
-        if isinstance(content, list):
-            for ce in content:
-                if isinstance(ce, dict) and ce.get("type") == "text":
-                    text = ce.get("text", "")
-                    if text:
-                        texts.append(f"[{idx}] {text}")
-                        idx += 1
-        elif isinstance(content, str) and content:
-            texts.append(f"[{idx}] {content}")
-            idx += 1
-
-    return "\n\n".join(texts)
