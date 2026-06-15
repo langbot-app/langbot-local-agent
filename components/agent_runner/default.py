@@ -10,6 +10,8 @@ Supports:
 
 from __future__ import annotations
 
+import logging
+import time
 from typing import Any, AsyncGenerator
 
 from langbot_plugin.api.definition.components.agent_runner.runner import AgentRunner
@@ -26,6 +28,55 @@ from pkg.agent_core import (
     LangBotModelAdapter,
 )
 from pkg.run_assembly import AgentRunAssembler, AgentRunAssembly, NoAuthorizedModelError
+
+logger = logging.getLogger(__name__)
+
+CANCELLED_ERROR = "Run cancellation requested"
+CANCELLED_CODE = "cancelled"
+INTERRUPT_CHECK_INTERVAL_SECONDS = 0.5
+
+
+class RunInterruptChecker:
+    """Poll Host run ledger for cooperative cancellation requests."""
+
+    def __init__(
+        self,
+        api: Any,
+        ctx: AgentRunContext,
+        *,
+        interval_seconds: float = INTERRUPT_CHECK_INTERVAL_SECONDS,
+    ):
+        self.api = api
+        self.ctx = ctx
+        self.interval_seconds = max(0.1, interval_seconds)
+        self._next_check_at = 0.0
+        available_apis = getattr(getattr(ctx, "context", None), "available_apis", None)
+        self.available = bool(getattr(available_apis, "run_get", False)) and callable(getattr(api, "run_get", None))
+
+    async def is_cancelled(self, *, force: bool = False) -> bool:
+        if not self.available:
+            return False
+
+        now = time.monotonic()
+        if not force and now < self._next_check_at:
+            return False
+        self._next_check_at = now + self.interval_seconds
+
+        try:
+            run = await self.api.run_get(self.ctx.run_id)
+        except Exception:
+            logger.debug("Failed to check AgentRun cancellation state", exc_info=True)
+            return False
+
+        return _run_cancel_requested(run)
+
+
+def _run_cancel_requested(run: Any) -> bool:
+    if run is None:
+        return False
+    if isinstance(run, dict):
+        return run.get("cancel_requested_at") is not None or run.get("status") == "cancelled"
+    return getattr(run, "cancel_requested_at", None) is not None or getattr(run, "status", None) == "cancelled"
 
 
 class DefaultAgentRunner(AgentRunner):
@@ -52,6 +103,16 @@ class DefaultAgentRunner(AgentRunner):
         6. Yield AgentRunResult events
         """
         api = self.get_run_api(ctx)
+        interrupt_checker = RunInterruptChecker(api, ctx)
+
+        if await interrupt_checker.is_cancelled(force=True):
+            yield AgentRunResult.run_failed(
+                ctx.run_id,
+                error=CANCELLED_ERROR,
+                code=CANCELLED_CODE,
+                retryable=False,
+            )
+            return
 
         try:
             assembly = await AgentRunAssembler(api, ctx).assemble()
@@ -63,10 +124,20 @@ class DefaultAgentRunner(AgentRunner):
             )
             return
 
+        if await interrupt_checker.is_cancelled(force=True):
+            yield AgentRunResult.run_failed(
+                ctx.run_id,
+                error=CANCELLED_ERROR,
+                code=CANCELLED_CODE,
+                retryable=False,
+            )
+            return
+
         async for result in self._run_agent_loop(
             run_id=ctx.run_id,
             api=api,
             assembly=assembly,
+            interrupt_checker=interrupt_checker,
         ):
             yield result
 
@@ -75,6 +146,7 @@ class DefaultAgentRunner(AgentRunner):
         run_id: str,
         api: Any,
         assembly: AgentRunAssembly,
+        interrupt_checker: RunInterruptChecker | None = None,
     ) -> AsyncGenerator[AgentRunResult, None]:
         """Run the LangBot-native Pi-style agent loop."""
         loop = AgentLoop(
@@ -91,6 +163,15 @@ class DefaultAgentRunner(AgentRunner):
 
         final_message: Message | None = None
         async for event in loop.run():
+            if interrupt_checker is not None and await interrupt_checker.is_cancelled():
+                yield AgentRunResult.run_failed(
+                    run_id,
+                    error=CANCELLED_ERROR,
+                    code=CANCELLED_CODE,
+                    retryable=False,
+                )
+                return
+
             if event.type == AgentLoopEventType.TOOL_EXECUTION_END and event.artifact is not None:
                 artifact = event.artifact
                 yield AgentRunResult.artifact_created(
@@ -109,6 +190,15 @@ class DefaultAgentRunner(AgentRunner):
             if result is not None:
                 yield result
                 if getattr(result.type, "value", result.type) == "run.failed":
+                    return
+
+                if interrupt_checker is not None and await interrupt_checker.is_cancelled(force=True):
+                    yield AgentRunResult.run_failed(
+                        run_id,
+                        error=CANCELLED_ERROR,
+                        code=CANCELLED_CODE,
+                        retryable=False,
+                    )
                     return
 
             if (

@@ -217,7 +217,13 @@ APIs.
 - `knowledge_retrieval`: yes
 - `multimodal_input`: yes
 - `skill_authoring`: yes
+- `interrupt`: yes
 - `steering`: yes
+
+`interrupt` is cooperative. When Host exposes the run ledger API, Local Agent
+polls the current run through `AgentRunAPIProxy.run_get()` at run boundaries and
+streaming event boundaries. If Host has recorded `cancel_requested_at`, the
+runner stops and emits `run.failed` with `code="cancelled"`.
 
 `skill_authoring` means Local Agent can receive LangBot's Host-owned
 `ctx.resources.skills` facts plus `activate`/`register_skill` tools when skills

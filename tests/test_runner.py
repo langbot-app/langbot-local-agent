@@ -130,6 +130,13 @@ class FakeAgentRunAPIProxy:
         self.state_set = AsyncMock(return_value={"ok": True})
         self.state_delete = AsyncMock(return_value={"ok": True})
         self.state_list = AsyncMock(return_value={"keys": []})
+        self.run_get = AsyncMock(
+            return_value={
+                "run_id": "test-run-id",
+                "status": "running",
+                "cancel_requested_at": None,
+            }
+        )
         self.history_page = AsyncMock(
             return_value={
                 "items": [],
@@ -1203,6 +1210,7 @@ class TestDefaultAgentRunner:
         )
 
         assert manifest["spec"]["capabilities"]["skill_authoring"] is True
+        assert manifest["spec"]["capabilities"]["interrupt"] is True
         assert manifest["spec"]["permissions"] == {
             "models": ["invoke", "stream", "rerank"],
             "tools": ["detail", "call"],
@@ -1428,6 +1436,62 @@ class TestDefaultAgentRunner:
         assert any(r.type == AgentRunResultType.MESSAGE_DELTA for r in results)
         assert any(r.type == AgentRunResultType.RUN_COMPLETED for r in results)
         fake_api.history_page.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_streaming_run_cancel_e2e_emits_cancelled_failure(self, runner, monkeypatch):
+        """Local Agent cooperatively stops when Host marks the active run cancelled."""
+        fake_api = FakeAgentRunAPIProxy(
+            models=[ModelResource(model_id="model-1")],
+        )
+
+        async def mock_stream(*args, **kwargs):
+            yield MessageChunk(role="assistant", content="partial", is_final=False)
+            yield MessageChunk(role="assistant", content=" should-not-complete", is_final=True)
+
+        fake_api.invoke_llm_stream = mock_stream
+        fake_api.run_get = AsyncMock(
+            side_effect=[
+                {
+                    "run_id": "test-run-id",
+                    "status": "running",
+                    "cancel_requested_at": None,
+                },
+                {
+                    "run_id": "test-run-id",
+                    "status": "running",
+                    "cancel_requested_at": None,
+                },
+                {
+                    "run_id": "test-run-id",
+                    "status": "running",
+                    "cancel_requested_at": 123,
+                    "status_reason": "user requested",
+                },
+            ]
+        )
+        monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
+
+        ctx = make_context(
+            config={"model": {"primary": "model-1", "fallbacks": []}},
+            resources=AgentResources(models=[ModelResource(model_id="model-1")]),
+        )
+        ctx.context.available_apis.run_get = True
+
+        results = []
+        async for result in runner.run(ctx):
+            results.append(result)
+
+        assert [result.type for result in results] == [
+            AgentRunResultType.MESSAGE_DELTA,
+            AgentRunResultType.RUN_FAILED,
+        ]
+        assert results[-1].data == {
+            "error": "Run cancellation requested",
+            "code": "cancelled",
+            "retryable": False,
+        }
+        assert not any(result.type == AgentRunResultType.RUN_COMPLETED for result in results)
+        assert fake_api.run_get.await_count == 3
 
     @pytest.mark.asyncio
     async def test_runner_pulls_steering_through_public_proxy(self, runner, monkeypatch):

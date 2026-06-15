@@ -148,7 +148,7 @@ spec:
     knowledge_retrieval: true
     multimodal_input: true
     skill_authoring: true
-    interrupt: false
+    interrupt: true
     steering: true
   permissions:
     models:
