@@ -134,9 +134,7 @@ def _chunk_from_result(kb_id: str, source_index: int, entry: typing.Any) -> RagC
                 _model_or_mapping_get(entry, "id", _model_or_mapping_get(entry, "document_id")),
             )
         ),
-        score=_optional_float(
-            _model_or_mapping_get(entry, "score", _model_or_mapping_get(entry, "similarity"))
-        ),
+        score=_optional_float(_model_or_mapping_get(entry, "score", _model_or_mapping_get(entry, "similarity"))),
         metadata=dict(metadata),
     )
 

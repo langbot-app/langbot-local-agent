@@ -945,9 +945,8 @@ class TestContextCompaction:
             Message(role="assistant", content="MEMORY_SET"),
             Message(
                 role="user",
-                content="下面这轮只用于制造长历史压力。" + " ".join(
-                    f"A{index:03d} context padding for local-agent compaction." for index in range(1, 41)
-                ),
+                content="下面这轮只用于制造长历史压力。"
+                + " ".join(f"A{index:03d} context padding for local-agent compaction." for index in range(1, 41)),
             ),
             Message(role="assistant", content="CONTEXT_PRESSURE_READY"),
             Message(role="user", content="刚才第一轮我要求你记住的测试暗号是什么？请只回复暗号本身，不要解释。"),
@@ -1527,8 +1526,7 @@ class TestDefaultAgentRunner:
         async def mock_stream(*args, **kwargs):
             stream_messages.append([message.model_copy(deep=True) for message in kwargs["messages"]])
             saw_steering = any(
-                message.role == "user" and message.content == "steering follow-up"
-                for message in kwargs["messages"]
+                message.role == "user" and message.content == "steering follow-up" for message in kwargs["messages"]
             )
             content = "saw steering" if saw_steering else "first response"
             yield MessageChunk(role="assistant", content=content, is_final=True)
@@ -1711,12 +1709,12 @@ class TestDefaultAgentRunner:
         assert "ordinary context before tool" in [message.content for message in captured_messages]
         assert "ordinary context after orphan" in [message.content for message in captured_messages]
         assert "current request" == captured_messages[-1].content
-        assert not any(message.role == "tool" and message.tool_call_id == "call-orphan" for message in captured_messages)
+        assert not any(
+            message.role == "tool" and message.tool_call_id == "call-orphan" for message in captured_messages
+        )
 
         assistant_tool_messages = [
-            message
-            for message in captured_messages
-            if message.role == "assistant" and message.tool_calls
+            message for message in captured_messages if message.role == "assistant" and message.tool_calls
         ]
         assert len(assistant_tool_messages) == 1
         assert [tool_call.id for tool_call in assistant_tool_messages[0].tool_calls] == ["call-legal"]
@@ -2211,7 +2209,7 @@ class TestDefaultAgentRunner:
             return_value={
                 "activated": True,
                 "skill_name": "pdf",
-                "content": '<skill-activation><skill-name>pdf</skill-name></skill-activation>',
+                "content": "<skill-activation><skill-name>pdf</skill-name></skill-activation>",
             }
         )
         monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)

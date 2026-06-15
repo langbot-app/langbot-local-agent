@@ -71,6 +71,7 @@ async def test_steering_puller_accepts_sdk_result_models():
 @pytest.mark.asyncio
 async def test_steering_puller_treats_permission_denied_as_authoritative():
     """The public proxy authorization gate is authoritative for steering."""
+
     class SteeringAPI:
         run_id = "run-1"
 
@@ -85,6 +86,7 @@ async def test_steering_puller_treats_permission_denied_as_authoritative():
 @pytest.mark.asyncio
 async def test_steering_puller_noops_when_sdk_method_missing():
     """Older SDK proxies without steering_pull degrade to no-op."""
+
     class SteeringAPI:
         run_id = "run-1"
 
@@ -207,20 +209,15 @@ async def test_streaming_loop_pulls_steering_after_tool_batch():
                     committed_model_id="model-1",
                     visible_content="Need tool",
                 )
-                yield ModelTurnEvent.message_delta(
-                    MessageChunk(role="assistant", content="Need tool", is_final=True)
-                )
+                yield ModelTurnEvent.message_delta(MessageChunk(role="assistant", content="Need tool", is_final=True))
                 yield ModelTurnEvent.message_end(result)
                 return
 
             saw_followup = any(
-                message.role == "user" and message.content == "steering follow-up"
-                for message in messages
+                message.role == "user" and message.content == "steering follow-up" for message in messages
             )
             content = "saw steering follow-up" if saw_followup else "missing steering follow-up"
-            yield ModelTurnEvent.message_delta(
-                MessageChunk(role="assistant", content=content, is_final=True)
-            )
+            yield ModelTurnEvent.message_delta(MessageChunk(role="assistant", content=content, is_final=True))
             yield ModelTurnEvent.message_end(
                 ModelTurnResult(
                     message=Message(role="assistant", content=content),
@@ -495,9 +492,7 @@ async def test_loop_stops_after_tool_batch_when_all_results_terminate():
                 message=Message(
                     role="assistant",
                     content="Sending now",
-                    tool_calls=[
-                        ToolCallRequest(id="call-1", name="send_message", arguments="{}").to_tool_call()
-                    ],
+                    tool_calls=[ToolCallRequest(id="call-1", name="send_message", arguments="{}").to_tool_call()],
                 ),
                 tool_calls=[ToolCallRequest(id="call-1", name="send_message", arguments="{}")],
                 committed_model_id="model-1",
@@ -855,9 +850,7 @@ async def test_loop_converts_before_tool_hook_exception_to_run_failed():
                 message=Message(
                     role="assistant",
                     content="",
-                    tool_calls=[
-                        ToolCallRequest(id="call-1", name="allowed_tool", arguments="{}").to_tool_call()
-                    ],
+                    tool_calls=[ToolCallRequest(id="call-1", name="allowed_tool", arguments="{}").to_tool_call()],
                 ),
                 tool_calls=[ToolCallRequest(id="call-1", name="allowed_tool", arguments="{}")],
                 committed_model_id="model-1",
@@ -900,9 +893,7 @@ async def test_loop_converts_prepare_next_turn_hook_exception_to_run_failed():
                 message=Message(
                     role="assistant",
                     content="",
-                    tool_calls=[
-                        ToolCallRequest(id="call-1", name="allowed_tool", arguments="{}").to_tool_call()
-                    ],
+                    tool_calls=[ToolCallRequest(id="call-1", name="allowed_tool", arguments="{}").to_tool_call()],
                 ),
                 tool_calls=[ToolCallRequest(id="call-1", name="allowed_tool", arguments="{}")],
                 committed_model_id="model-1",

@@ -480,7 +480,9 @@ class ContextAssembler:
                 page = await self.api.history_page(**kwargs)
             except Exception:
                 if checkpoint is not None:
-                    logger.warning("Compaction checkpoint history cursor failed; falling back to recent tail", exc_info=True)
+                    logger.warning(
+                        "Compaction checkpoint history cursor failed; falling back to recent tail", exc_info=True
+                    )
                     return await self._get_history_messages(None)
                 raise
 
@@ -511,7 +513,11 @@ class ContextAssembler:
 
     def _state_api_available(self) -> bool:
         available_apis = getattr(getattr(self.ctx, "context", None), "available_apis", None)
-        return bool(getattr(available_apis, "state", False)) and hasattr(self.api, "state_get") and hasattr(self.api, "state_set")
+        return (
+            bool(getattr(available_apis, "state", False))
+            and hasattr(self.api, "state_get")
+            and hasattr(self.api, "state_set")
+        )
 
     async def _load_compaction_checkpoint(self) -> CompactionCheckpoint | None:
         if not self._state_api_available():
@@ -985,9 +991,7 @@ def sanitize_provider_messages(messages: list[Message]) -> list[Message]:
                 next_index += 1
 
             if tool_result_messages:
-                message.tool_calls = [
-                    tool_call for tool_call in message.tool_calls if tool_call.id in seen_result_ids
-                ]
+                message.tool_calls = [tool_call for tool_call in message.tool_calls if tool_call.id in seen_result_ids]
                 normalized.append(message)
                 normalized.extend(tool_result_messages)
             else:
@@ -1049,12 +1053,7 @@ def estimate_messages_tokens(messages: list[Message]) -> int:
 
 
 def estimate_messages_tokens_with_anchor(messages: list[Message], anchor: ContextUsageAnchor | None) -> int:
-    if (
-        anchor is None
-        or anchor.message_count < 0
-        or anchor.total_tokens <= 0
-        or anchor.message_count > len(messages)
-    ):
+    if anchor is None or anchor.message_count < 0 or anchor.total_tokens <= 0 or anchor.message_count > len(messages):
         return estimate_messages_tokens(messages)
     return anchor.total_tokens + estimate_messages_tokens(messages[anchor.message_count :])
 
@@ -1404,7 +1403,9 @@ def _parse_conversation_summary_message(message: Message) -> tuple[int, list[Con
 
 
 def _extract_previous_summary_text(messages: list[Message]) -> str:
-    summaries = [_conversation_summary_body(message) for message in messages if _is_conversation_summary_message(message)]
+    summaries = [
+        _conversation_summary_body(message) for message in messages if _is_conversation_summary_message(message)
+    ]
     summaries = [summary for summary in summaries if summary]
     return "\n\n---\n\n".join(summaries)
 
@@ -1426,7 +1427,7 @@ def _serialize_messages_for_summary(messages: list[Message]) -> str:
         text = message_to_text(message)
         if not text:
             text = "(empty)"
-        parts.append(f"<message index=\"{index}\" role=\"{message.role}\">\n{text}\n</message>")
+        parts.append(f'<message index="{index}" role="{message.role}">\n{text}\n</message>')
     return "\n\n".join(parts)
 
 
@@ -1888,11 +1889,7 @@ def _is_cjk_token_char(char: str) -> bool:
 
 def _is_symbol_token_char(char: str) -> bool:
     codepoint = ord(char)
-    if (
-        0x1F000 <= codepoint <= 0x1FAFF
-        or 0x2600 <= codepoint <= 0x27BF
-        or 0xFE00 <= codepoint <= 0xFE0F
-    ):
+    if 0x1F000 <= codepoint <= 0x1FAFF or 0x2600 <= codepoint <= 0x27BF or 0xFE00 <= codepoint <= 0xFE0F:
         return True
     return unicodedata.category(char) == "So"
 
