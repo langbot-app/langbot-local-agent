@@ -203,14 +203,19 @@ class AgentLoopEvent:
     retryable: bool = False
     tool_results: list[Message] = field(default_factory=list)
     messages: list[Message] = field(default_factory=list)
+    usage: dict[str, typing.Any] | None = None
 
     @classmethod
     def agent_start(cls) -> "AgentLoopEvent":
         return cls(type=AgentLoopEventType.AGENT_START)
 
     @classmethod
-    def agent_end(cls, messages: list[Message]) -> "AgentLoopEvent":
-        return cls(type=AgentLoopEventType.AGENT_END, messages=list(messages))
+    def agent_end(
+        cls,
+        messages: list[Message],
+        usage: dict[str, typing.Any] | None = None,
+    ) -> "AgentLoopEvent":
+        return cls(type=AgentLoopEventType.AGENT_END, messages=list(messages), usage=usage)
 
     @classmethod
     def turn_start(cls) -> "AgentLoopEvent":
@@ -221,11 +226,13 @@ class AgentLoopEvent:
         cls,
         message: Message,
         tool_results: list[Message],
+        usage: dict[str, typing.Any] | None = None,
     ) -> "AgentLoopEvent":
         return cls(
             type=AgentLoopEventType.TURN_END,
             message=message,
             tool_results=list(tool_results),
+            usage=usage,
         )
 
     @classmethod
@@ -271,10 +278,12 @@ class AgentLoopEvent:
         error: str,
         code: str = "runner.error",
         retryable: bool = False,
+        usage: dict[str, typing.Any] | None = None,
     ) -> "AgentLoopEvent":
         return cls(
             type=AgentLoopEventType.RUN_FAILED,
             error=error,
             code=code,
             retryable=retryable,
+            usage=usage,
         )

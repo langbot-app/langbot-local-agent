@@ -1546,6 +1546,43 @@ class TestDefaultAgentRunner:
         fake_api.history_page.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_streaming_terminal_result_reports_usage(self, runner, monkeypatch):
+        """Provider usage collected during streaming reaches run.completed."""
+        fake_api = FakeAgentRunAPIProxy(
+            models=[ModelResource(model_id="model-1")],
+        )
+
+        def mock_stream_events(*args, **kwargs):
+            async def stream():
+                yield LLMStreamEvent(chunk=MessageChunk(role="assistant", content="Hello", is_final=True))
+                yield LLMStreamEvent(usage={"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12})
+
+            return stream()
+
+        fake_api.invoke_llm_stream_events = mock_stream_events
+        monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
+
+        ctx = make_context(
+            config={"model": {"primary": "model-1", "fallbacks": []}},
+            resources=AgentResources(models=[ModelResource(model_id="model-1")]),
+        )
+
+        results = []
+        async for result in runner.run(ctx):
+            results.append(result)
+
+        run_completed = [result for result in results if result.type == AgentRunResultType.RUN_COMPLETED]
+        assert len(run_completed) == 1
+        assert run_completed[0].usage is not None
+        assert run_completed[0].usage.model_dump(mode="json", exclude_none=True) == {
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "total_tokens": 12,
+            "model_calls": 1,
+            "turns": [{"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}],
+        }
+
+    @pytest.mark.asyncio
     async def test_streaming_run_cancel_e2e_emits_cancelled_failure(self, runner, monkeypatch):
         """Local Agent cooperatively stops when Host marks the active run cancelled."""
         fake_api = FakeAgentRunAPIProxy(

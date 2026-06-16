@@ -253,13 +253,18 @@ class DefaultAgentRunner(AgentRunner):
         )
 
         final_message: Message | None = None
+        terminal_usage: dict[str, Any] | None = None
         async for event in loop.run():
+            if event.usage is not None:
+                terminal_usage = event.usage
+
             if interrupt_checker is not None and await interrupt_checker.is_cancelled():
                 yield AgentRunResult.run_failed(
                     run_id,
                     error=CANCELLED_ERROR,
                     code=CANCELLED_CODE,
                     retryable=False,
+                    usage=terminal_usage,
                 )
                 return
 
@@ -312,7 +317,11 @@ class DefaultAgentRunner(AgentRunner):
                     return
                 if not assembly.streaming and final_message is not None:
                     yield AgentRunResult.message_completed(run_id, final_message)
-                yield AgentRunResult.run_completed(run_id, finish_reason="stop")
+                yield AgentRunResult.run_completed(
+                    run_id,
+                    finish_reason="stop",
+                    usage=event.usage or terminal_usage,
+                )
 
     def _loop_event_to_result(
         self,
@@ -347,6 +356,7 @@ class DefaultAgentRunner(AgentRunner):
                 error=event.error or "Agent loop failed",
                 code=event.code or "runner.error",
                 retryable=event.retryable,
+                usage=event.usage,
             )
 
         return None

@@ -176,6 +176,64 @@ async def test_streaming_loop_emits_turn_message_and_tool_events():
 
 
 @pytest.mark.asyncio
+async def test_loop_aggregates_usage_across_tool_turns():
+    """The loop carries aggregate model usage to the terminal event."""
+
+    class UsageAPI:
+        def __init__(self):
+            self.call_tool = AsyncMock(return_value={"value": "tool-result"})
+            self.stream_calls = 0
+
+        def invoke_llm_stream_events(self, *args, **kwargs):
+            self.stream_calls += 1
+
+            async def stream():
+                if self.stream_calls == 1:
+                    yield MessageChunk(
+                        role="assistant",
+                        content="Checking",
+                        is_final=True,
+                        tool_calls=[
+                            ToolCall(
+                                id="call-1",
+                                type="function",
+                                function=FunctionCall(name="allowed_tool", arguments='{"arg": "value"}'),
+                            )
+                        ],
+                    )
+                    yield {"usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}}
+                else:
+                    yield MessageChunk(role="assistant", content="Done", is_final=True)
+                    yield {"usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}}
+
+            return stream()
+
+    api = UsageAPI()
+    loop = AgentLoop(
+        model_adapter=LangBotModelAdapter(api),
+        tool_executor=LangBotToolExecutor(api, {"allowed_tool"}),
+        model_ids=["model-1"],
+        messages=[Message(role="user", content="Use the tool")],
+        tools=[],
+        streaming=True,
+        max_tool_iterations=10,
+    )
+
+    events = [event async for event in loop.run()]
+    assert events[-1].type == AgentLoopEventType.AGENT_END
+    assert events[-1].usage == {
+        "model_calls": 2,
+        "turns": [
+            {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+            {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+        ],
+        "prompt_tokens": 12,
+        "completion_tokens": 5,
+        "total_tokens": 17,
+    }
+
+
+@pytest.mark.asyncio
 async def test_streaming_model_empty_first_stream_falls_back():
     class StreamingAPI:
         def __init__(self):

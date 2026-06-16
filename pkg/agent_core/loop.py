@@ -56,6 +56,7 @@ class AgentLoop:
         self.tool_execution_mode = self._normalize_tool_execution_mode(tool_execution_mode)
         self.hooks = hooks or AgentLoopHooks()
         self._last_tool_batch_terminates = False
+        self._usage: dict[str, typing.Any] | None = None
 
     @staticmethod
     def _normalize_tool_execution_mode(mode: ToolExecutionMode | str) -> ToolExecutionMode:
@@ -97,6 +98,14 @@ class AgentLoop:
 
     def _should_execute_serially(self) -> bool:
         return self.tool_execution_mode == ToolExecutionMode.SERIAL
+
+    def _record_usage(self, usage: dict[str, typing.Any] | None) -> None:
+        if not usage:
+            return
+        self._usage = _merge_usage(self._usage, usage)
+
+    def _current_usage(self) -> dict[str, typing.Any] | None:
+        return dict(self._usage) if self._usage else None
 
     async def _execute_prepared_tool_calls_parallel(
         self,
@@ -152,7 +161,7 @@ class AgentLoop:
             yield AgentLoopEvent.message_end(outcome.message)
 
         if last_model_turn is not None:
-            yield AgentLoopEvent.turn_end(last_model_turn.message, tool_results)
+            yield AgentLoopEvent.turn_end(last_model_turn.message, tool_results, usage=self._current_usage())
             messages = await self.hooks.prepare_next_turn(self.messages, last_model_turn, tool_results)
             self.messages = [message.model_copy(deep=True) for message in messages]
 
@@ -180,7 +189,7 @@ class AgentLoop:
             yield AgentLoopEvent.message_end(tool_result)
 
         if last_model_turn is not None:
-            yield AgentLoopEvent.turn_end(last_model_turn.message, tool_results)
+            yield AgentLoopEvent.turn_end(last_model_turn.message, tool_results, usage=self._current_usage())
 
         final_message = Message(role="assistant", content=TOOL_LOOP_LIMIT_MESSAGE)
         self.messages.append(final_message)
@@ -191,8 +200,8 @@ class AgentLoop:
                 MessageChunk(role="assistant", content=TOOL_LOOP_LIMIT_MESSAGE, is_final=True)
             )
         yield AgentLoopEvent.message_end(final_message)
-        yield AgentLoopEvent.turn_end(final_message, [])
-        yield AgentLoopEvent.agent_end(self.messages)
+        yield AgentLoopEvent.turn_end(final_message, [], usage=self._current_usage())
+        yield AgentLoopEvent.agent_end(self.messages, usage=self._current_usage())
 
     async def _run_streaming(self) -> typing.AsyncGenerator[AgentLoopEvent, None]:
         yield AgentLoopEvent.agent_start()
@@ -219,10 +228,10 @@ class AgentLoop:
                     async for event in self._execute_tool_batch(pending_tool_calls, last_model_turn):
                         yield event
                 except Exception as e:
-                    yield AgentLoopEvent.run_failed(str(e), code="runner.tool_error")
+                    yield AgentLoopEvent.run_failed(str(e), code="runner.tool_error", usage=self._current_usage())
                     return
                 if self._last_tool_batch_terminates:
-                    yield AgentLoopEvent.agent_end(self.messages)
+                    yield AgentLoopEvent.agent_end(self.messages, usage=self._current_usage())
                     return
 
             if committed_model_id is None:
@@ -255,40 +264,50 @@ class AgentLoop:
                     if not stream_started and not context_retry_used and await self._recover_context_overflow(e):
                         context_retry_used = True
                         continue
-                    yield AgentLoopEvent.run_failed(str(e), code="runner.llm_error", retryable=e.retryable)
+                    yield AgentLoopEvent.run_failed(
+                        str(e),
+                        code="runner.llm_error",
+                        retryable=e.retryable,
+                        usage=self._current_usage(),
+                    )
                     return
                 except Exception as e:
-                    yield AgentLoopEvent.run_failed(str(e), code="runner.error")
+                    yield AgentLoopEvent.run_failed(str(e), code="runner.error", usage=self._current_usage())
                     return
 
             if model_turn is None:
-                yield AgentLoopEvent.run_failed("Model stream ended without a final message", code="runner.llm_error")
+                yield AgentLoopEvent.run_failed(
+                    "Model stream ended without a final message",
+                    code="runner.llm_error",
+                    usage=self._current_usage(),
+                )
                 return
 
             committed_model_id = model_turn.committed_model_id or committed_model_id
+            self._record_usage(model_turn.usage)
             self.messages.append(model_turn.message)
             last_model_turn = model_turn
             yield AgentLoopEvent.message_end(model_turn.message)
 
             try:
                 if await self.hooks.should_stop_after_turn(model_turn, self.messages):
-                    yield AgentLoopEvent.turn_end(model_turn.message, [])
-                    yield AgentLoopEvent.agent_end(self.messages)
+                    yield AgentLoopEvent.turn_end(model_turn.message, [], usage=self._current_usage())
+                    yield AgentLoopEvent.agent_end(self.messages, usage=self._current_usage())
                     return
                 messages_after_turn = await self.hooks.after_model_turn(model_turn, self.messages)
             except Exception as e:
-                yield AgentLoopEvent.run_failed(str(e), code="runner.error")
+                yield AgentLoopEvent.run_failed(str(e), code="runner.error", usage=self._current_usage())
                 return
             has_follow_up_messages = len(messages_after_turn) > len(self.messages)
             self.messages = [message.model_copy(deep=True) for message in messages_after_turn]
 
             pending_tool_calls = model_turn.tool_calls
             if not pending_tool_calls:
-                yield AgentLoopEvent.turn_end(model_turn.message, [])
+                yield AgentLoopEvent.turn_end(model_turn.message, [], usage=self._current_usage())
                 if has_follow_up_messages:
                     pending_tool_calls = None
                     continue
-                yield AgentLoopEvent.agent_end(self.messages)
+                yield AgentLoopEvent.agent_end(self.messages, usage=self._current_usage())
                 return
 
             visible_content_prefix += model_turn.visible_content
@@ -317,10 +336,10 @@ class AgentLoop:
                     async for event in self._execute_tool_batch(pending_tool_calls, last_model_turn):
                         yield event
                 except Exception as e:
-                    yield AgentLoopEvent.run_failed(str(e), code="runner.tool_error")
+                    yield AgentLoopEvent.run_failed(str(e), code="runner.tool_error", usage=self._current_usage())
                     return
                 if self._last_tool_batch_terminates:
-                    yield AgentLoopEvent.agent_end(self.messages)
+                    yield AgentLoopEvent.agent_end(self.messages, usage=self._current_usage())
                     return
 
             yield AgentLoopEvent.turn_start()
@@ -347,34 +366,71 @@ class AgentLoop:
                     if not context_retry_used and await self._recover_context_overflow(e):
                         context_retry_used = True
                         continue
-                    yield AgentLoopEvent.run_failed(str(e), code="runner.llm_error", retryable=e.retryable)
+                    yield AgentLoopEvent.run_failed(
+                        str(e),
+                        code="runner.llm_error",
+                        retryable=e.retryable,
+                        usage=self._current_usage(),
+                    )
                     return
                 except Exception as e:
-                    yield AgentLoopEvent.run_failed(str(e), code="runner.error")
+                    yield AgentLoopEvent.run_failed(str(e), code="runner.error", usage=self._current_usage())
                     return
 
             committed_model_id = model_turn.committed_model_id or committed_model_id
+            self._record_usage(model_turn.usage)
             self.messages.append(model_turn.message)
             last_model_turn = model_turn
             yield AgentLoopEvent.message_end(model_turn.message)
 
             try:
                 if await self.hooks.should_stop_after_turn(model_turn, self.messages):
-                    yield AgentLoopEvent.turn_end(model_turn.message, [])
-                    yield AgentLoopEvent.agent_end(self.messages)
+                    yield AgentLoopEvent.turn_end(model_turn.message, [], usage=self._current_usage())
+                    yield AgentLoopEvent.agent_end(self.messages, usage=self._current_usage())
                     return
                 messages_after_turn = await self.hooks.after_model_turn(model_turn, self.messages)
             except Exception as e:
-                yield AgentLoopEvent.run_failed(str(e), code="runner.error")
+                yield AgentLoopEvent.run_failed(str(e), code="runner.error", usage=self._current_usage())
                 return
             has_follow_up_messages = len(messages_after_turn) > len(self.messages)
             self.messages = [message.model_copy(deep=True) for message in messages_after_turn]
 
             pending_tool_calls = model_turn.tool_calls
             if not pending_tool_calls:
-                yield AgentLoopEvent.turn_end(model_turn.message, [])
+                yield AgentLoopEvent.turn_end(model_turn.message, [], usage=self._current_usage())
                 if has_follow_up_messages:
                     pending_tool_calls = None
                     continue
-                yield AgentLoopEvent.agent_end(self.messages)
+                yield AgentLoopEvent.agent_end(self.messages, usage=self._current_usage())
                 return
+
+
+def _merge_usage(
+    current: dict[str, typing.Any] | None,
+    usage: dict[str, typing.Any],
+) -> dict[str, typing.Any]:
+    merged = dict(current or {})
+    calls = int(merged.get("model_calls") or 0) + 1
+    merged["model_calls"] = calls
+
+    turns = merged.get("turns")
+    if not isinstance(turns, list):
+        turns = []
+    turns.append(dict(usage))
+    merged["turns"] = turns
+
+    for key, value in usage.items():
+        if key in {"model_calls", "turns"}:
+            continue
+        if not _is_number(value):
+            if key not in merged:
+                merged[key] = value
+            continue
+        existing = merged.get(key)
+        merged[key] = (existing if _is_number(existing) else 0) + value
+
+    return merged
+
+
+def _is_number(value: typing.Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float))
