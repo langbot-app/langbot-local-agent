@@ -26,7 +26,7 @@ from pkg.agent_core import (
 )
 from pkg.agent_core.langbot import LangBotSteeringPuller
 from pkg.context_pipeline import ContextBudget
-from pkg.model_calling import INTERNAL_ARTIFACT_READ_TOOL_NAME, ModelCallError
+from pkg.model_calling import INTERNAL_ARTIFACT_READ_TOOL_NAME, ModelCallError, StreamingModelCaller
 
 
 async def _collect_events(loop: AgentLoop):
@@ -173,6 +173,60 @@ async def test_streaming_loop_emits_turn_message_and_tool_events():
     ]
     assert deltas == ["Checking", "CheckingDone"]
     api.call_tool.assert_awaited_once_with(tool_name="allowed_tool", parameters={"arg": "value"})
+
+
+@pytest.mark.asyncio
+async def test_streaming_model_empty_first_stream_falls_back():
+    class StreamingAPI:
+        def __init__(self):
+            self.model_ids: list[str] = []
+
+        def invoke_llm_stream(self, *, llm_model_uuid, messages, funcs, remove_think):
+            self.model_ids.append(llm_model_uuid)
+
+            async def stream():
+                if llm_model_uuid == "model-1":
+                    return
+                    yield
+                yield MessageChunk(role="assistant", content="fallback response", is_final=True)
+
+            return stream()
+
+    api = StreamingAPI()
+    caller = StreamingModelCaller(
+        api,
+        model_ids=["model-1", "model-2"],
+        messages=[Message(role="user", content="hello")],
+    )
+
+    chunks = []
+    async for chunk, _ in caller.stream():
+        chunks.append(chunk)
+
+    assert api.model_ids == ["model-1", "model-2"]
+    assert chunks[-1].content == "fallback response"
+    assert caller.get_committed_model_id() == "model-2"
+
+
+@pytest.mark.asyncio
+async def test_streaming_model_all_empty_streams_fail():
+    class StreamingAPI:
+        def invoke_llm_stream(self, *, llm_model_uuid, messages, funcs, remove_think):
+            async def stream():
+                return
+                yield
+
+            return stream()
+
+    caller = StreamingModelCaller(
+        StreamingAPI(),
+        model_ids=["model-1", "model-2"],
+        messages=[Message(role="user", content="hello")],
+    )
+
+    with pytest.raises(ModelCallError, match="All models failed"):
+        async for _chunk, _ in caller.stream():
+            pass
 
 
 @pytest.mark.asyncio
@@ -926,6 +980,47 @@ async def test_loop_converts_prepare_next_turn_hook_exception_to_run_failed():
     assert events[-1].type == AgentLoopEventType.RUN_FAILED
     assert events[-1].code == "runner.tool_error"
     assert "next turn preparation failed" in events[-1].error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method_name", ["should_stop_after_turn", "after_model_turn"])
+async def test_loop_converts_after_model_hook_exception_to_run_failed(method_name):
+    class DoneModelAdapter:
+        async def invoke_turn(self, *, model_ids, messages, tools):
+            return ModelTurnResult(
+                message=Message(role="assistant", content="Done"),
+                tool_calls=[],
+                committed_model_id="model-1",
+                visible_content="Done",
+            )
+
+    class FailingHooks(AgentLoopHooks):
+        async def should_stop_after_turn(self, result, messages):
+            if method_name == "should_stop_after_turn":
+                raise RuntimeError("stop hook failed")
+            return False
+
+        async def after_model_turn(self, result, messages):
+            if method_name == "after_model_turn":
+                raise RuntimeError("after model hook failed")
+            return [message.model_copy(deep=True) for message in messages]
+
+    loop = AgentLoop(
+        model_adapter=DoneModelAdapter(),
+        tool_executor=LangBotToolExecutor(AsyncMock(), set()),
+        model_ids=["model-1"],
+        messages=[Message(role="user", content="hello")],
+        tools=[],
+        streaming=False,
+        max_tool_iterations=10,
+        hooks=FailingHooks(),
+    )
+
+    events = await _collect_events(loop)
+
+    assert events[-1].type == AgentLoopEventType.RUN_FAILED
+    assert events[-1].code == "runner.error"
+    assert "hook failed" in events[-1].error
 
 
 @pytest.mark.asyncio
