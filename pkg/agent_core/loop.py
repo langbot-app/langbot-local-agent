@@ -270,11 +270,15 @@ class AgentLoop:
             last_model_turn = model_turn
             yield AgentLoopEvent.message_end(model_turn.message)
 
-            if await self.hooks.should_stop_after_turn(model_turn, self.messages):
-                yield AgentLoopEvent.turn_end(model_turn.message, [])
-                yield AgentLoopEvent.agent_end(self.messages)
+            try:
+                if await self.hooks.should_stop_after_turn(model_turn, self.messages):
+                    yield AgentLoopEvent.turn_end(model_turn.message, [])
+                    yield AgentLoopEvent.agent_end(self.messages)
+                    return
+                messages_after_turn = await self.hooks.after_model_turn(model_turn, self.messages)
+            except Exception as e:
+                yield AgentLoopEvent.run_failed(str(e), code="runner.error")
                 return
-            messages_after_turn = await self.hooks.after_model_turn(model_turn, self.messages)
             has_follow_up_messages = len(messages_after_turn) > len(self.messages)
             self.messages = [message.model_copy(deep=True) for message in messages_after_turn]
 
@@ -354,11 +358,15 @@ class AgentLoop:
             last_model_turn = model_turn
             yield AgentLoopEvent.message_end(model_turn.message)
 
-            if await self.hooks.should_stop_after_turn(model_turn, self.messages):
-                yield AgentLoopEvent.turn_end(model_turn.message, [])
-                yield AgentLoopEvent.agent_end(self.messages)
+            try:
+                if await self.hooks.should_stop_after_turn(model_turn, self.messages):
+                    yield AgentLoopEvent.turn_end(model_turn.message, [])
+                    yield AgentLoopEvent.agent_end(self.messages)
+                    return
+                messages_after_turn = await self.hooks.after_model_turn(model_turn, self.messages)
+            except Exception as e:
+                yield AgentLoopEvent.run_failed(str(e), code="runner.error")
                 return
-            messages_after_turn = await self.hooks.after_model_turn(model_turn, self.messages)
             has_follow_up_messages = len(messages_after_turn) > len(self.messages)
             self.messages = [message.model_copy(deep=True) for message in messages_after_turn]
 

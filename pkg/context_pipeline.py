@@ -27,6 +27,7 @@ DEFAULT_CONTEXT_WINDOW_TOKENS = 200_000
 DEFAULT_CONTEXT_RESERVE_TOKENS = 16_384
 DEFAULT_CONTEXT_KEEP_RECENT_TOKENS = 20_000
 DEFAULT_CONTEXT_SUMMARY_TOKENS = 8_000
+RAG_CONTEXT_MAX_INPUT_FRACTION = 4
 
 ESTIMATED_ATTACHMENT_CHARS = 4800
 ESTIMATED_ATTACHMENT_TOKENS = 1600
@@ -663,6 +664,7 @@ class ContextCompactor:
                 compacted_message_count=0,
             )
 
+        rag = self._fit_rag_before_history_budget(prompt=prompt, history=history, rag=rag, current=current)
         history_budget = max(self.budget.input_tokens - estimate_messages_tokens(prompt + rag + current), 0)
         if not history:
             return self._build_assembly(
@@ -741,6 +743,7 @@ class ContextCompactor:
                 compacted_message_count=0,
             )
 
+        rag = self._fit_rag_before_history_budget(prompt=prompt, history=history, rag=rag, current=current)
         history_budget = max(self.budget.input_tokens - estimate_messages_tokens(prompt + rag + current), 0)
         if not history:
             return self._build_assembly(
@@ -841,6 +844,29 @@ class ContextCompactor:
             diagnostics=diagnostics,
         )
 
+    def _fit_rag_before_history_budget(
+        self,
+        *,
+        prompt: list[Message],
+        history: list[Message],
+        rag: list[Message],
+        current: list[Message],
+    ) -> list[Message]:
+        if not self.budget.enabled or not rag:
+            return rag
+
+        available_after_fixed = self.budget.input_tokens - estimate_messages_tokens(prompt + current)
+        if available_after_fixed <= 0:
+            return []
+
+        if not history:
+            return _fit_messages_to_budget(rag, available_after_fixed, keep_tail=False)
+
+        history_reserve = min(self.budget.keep_recent_tokens, max(1, available_after_fixed // 2))
+        rag_budget = max(available_after_fixed - history_reserve, 0)
+        rag_budget = min(rag_budget, max(1, self.budget.input_tokens // RAG_CONTEXT_MAX_INPUT_FRACTION))
+        return _fit_messages_to_budget(rag, rag_budget, keep_tail=False)
+
     def _fit_frame_to_budget(
         self,
         *,
@@ -857,17 +883,17 @@ class ContextCompactor:
         if estimate_messages_tokens(prompt + summaries + history + rag + current) <= input_budget:
             return prompt, summaries, history, rag, current
 
-        summaries = _fit_messages_to_budget(
-            summaries,
-            input_budget - estimate_messages_tokens(prompt + history + rag + current),
+        rag = _fit_messages_to_budget(
+            rag,
+            input_budget - estimate_messages_tokens(prompt + summaries + history + current),
             keep_tail=False,
         )
         if estimate_messages_tokens(prompt + summaries + history + rag + current) <= input_budget:
             return prompt, summaries, history, rag, current
 
-        rag = _fit_messages_to_budget(
-            rag,
-            input_budget - estimate_messages_tokens(prompt + summaries + history + current),
+        summaries = _fit_messages_to_budget(
+            summaries,
+            input_budget - estimate_messages_tokens(prompt + history + rag + current),
             keep_tail=False,
         )
         if estimate_messages_tokens(prompt + summaries + history + rag + current) <= input_budget:

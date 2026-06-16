@@ -110,8 +110,12 @@ class AgentRunAssembler:
     def _streaming_supported(self) -> bool:
         metadata = getattr(self.ctx.runtime, "metadata", {}) or {}
         if not isinstance(metadata, dict):
-            return True
-        return bool(metadata.get("streaming_supported", True))
+            runtime_supported = True
+        else:
+            runtime_supported = bool(metadata.get("streaming_supported", True))
+        delivery = getattr(self.ctx, "delivery", None)
+        delivery_supported = bool(getattr(delivery, "supports_streaming", False))
+        return runtime_supported and delivery_supported
 
     async def _build_tools(self, allowed_tools: set[str], artifact_read_available: bool) -> list[LLMTool]:
         host_tool_names = {tool_name for tool_name in allowed_tools if tool_name != INTERNAL_ARTIFACT_READ_TOOL_NAME}

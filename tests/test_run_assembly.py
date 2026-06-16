@@ -56,6 +56,23 @@ async def test_assembler_builds_authorized_loop_inputs_with_artifact_read_tool()
 
 
 @pytest.mark.asyncio
+async def test_assembler_disables_streaming_when_delivery_does_not_support_it() -> None:
+    api = FakeAgentRunAPIProxy(
+        models=[ModelResource(model_id="model-primary")],
+    )
+    ctx = make_context(
+        config={"model": {"primary": "model-primary", "fallbacks": []}},
+        resources=AgentResources(models=[ModelResource(model_id="model-primary")]),
+        runtime_metadata={"streaming_supported": True},
+        delivery_supports_streaming=False,
+    )
+
+    assembly = await AgentRunAssembler(api, ctx).assemble()
+
+    assert assembly.streaming is False
+
+
+@pytest.mark.asyncio
 async def test_assembler_omits_internal_artifact_tool_when_host_api_is_unavailable() -> None:
     api = FakeAgentRunAPIProxy(
         models=[ModelResource(model_id="model-primary")],

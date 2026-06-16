@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import typing
 from dataclasses import dataclass, field, replace
@@ -111,7 +112,18 @@ def format_rag_chunks(chunks: list[RagChunk]) -> str:
     if not chunks:
         return ""
 
-    return "\n\n".join(f"[{index}] {chunk.content}" for index, chunk in enumerate(chunks, start=1))
+    return json.dumps(
+        {
+            "chunks": [
+                {
+                    "index": index,
+                    "content": chunk.content,
+                }
+                for index, chunk in enumerate(chunks, start=1)
+            ]
+        },
+        ensure_ascii=False,
+    )
 
 
 def _chunk_from_result(kb_id: str, source_index: int, entry: typing.Any) -> RagChunk | None:

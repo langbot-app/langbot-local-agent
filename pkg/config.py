@@ -7,6 +7,7 @@ import typing
 DEFAULT_MAX_TOOL_ITERATIONS = 20
 DEFAULT_MAX_TOOL_RESULT_CHARS = 20000
 DEFAULT_MAX_TOOL_RESULT_ARTIFACT_BYTES = 1_048_576
+DEFAULT_RUN_TIMEOUT_SECONDS = 300
 DEFAULT_TOOL_EXECUTION_MODE = "parallel"
 VALID_TOOL_EXECUTION_MODES = {"parallel", "serial"}
 
@@ -125,6 +126,11 @@ def get_retrieval_top_k(config: dict[str, typing.Any]) -> int:
 def get_max_tool_iterations(config: dict[str, typing.Any]) -> int:
     """Get the maximum number of tool-call follow-up iterations."""
     return _positive_int(config.get("max-tool-iterations"), default=DEFAULT_MAX_TOOL_ITERATIONS)
+
+
+def get_run_timeout_seconds(config: dict[str, typing.Any]) -> int:
+    """Get the maximum wall-clock seconds for one agent run."""
+    return _positive_int(config.get("timeout"), default=DEFAULT_RUN_TIMEOUT_SECONDS)
 
 
 def get_tool_execution_mode(config: dict[str, typing.Any]) -> str:

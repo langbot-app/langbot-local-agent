@@ -313,9 +313,22 @@ class StreamingModelCaller:
                 break
 
             except StopAsyncIteration:
-                # Empty stream - treat as success, commit this model
-                self._committed_model_id = model_id
-                return
+                # Empty stream before any model-visible chunk is a model failure.
+                last_error = ModelCallError(
+                    f"Model {model_id} stream ended before first chunk",
+                    retryable=True,
+                )
+                if model_id != self.model_ids[-1]:
+                    logger.warning(
+                        "Streaming LLM model ended before first chunk; falling back to next configured model: %s",
+                        model_id,
+                    )
+                else:
+                    logger.warning(
+                        "Streaming LLM model ended before first chunk and no fallback remains: %s",
+                        model_id,
+                    )
+                continue
             except Exception as e:
                 # Failure before first chunk - try next model
                 last_error = e
@@ -695,9 +708,14 @@ def _normalize_stream_chunk(raw_chunk: typing.Any) -> tuple[MessageChunk | None,
         return raw_chunk, _normalize_usage(_model_or_mapping_get(raw_chunk, "usage"))
 
     usage = _normalize_usage(_model_or_mapping_get(raw_chunk, "usage"))
-    chunk = _model_or_mapping_get(raw_chunk, "chunk")
+    missing = object()
+    chunk = _model_or_mapping_get(raw_chunk, "chunk", missing)
+    if chunk is missing:
+        chunk = _model_or_mapping_get(raw_chunk, "message", missing)
     if chunk is None:
-        chunk = _model_or_mapping_get(raw_chunk, "message")
+        return None, usage
+    if chunk is missing:
+        chunk = None
     if isinstance(chunk, MessageChunk):
         return chunk, usage
     if isinstance(chunk, dict):

@@ -10,6 +10,7 @@ Supports:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any, AsyncGenerator
@@ -27,13 +28,31 @@ from pkg.agent_core import (
     AgentLoopEventType,
     LangBotModelAdapter,
 )
+from pkg.config import get_run_timeout_seconds
 from pkg.run_assembly import AgentRunAssembler, AgentRunAssembly, NoAuthorizedModelError
 
 logger = logging.getLogger(__name__)
 
 CANCELLED_ERROR = "Run cancellation requested"
 CANCELLED_CODE = "cancelled"
+TIMEOUT_ERROR = "Agent run timed out"
+TIMEOUT_CODE = "runner.timeout"
 INTERRUPT_CHECK_INTERVAL_SECONDS = 0.5
+
+
+class RunCancelledError(Exception):
+    """Raised internally when Host marks the run cancelled."""
+
+
+class RunDeadline:
+    """Wall-clock deadline shared by assembly, model calls, and tool calls."""
+
+    def __init__(self, timeout_seconds: float):
+        self.timeout_seconds = max(0.001, float(timeout_seconds))
+        self._deadline = time.monotonic() + self.timeout_seconds
+
+    def remaining(self) -> float:
+        return max(0.0, self._deadline - time.monotonic())
 
 
 class RunInterruptChecker:
@@ -70,6 +89,42 @@ class RunInterruptChecker:
 
         return _run_cancel_requested(run)
 
+    async def wait_for(self, awaitable: Any, *, deadline: RunDeadline | None = None) -> Any:
+        """Wait for an awaitable while polling Host cancellation and run timeout."""
+        if not self.available and deadline is None:
+            return await awaitable
+
+        task = asyncio.ensure_future(awaitable)
+        try:
+            while True:
+                if self.available and await self.is_cancelled(force=True):
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                    raise RunCancelledError(CANCELLED_ERROR)
+
+                wait_seconds = self.interval_seconds
+                if deadline is not None:
+                    remaining = deadline.remaining()
+                    if remaining <= 0:
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                        raise asyncio.TimeoutError(TIMEOUT_ERROR)
+                    wait_seconds = min(wait_seconds, remaining)
+
+                try:
+                    return await asyncio.wait_for(asyncio.shield(task), timeout=wait_seconds)
+                except asyncio.TimeoutError:
+                    if deadline is not None and deadline.remaining() <= 0:
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                        raise asyncio.TimeoutError(TIMEOUT_ERROR)
+                    continue
+        except BaseException:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            raise
+
 
 def _run_cancel_requested(run: Any) -> bool:
     if run is None:
@@ -104,6 +159,8 @@ class DefaultAgentRunner(AgentRunner):
         """
         api = self.get_run_api(ctx)
         interrupt_checker = RunInterruptChecker(api, ctx)
+        config = ctx.config if isinstance(ctx.config, dict) else {}
+        deadline = RunDeadline(get_run_timeout_seconds(config))
 
         if await interrupt_checker.is_cancelled(force=True):
             yield AgentRunResult.run_failed(
@@ -115,12 +172,30 @@ class DefaultAgentRunner(AgentRunner):
             return
 
         try:
-            assembly = await AgentRunAssembler(api, ctx).assemble()
+            assembly = await interrupt_checker.wait_for(
+                AgentRunAssembler(api, ctx).assemble(),
+                deadline=deadline,
+            )
         except NoAuthorizedModelError:
             yield AgentRunResult.run_failed(
                 ctx.run_id,
                 error="No authorized model for local-agent",
                 code="runner.no_model",
+            )
+            return
+        except RunCancelledError:
+            yield _cancelled_result(ctx.run_id)
+            return
+        except asyncio.TimeoutError:
+            yield _timeout_result(ctx.run_id)
+            return
+        except Exception as e:
+            logger.exception("Agent run assembly failed")
+            yield AgentRunResult.run_failed(
+                ctx.run_id,
+                error=str(e) or "Agent run assembly failed",
+                code="runner.error",
+                retryable=False,
             )
             return
 
@@ -133,13 +208,29 @@ class DefaultAgentRunner(AgentRunner):
             )
             return
 
-        async for result in self._run_agent_loop(
-            run_id=ctx.run_id,
-            api=api,
-            assembly=assembly,
-            interrupt_checker=interrupt_checker,
-        ):
-            yield result
+        try:
+            results = self._run_agent_loop(
+                run_id=ctx.run_id,
+                api=api,
+                assembly=assembly,
+                interrupt_checker=interrupt_checker,
+            )
+            async for result in _iterate_with_run_controls(results, interrupt_checker, deadline):
+                yield result
+                if _is_terminal_result(result):
+                    return
+        except RunCancelledError:
+            yield _cancelled_result(ctx.run_id)
+        except asyncio.TimeoutError:
+            yield _timeout_result(ctx.run_id)
+        except Exception as e:
+            logger.exception("Agent run failed")
+            yield AgentRunResult.run_failed(
+                ctx.run_id,
+                error=str(e) or "Agent run failed",
+                code="runner.error",
+                retryable=False,
+            )
 
     async def _run_agent_loop(
         self,
@@ -211,6 +302,14 @@ class DefaultAgentRunner(AgentRunner):
                 final_message = event.message
 
             if event.type == AgentLoopEventType.AGENT_END:
+                if interrupt_checker is not None and await interrupt_checker.is_cancelled(force=True):
+                    yield AgentRunResult.run_failed(
+                        run_id,
+                        error=CANCELLED_ERROR,
+                        code=CANCELLED_CODE,
+                        retryable=False,
+                    )
+                    return
                 if not assembly.streaming and final_message is not None:
                     yield AgentRunResult.message_completed(run_id, final_message)
                 yield AgentRunResult.run_completed(run_id, finish_reason="stop")
@@ -257,3 +356,43 @@ def _tool_event_result_payload(result: Any) -> dict[str, Any] | None:
     if result is None or isinstance(result, dict):
         return result
     return {"value": result}
+
+
+async def _iterate_with_run_controls(
+    results: AsyncGenerator[AgentRunResult, None],
+    interrupt_checker: RunInterruptChecker,
+    deadline: RunDeadline,
+) -> AsyncGenerator[AgentRunResult, None]:
+    iterator = results.__aiter__()
+    try:
+        while True:
+            try:
+                yield await interrupt_checker.wait_for(iterator.__anext__(), deadline=deadline)
+            except StopAsyncIteration:
+                return
+    except BaseException:
+        await iterator.aclose()
+        raise
+
+
+def _cancelled_result(run_id: str) -> AgentRunResult:
+    return AgentRunResult.run_failed(
+        run_id,
+        error=CANCELLED_ERROR,
+        code=CANCELLED_CODE,
+        retryable=False,
+    )
+
+
+def _timeout_result(run_id: str) -> AgentRunResult:
+    return AgentRunResult.run_failed(
+        run_id,
+        error=TIMEOUT_ERROR,
+        code=TIMEOUT_CODE,
+        retryable=True,
+    )
+
+
+def _is_terminal_result(result: AgentRunResult) -> bool:
+    result_type = getattr(result.type, "value", result.type)
+    return result_type in {"run.failed", "run.completed"}
