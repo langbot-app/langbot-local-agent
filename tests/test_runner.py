@@ -1637,7 +1637,12 @@ class TestDefaultAgentRunner:
         fake_api = FakeAgentRunAPIProxy(
             models=[ModelResource(model_id="model-1")],
         )
-        fake_api.invoke_llm = AsyncMock(return_value=Message(role="assistant", content="final answer"))
+        fake_api.invoke_llm_with_usage = AsyncMock(
+            return_value={
+                "message": {"role": "assistant", "content": "final answer"},
+                "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+            }
+        )
         run_get_checks = 0
 
         async def run_get(run_id):
@@ -1665,6 +1670,14 @@ class TestDefaultAgentRunner:
 
         assert [result.type for result in results] == [AgentRunResultType.RUN_FAILED]
         assert results[0].data["code"] == "cancelled"
+        assert results[0].usage is not None
+        assert results[0].usage.model_dump(mode="json", exclude_none=True) == {
+            "prompt_tokens": 7,
+            "completion_tokens": 3,
+            "total_tokens": 10,
+            "model_calls": 1,
+            "turns": [{"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}],
+        }
         assert not any(result.type == AgentRunResultType.MESSAGE_COMPLETED for result in results)
         assert not any(result.type == AgentRunResultType.RUN_COMPLETED for result in results)
 

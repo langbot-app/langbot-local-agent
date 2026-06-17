@@ -294,6 +294,7 @@ class DefaultAgentRunner(AgentRunner):
                         error=CANCELLED_ERROR,
                         code=CANCELLED_CODE,
                         retryable=False,
+                        usage=terminal_usage,
                     )
                     return
 
@@ -313,6 +314,7 @@ class DefaultAgentRunner(AgentRunner):
                         error=CANCELLED_ERROR,
                         code=CANCELLED_CODE,
                         retryable=False,
+                        usage=terminal_usage,
                     )
                     return
                 if not assembly.streaming and final_message is not None:
