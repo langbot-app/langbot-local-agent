@@ -13,14 +13,13 @@ from pkg.agent_core import AgentLoopHooks, LangBotContextHooks, LangBotToolExecu
 from pkg.agent_core.langbot import LangBotSteeringPuller
 from pkg.config import (
     get_max_tool_iterations,
-    get_max_tool_result_artifact_bytes,
     get_max_tool_result_chars,
     get_remove_think,
     get_tool_execution_mode,
     parse_model_config,
 )
 from pkg.context_pipeline import ContextAssembler, ContextBudget, LLMContextSummarizer
-from pkg.model_calling import INTERNAL_ARTIFACT_READ_TOOL_NAME, build_artifact_read_tool, build_llm_tools
+from pkg.model_calling import build_llm_tools
 
 
 class NoAuthorizedModelError(Exception):
@@ -55,13 +54,9 @@ class AgentRunAssembler:
             raise NoAuthorizedModelError("No authorized model for local-agent")
 
         allowed_tools = self._allowed_tool_names()
-        artifact_read_available = self._artifact_read_available()
-        if artifact_read_available:
-            allowed_tools.add(INTERNAL_ARTIFACT_READ_TOOL_NAME)
 
         max_tool_iterations = get_max_tool_iterations(self.ctx.config)
         max_tool_result_chars = get_max_tool_result_chars(self.ctx.config)
-        max_tool_result_artifact_bytes = get_max_tool_result_artifact_bytes(self.ctx.config)
         tool_execution_mode = get_tool_execution_mode(self.ctx.config)
         remove_think = get_remove_think(self.ctx.config)
         context_budget = ContextBudget.from_context(self.ctx)
@@ -73,7 +68,7 @@ class AgentRunAssembler:
             budget=context_budget,
             summarizer=summarizer,
         ).assemble()
-        tools = await self._build_tools(allowed_tools, artifact_read_available)
+        tools = await self._build_tools(allowed_tools)
 
         return AgentRunAssembly(
             model_ids=model_ids,
@@ -83,8 +78,6 @@ class AgentRunAssembler:
                 self.api,
                 allowed_tools,
                 max_result_chars=max_tool_result_chars,
-                max_artifact_bytes=max_tool_result_artifact_bytes,
-                artifact_read_available=artifact_read_available,
             ),
             hooks=LangBotContextHooks(
                 context_budget,
@@ -104,9 +97,6 @@ class AgentRunAssembler:
     def _allowed_tool_names(self) -> set[str]:
         return {tool.tool_name for tool in self.api.get_allowed_tools()}
 
-    def _artifact_read_available(self) -> bool:
-        return bool(getattr(self.ctx.context.available_apis, "artifact_read", False))
-
     def _streaming_supported(self) -> bool:
         metadata = getattr(self.ctx.runtime, "metadata", {}) or {}
         if not isinstance(metadata, dict):
@@ -117,12 +107,8 @@ class AgentRunAssembler:
         delivery_supported = bool(getattr(delivery, "supports_streaming", False))
         return runtime_supported and delivery_supported
 
-    async def _build_tools(self, allowed_tools: set[str], artifact_read_available: bool) -> list[LLMTool]:
-        host_tool_names = {tool_name for tool_name in allowed_tools if tool_name != INTERNAL_ARTIFACT_READ_TOOL_NAME}
-        tools = await build_llm_tools(self.api, host_tool_names)
-        if artifact_read_available:
-            tools.append(build_artifact_read_tool())
-        return tools
+    async def _build_tools(self, allowed_tools: set[str]) -> list[LLMTool]:
+        return await build_llm_tools(self.api, allowed_tools)
 
 
 __all__ = ["AgentRunAssembler", "AgentRunAssembly", "NoAuthorizedModelError"]

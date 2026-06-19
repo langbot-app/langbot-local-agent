@@ -126,6 +126,20 @@ class RunInterruptChecker:
             raise
 
 
+class RunUsageTracker:
+    """Share already observed model usage across run-control cancellation paths."""
+
+    def __init__(self):
+        self._usage: dict[str, Any] | None = None
+
+    def update(self, usage: dict[str, Any] | None) -> None:
+        if usage is not None:
+            self._usage = usage
+
+    def current(self) -> dict[str, Any] | None:
+        return dict(self._usage) if self._usage is not None else None
+
+
 def _run_cancel_requested(run: Any) -> bool:
     if run is None:
         return False
@@ -160,7 +174,9 @@ class DefaultAgentRunner(AgentRunner):
         api = self.get_run_api(ctx)
         interrupt_checker = RunInterruptChecker(api, ctx)
         config = ctx.config if isinstance(ctx.config, dict) else {}
-        deadline = RunDeadline(get_run_timeout_seconds(config))
+        timeout_seconds = get_run_timeout_seconds(config)
+        deadline = RunDeadline(timeout_seconds) if timeout_seconds is not None else None
+        usage_tracker = RunUsageTracker()
 
         if await interrupt_checker.is_cancelled(force=True):
             yield AgentRunResult.run_failed(
@@ -214,15 +230,16 @@ class DefaultAgentRunner(AgentRunner):
                 api=api,
                 assembly=assembly,
                 interrupt_checker=interrupt_checker,
+                usage_tracker=usage_tracker,
             )
             async for result in _iterate_with_run_controls(results, interrupt_checker, deadline):
                 yield result
                 if _is_terminal_result(result):
                     return
         except RunCancelledError:
-            yield _cancelled_result(ctx.run_id)
+            yield _cancelled_result(ctx.run_id, usage=usage_tracker.current())
         except asyncio.TimeoutError:
-            yield _timeout_result(ctx.run_id)
+            yield _timeout_result(ctx.run_id, usage=usage_tracker.current())
         except Exception as e:
             logger.exception("Agent run failed")
             yield AgentRunResult.run_failed(
@@ -238,6 +255,7 @@ class DefaultAgentRunner(AgentRunner):
         api: Any,
         assembly: AgentRunAssembly,
         interrupt_checker: RunInterruptChecker | None = None,
+        usage_tracker: RunUsageTracker | None = None,
     ) -> AsyncGenerator[AgentRunResult, None]:
         """Run the LangBot-native Pi-style agent loop."""
         loop = AgentLoop(
@@ -257,6 +275,8 @@ class DefaultAgentRunner(AgentRunner):
         async for event in loop.run():
             if event.usage is not None:
                 terminal_usage = event.usage
+                if usage_tracker is not None:
+                    usage_tracker.update(event.usage)
 
             if interrupt_checker is not None and await interrupt_checker.is_cancelled():
                 yield AgentRunResult.run_failed(
@@ -267,20 +287,6 @@ class DefaultAgentRunner(AgentRunner):
                     usage=terminal_usage,
                 )
                 return
-
-            if event.type == AgentLoopEventType.TOOL_EXECUTION_END and event.artifact is not None:
-                artifact = event.artifact
-                yield AgentRunResult.artifact_created(
-                    run_id,
-                    artifact_id=artifact.artifact_id,
-                    artifact_type=artifact.artifact_type,
-                    mime_type=artifact.mime_type,
-                    name=artifact.name,
-                    size_bytes=artifact.size_bytes,
-                    sha256=artifact.sha256,
-                    metadata=artifact.metadata,
-                    content_base64=artifact.content_base64,
-                )
 
             result = self._loop_event_to_result(run_id, event, streaming=assembly.streaming)
             if result is not None:
@@ -373,7 +379,7 @@ def _tool_event_result_payload(result: Any) -> dict[str, Any] | None:
 async def _iterate_with_run_controls(
     results: AsyncGenerator[AgentRunResult, None],
     interrupt_checker: RunInterruptChecker,
-    deadline: RunDeadline,
+    deadline: RunDeadline | None,
 ) -> AsyncGenerator[AgentRunResult, None]:
     iterator = results.__aiter__()
     try:
@@ -387,21 +393,23 @@ async def _iterate_with_run_controls(
         raise
 
 
-def _cancelled_result(run_id: str) -> AgentRunResult:
+def _cancelled_result(run_id: str, usage: dict[str, Any] | None = None) -> AgentRunResult:
     return AgentRunResult.run_failed(
         run_id,
         error=CANCELLED_ERROR,
         code=CANCELLED_CODE,
         retryable=False,
+        usage=usage,
     )
 
 
-def _timeout_result(run_id: str) -> AgentRunResult:
+def _timeout_result(run_id: str, usage: dict[str, Any] | None = None) -> AgentRunResult:
     return AgentRunResult.run_failed(
         run_id,
         error=TIMEOUT_ERROR,
         code=TIMEOUT_CODE,
         retryable=True,
+        usage=usage,
     )
 
 

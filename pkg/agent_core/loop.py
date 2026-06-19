@@ -8,11 +8,12 @@ import typing
 from langbot_plugin.api.entities.builtin.provider.message import Message, MessageChunk
 from langbot_plugin.api.entities.builtin.resource.tool import LLMTool
 
-from pkg.model_calling import ModelCallError
+from pkg.model_calling import ModelCallError, is_deadline_exceeded_error
 
 from .langbot import LangBotModelAdapter, LangBotToolExecutor
 from .types import (
     AgentLoopEvent,
+    AgentLoopEventType,
     AgentLoopHooks,
     ModelTurnEventType,
     ModelTurnResult,
@@ -119,7 +120,7 @@ class AgentLoop:
         try:
             for completed in asyncio.as_completed(tasks):
                 yield await completed
-        except Exception:
+        except BaseException:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -227,8 +228,10 @@ class AgentLoop:
                 try:
                     async for event in self._execute_tool_batch(pending_tool_calls, last_model_turn):
                         yield event
-                except Exception as e:
-                    yield AgentLoopEvent.run_failed(str(e), code="runner.tool_error", usage=self._current_usage())
+                except BaseException as e:
+                    if isinstance(e, (asyncio.CancelledError, GeneratorExit)) or not isinstance(e, Exception):
+                        raise
+                    yield self._tool_batch_failed_event(e)
                     return
                 if self._last_tool_batch_terminates:
                     yield AgentLoopEvent.agent_end(self.messages, usage=self._current_usage())
@@ -264,10 +267,11 @@ class AgentLoop:
                     if not stream_started and not context_retry_used and await self._recover_context_overflow(e):
                         context_retry_used = True
                         continue
+                    code = "runner.timeout" if e.is_deadline_exceeded else "runner.llm_error"
                     yield AgentLoopEvent.run_failed(
                         str(e),
-                        code="runner.llm_error",
-                        retryable=e.retryable,
+                        code=code,
+                        retryable=True if code == "runner.timeout" else e.retryable,
                         usage=self._current_usage(),
                     )
                     return
@@ -287,7 +291,11 @@ class AgentLoop:
             self._record_usage(model_turn.usage)
             self.messages.append(model_turn.message)
             last_model_turn = model_turn
-            yield AgentLoopEvent.message_end(model_turn.message)
+            yield AgentLoopEvent(
+                type=AgentLoopEventType.MESSAGE_END,
+                message=model_turn.message,
+                usage=self._current_usage(),
+            )
 
             try:
                 if await self.hooks.should_stop_after_turn(model_turn, self.messages):
@@ -335,8 +343,10 @@ class AgentLoop:
                 try:
                     async for event in self._execute_tool_batch(pending_tool_calls, last_model_turn):
                         yield event
-                except Exception as e:
-                    yield AgentLoopEvent.run_failed(str(e), code="runner.tool_error", usage=self._current_usage())
+                except BaseException as e:
+                    if isinstance(e, (asyncio.CancelledError, GeneratorExit)) or not isinstance(e, Exception):
+                        raise
+                    yield self._tool_batch_failed_event(e)
                     return
                 if self._last_tool_batch_terminates:
                     yield AgentLoopEvent.agent_end(self.messages, usage=self._current_usage())
@@ -366,10 +376,11 @@ class AgentLoop:
                     if not context_retry_used and await self._recover_context_overflow(e):
                         context_retry_used = True
                         continue
+                    code = "runner.timeout" if e.is_deadline_exceeded else "runner.llm_error"
                     yield AgentLoopEvent.run_failed(
                         str(e),
-                        code="runner.llm_error",
-                        retryable=e.retryable,
+                        code=code,
+                        retryable=True if code == "runner.timeout" else e.retryable,
                         usage=self._current_usage(),
                     )
                     return
@@ -381,7 +392,11 @@ class AgentLoop:
             self._record_usage(model_turn.usage)
             self.messages.append(model_turn.message)
             last_model_turn = model_turn
-            yield AgentLoopEvent.message_end(model_turn.message)
+            yield AgentLoopEvent(
+                type=AgentLoopEventType.MESSAGE_END,
+                message=model_turn.message,
+                usage=self._current_usage(),
+            )
 
             try:
                 if await self.hooks.should_stop_after_turn(model_turn, self.messages):
@@ -403,6 +418,15 @@ class AgentLoop:
                     continue
                 yield AgentLoopEvent.agent_end(self.messages, usage=self._current_usage())
                 return
+
+    def _tool_batch_failed_event(self, error: BaseException) -> AgentLoopEvent:
+        code = "runner.timeout" if is_deadline_exceeded_error(error) else "runner.tool_error"
+        return AgentLoopEvent.run_failed(
+            str(error),
+            code=code,
+            retryable=code == "runner.timeout",
+            usage=self._current_usage(),
+        )
 
 
 def _merge_usage(

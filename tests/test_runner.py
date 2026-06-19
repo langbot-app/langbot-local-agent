@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
 import os
@@ -22,8 +21,9 @@ from langbot_plugin.api.entities.builtin.agent_runner.context_access import (
     ContextAPICapabilities,
 )
 from langbot_plugin.api.entities.builtin.agent_runner.delivery import DeliveryContext
+from langbot_plugin.api.entities.builtin.agent_runner.errors import AgentAPIError, AgentAPIException
 from langbot_plugin.api.entities.builtin.agent_runner.event import AgentEventContext
-from langbot_plugin.api.entities.builtin.agent_runner.input import AgentInput
+from langbot_plugin.api.entities.builtin.agent_runner.input import AgentInput, InputAttachment
 from langbot_plugin.api.entities.builtin.agent_runner.page_results import HistoryPage
 from langbot_plugin.api.entities.builtin.agent_runner.resources import (
     AgentResources,
@@ -51,12 +51,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pkg.config import (
     DEFAULT_MAX_TOOL_ITERATIONS,
-    DEFAULT_MAX_TOOL_RESULT_ARTIFACT_BYTES,
     DEFAULT_MAX_TOOL_RESULT_CHARS,
     DEFAULT_RUN_TIMEOUT_SECONDS,
     get_knowledge_base_ids,
     get_max_tool_iterations,
-    get_max_tool_result_artifact_bytes,
     get_max_tool_result_chars,
     get_remove_think,
     get_rerank_config,
@@ -89,11 +87,10 @@ from pkg.messages import (
     get_effective_prompt_config,
 )
 from pkg.model_calling import (
-    INTERNAL_ARTIFACT_READ_TOOL_NAME,
-    TOOL_RESULT_ARTIFACT_MARKER,
     TOOL_RESULT_REFERENCE_MARKER,
     TOOL_RESULT_TRUNCATION_MARKER,
     LLMCallResult,
+    ModelCallError,
     StreamingModelCaller,
     build_llm_tools,
     build_tool_call_message,
@@ -132,7 +129,6 @@ class FakeAgentRunAPIProxy:
         self.retrieve_knowledge = AsyncMock()
         self.invoke_rerank = AsyncMock()
         self.get_prompt = AsyncMock(return_value=[])
-        self.artifact_read = AsyncMock()
         self.steering_pull = AsyncMock(return_value={"items": []})
         self.state_get = AsyncMock(return_value={"value": None})
         self.state_set = AsyncMock(return_value={"ok": True})
@@ -170,11 +166,11 @@ def make_context(
     resources: AgentResources | None = None,
     input_text: str = "test input",
     input_contents: list[ContentElement] | None = None,
+    input_attachments: list[InputAttachment] | None = None,
     runtime_metadata: dict[str, Any] | None = None,
     adapter_extra: dict[str, Any] | None = None,
     history_available: bool = False,
     prompt_get: bool = False,
-    artifact_read: bool = False,
     conversation_id: str = "conv-test",
     delivery_supports_streaming: bool | None = None,
 ) -> AgentRunContext:
@@ -189,7 +185,7 @@ def make_context(
             event_type="message.received",
             source="pipeline_adapter",
         ),
-        input=AgentInput(text=input_text, contents=input_contents or []),
+        input=AgentInput(text=input_text, contents=input_contents or [], attachments=input_attachments or []),
         delivery=DeliveryContext(
             surface="pipeline",
             supports_streaming=delivery_supports_streaming,
@@ -201,7 +197,6 @@ def make_context(
                 history_page=history_available,
                 history_search=history_available,
                 prompt_get=prompt_get,
-                artifact_read=artifact_read,
             ),
         ),
         runtime=AgentRuntimeContext(query_id=1, metadata=runtime_metadata or {}),
@@ -269,7 +264,9 @@ class TestParseModelConfig:
     def test_run_timeout_defaults_and_rejects_invalid_values(self):
         assert get_run_timeout_seconds({}) == DEFAULT_RUN_TIMEOUT_SECONDS
         assert get_run_timeout_seconds({"timeout": 12}) == 12
-        assert get_run_timeout_seconds({"timeout": 0}) == DEFAULT_RUN_TIMEOUT_SECONDS
+        assert get_run_timeout_seconds({"timeout": 0}) is None
+        assert get_run_timeout_seconds({"timeout": None}) is None
+        assert get_run_timeout_seconds({"timeout": -1}) == DEFAULT_RUN_TIMEOUT_SECONDS
         assert get_run_timeout_seconds({"timeout": True}) == DEFAULT_RUN_TIMEOUT_SECONDS
 
 
@@ -355,15 +352,6 @@ class TestRunnerBehaviorConfig:
         assert get_max_tool_result_chars({"max-tool-result-chars": 0}) == DEFAULT_MAX_TOOL_RESULT_CHARS
         assert get_max_tool_result_chars({"max-tool-result-chars": "1234"}) == DEFAULT_MAX_TOOL_RESULT_CHARS
 
-    def test_max_tool_result_artifact_bytes(self):
-        assert get_max_tool_result_artifact_bytes({"max-tool-result-artifact-bytes": 1024}) == 1024
-        assert get_max_tool_result_artifact_bytes({"max-tool-result-artifact-bytes": 0}) == (
-            DEFAULT_MAX_TOOL_RESULT_ARTIFACT_BYTES
-        )
-        assert get_max_tool_result_artifact_bytes({"max-tool-result-artifact-bytes": "1024"}) == (
-            DEFAULT_MAX_TOOL_RESULT_ARTIFACT_BYTES
-        )
-
     def test_remove_think(self):
         assert get_remove_think({"remove-think": True}) is True
         assert get_remove_think({"remove-think": False}) is False
@@ -424,6 +412,49 @@ class TestMessageHelpers:
         assert isinstance(message.content, list)
         assert message.content[0].text == "Look at this"
         assert message.content[1].type == "image_base64"
+
+    def test_text_contents_and_attachments_are_preserved_together(self):
+        """AgentInput text, contents, and attachments all reach one current user message."""
+        contents = [
+            ContentElement.from_image_base64("base64-image"),
+            ContentElement.from_text("caption from content"),
+        ]
+        attachments = [
+            InputAttachment(
+                type="image",
+                mime_type="image/png",
+                size=123,
+                name="diagram.png",
+                path="/tmp/langbot-input/diagram.png",
+                content="x" * 2048,
+            )
+        ]
+
+        message = build_user_message(
+            user_text="please inspect the diagram",
+            input_contents=contents,
+            input_attachments=attachments,
+        )
+
+        assert message is not None
+        assert isinstance(message.content, list)
+        assert [part.type for part in message.content] == ["text", "image_base64", "text", "text"]
+        assert message.content[0].text == "please inspect the diagram"
+        assert message.content[1].image_base64 == "base64-image"
+        assert message.content[2].text == "caption from content"
+        attachment_payload = json.loads(message.content[3].text)
+        assert attachment_payload["type"] == "langbot_input_attachments"
+        assert attachment_payload["attachments"] == [
+            {
+                "type": "image",
+                "mime_type": "image/png",
+                "size_bytes": 123,
+                "name": "diagram.png",
+                "path": "/tmp/langbot-input/diagram.png",
+                "inline_content_omitted": True,
+                "inline_content_chars": 2048,
+            }
+        ]
 
     def test_rag_context_message_json_escapes_untrusted_chunk_text(self):
         """Retrieved content is model-facing data, not tag-delimited instructions."""
@@ -792,7 +823,7 @@ class TestContextCompaction:
         assert assembly.messages[-1].content == "current request"
 
     def test_compaction_summary_preserves_machine_readable_refs(self):
-        """Omitted artifact and file refs remain available after compaction."""
+        """Omitted file refs remain available after compaction."""
         tool_call = ToolCall(
             id="call-refs",
             type="function",
@@ -805,28 +836,22 @@ class TestContextCompaction:
                 tool_call_id="call-refs",
                 content=json.dumps(
                     {
-                        "artifact_refs": [
-                            {
-                                "artifact_id": "artifact-1",
-                                "name": "result.txt",
-                                "mime_type": "text/plain",
-                            }
-                        ],
                         "file_refs": [
                             {
-                                "file_key": "sandbox-file-1",
+                                "path": "/workspace/notes.md",
                                 "file_name": "notes.md",
                             }
                         ],
+                        "details": "long checkpoint content " * 80,
                     }
                 ),
             ),
         ]
         budget = ContextBudget(
-            window_tokens=60,
+            window_tokens=90,
             reserve_tokens=10,
             keep_recent_tokens=0,
-            summary_tokens=45,
+            summary_tokens=80,
         )
 
         assembly = ContextCompactor(budget).compact(
@@ -836,10 +861,8 @@ class TestContextCompaction:
         )
 
         assert assembly.summary_message is not None
-        assert "<artifacts>" in assembly.summary_message.content
-        assert "artifact_id=artifact-1" in assembly.summary_message.content
         assert "<files>" in assembly.summary_message.content
-        assert "file_id=sandbox-file-1" in assembly.summary_message.content
+        assert "path=/workspace/notes.md" in assembly.summary_message.content
 
     def test_post_assembly_fit_keeps_context_under_input_budget(self):
         """Prompt, RAG, and current input are hard-bounded after assembly."""
@@ -1061,6 +1084,35 @@ class TestContextAssembler:
     """Tests for structured context assembly."""
 
     @pytest.mark.asyncio
+    async def test_assembler_preserves_text_contents_and_attachments(self):
+        fake_api = FakeAgentRunAPIProxy()
+        ctx = make_context(
+            input_text="current text sentinel",
+            input_contents=[ContentElement.from_image_base64("base64-image")],
+            input_attachments=[
+                InputAttachment(
+                    type="file",
+                    mime_type="text/plain",
+                    size=42,
+                    name="notes.txt",
+                    path="/tmp/langbot-input/notes.txt",
+                )
+            ],
+        )
+
+        assembly = await ContextAssembler(fake_api, ctx).assemble()
+
+        user_message = assembly.messages[-1]
+        assert user_message.role == "user"
+        assert isinstance(user_message.content, list)
+        assert user_message.content[0].text == "current text sentinel"
+        assert user_message.content[1].type == "image_base64"
+        attachment_payload = json.loads(user_message.content[2].text)
+        assert attachment_payload["attachments"][0]["type"] == "file"
+        assert attachment_payload["attachments"][0]["path"] == "/tmp/langbot-input/notes.txt"
+        assert attachment_payload["attachments"][0]["name"] == "notes.txt"
+
+    @pytest.mark.asyncio
     async def test_rag_context_is_separate_from_current_user_message(self):
         """RAG chunks keep metadata internally while rendered context stays stable."""
         fake_api = FakeAgentRunAPIProxy(
@@ -1272,7 +1324,6 @@ class TestDefaultAgentRunner:
             "tools": ["detail", "call"],
             "knowledge_bases": ["list", "retrieve"],
             "history": ["page"],
-            "artifacts": ["read"],
         }
         config_names = {item["name"] for item in manifest["spec"]["config"]}
         assert "remove-think" in config_names
@@ -1283,7 +1334,6 @@ class TestDefaultAgentRunner:
         assert "max-tool-iterations" in config_names
         assert "tool-execution-mode" in config_names
         assert "max-tool-result-chars" in config_names
-        assert "max-tool-result-artifact-bytes" in config_names
         max_tool_iterations = next(item for item in manifest["spec"]["config"] if item["name"] == "max-tool-iterations")
         assert max_tool_iterations["default"] == DEFAULT_MAX_TOOL_ITERATIONS
         tool_execution_mode = next(item for item in manifest["spec"]["config"] if item["name"] == "tool-execution-mode")
@@ -1433,6 +1483,29 @@ class TestDefaultAgentRunner:
         fake_api.invoke_llm.assert_not_called()
         fake_api.invoke_llm_with_usage.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_invoke_deadline_exceeded_stops_fallback_and_maps_code(self):
+        fake_api = FakeAgentRunAPIProxy()
+        fake_api.invoke_llm_with_usage = AsyncMock(
+            side_effect=AgentAPIException(
+                AgentAPIError(
+                    code="deadline_exceeded",
+                    message="Agent run deadline has expired",
+                    retryable=True,
+                )
+            )
+        )
+
+        with pytest.raises(ModelCallError) as exc_info:
+            await invoke_with_fallback_result(
+                fake_api,
+                ["model-1", "model-2"],
+                [Message(role="user", content="hello")],
+            )
+
+        assert getattr(exc_info.value, "code", None) == "deadline_exceeded"
+        assert fake_api.invoke_llm_with_usage.await_count == 1
+
     @pytest.fixture
     def runner(self):
         """Create a runner instance."""
@@ -1511,6 +1584,123 @@ class TestDefaultAgentRunner:
             "error": "Agent run timed out",
             "code": "runner.timeout",
             "retryable": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_timeout_zero_disables_local_runner_deadline(self, runner, monkeypatch):
+        """timeout=0 relies on Host deadline/cancellation instead of local wait_for."""
+        fake_api = FakeAgentRunAPIProxy(
+            models=[ModelResource(model_id="model-1")],
+        )
+
+        async def slow_but_successful_stream(*args, **kwargs):
+            await asyncio.sleep(0.02)
+            yield MessageChunk(role="assistant", content="finished", is_final=True)
+
+        fake_api.invoke_llm_stream = slow_but_successful_stream
+        monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
+
+        ctx = make_context(
+            config={"model": {"primary": "model-1", "fallbacks": []}, "timeout": 0},
+            resources=AgentResources(models=[ModelResource(model_id="model-1")]),
+        )
+
+        results = [result async for result in runner.run(ctx)]
+
+        assert any(result.type == AgentRunResultType.RUN_COMPLETED for result in results)
+        assert not any(
+            result.type == AgentRunResultType.RUN_FAILED and result.data.get("code") == "runner.timeout"
+            for result in results
+        )
+
+    @pytest.mark.asyncio
+    async def test_host_deadline_exceeded_maps_to_runner_timeout(self, runner, monkeypatch):
+        fake_api = FakeAgentRunAPIProxy(
+            models=[ModelResource(model_id="model-1")],
+        )
+        fake_api.invoke_llm_with_usage = AsyncMock(
+            side_effect=AgentAPIException(
+                AgentAPIError(
+                    code="deadline_exceeded",
+                    message="Agent run deadline has expired",
+                    retryable=True,
+                )
+            )
+        )
+        monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
+
+        ctx = make_context(
+            config={"model": {"primary": "model-1", "fallbacks": []}},
+            resources=AgentResources(models=[ModelResource(model_id="model-1")]),
+            runtime_metadata={"streaming_supported": False},
+        )
+
+        results = [result async for result in runner.run(ctx)]
+
+        assert [result.type for result in results] == [AgentRunResultType.RUN_FAILED]
+        assert results[0].data["code"] == "runner.timeout"
+        assert results[0].data["retryable"] is True
+
+    @pytest.mark.asyncio
+    async def test_local_timeout_preserves_prior_model_usage(self, runner, monkeypatch):
+        fake_api = FakeAgentRunAPIProxy(
+            models=[ModelResource(model_id="model-1")],
+            tools=[ToolResource(tool_name="slow_tool")],
+        )
+        fake_api.get_tool_detail = AsyncMock(
+            return_value={
+                "name": "slow_tool",
+                "description": "Slow tool",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        )
+        fake_api.invoke_llm_with_usage = AsyncMock(
+            return_value={
+                "message": {
+                    "role": "assistant",
+                    "content": "Need tool",
+                    "tool_calls": [
+                        {
+                            "id": "call-slow",
+                            "type": "function",
+                            "function": {"name": "slow_tool", "arguments": "{}"},
+                        }
+                    ],
+                },
+                "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+            }
+        )
+
+        async def slow_tool(*args, **kwargs):
+            await asyncio.sleep(3600)
+
+        fake_api.call_tool = AsyncMock(side_effect=slow_tool)
+        monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
+        monkeypatch.setattr("components.agent_runner.default.get_run_timeout_seconds", lambda config: 0.01)
+
+        ctx = make_context(
+            config={"model": {"primary": "model-1", "fallbacks": []}, "timeout": 1},
+            resources=AgentResources(
+                models=[ModelResource(model_id="model-1")],
+                tools=[ToolResource(tool_name="slow_tool")],
+            ),
+            runtime_metadata={"streaming_supported": False},
+        )
+
+        results = [result async for result in runner.run(ctx)]
+
+        assert [result.type for result in results] == [
+            AgentRunResultType.TOOL_CALL_STARTED,
+            AgentRunResultType.RUN_FAILED,
+        ]
+        assert results[-1].data["code"] == "runner.timeout"
+        assert results[-1].usage is not None
+        assert results[-1].usage.model_dump(mode="json", exclude_none=True) == {
+            "prompt_tokens": 7,
+            "completion_tokens": 3,
+            "total_tokens": 10,
+            "model_calls": 1,
+            "turns": [{"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}],
         }
 
     @pytest.mark.asyncio
@@ -1798,7 +1988,6 @@ class TestDefaultAgentRunner:
             conversation_id="conv-test",
             limit=50,
             direction="backward",
-            include_artifacts=True,
         )
         assert [(msg.role, msg.content) for msg in captured_messages] == [
             ("system", "Static prompt"),
@@ -2471,149 +2660,13 @@ class TestDefaultAgentRunner:
         completed = [r for r in results if r.type == AgentRunResultType.TOOL_CALL_COMPLETED]
         result_payload = completed[0].data.get("result")
         assert result_payload["type"] == "langbot_tool_result_preview"
-        assert result_payload["reason"] == "artifact_read_unavailable"
+        assert result_payload["reason"] == "tool_result_truncated"
         assert result_payload["preview"] == "x" * 8
         assert result_payload["original_chars"] == 25
-        assert not [r for r in results if r.type == AgentRunResultType.ARTIFACT_CREATED]
 
     @pytest.mark.asyncio
-    async def test_large_tool_result_becomes_host_artifact_when_read_api_is_available(self, runner, monkeypatch):
-        """Readable Host artifacts carry oversized tool output without runner-local file access."""
-        fake_api = FakeAgentRunAPIProxy(
-            models=[ModelResource(model_id="model-1")],
-            tools=[ToolResource(tool_name="allowed_tool")],
-        )
-        captured_turn_messages: list[list[Message]] = []
-        captured_funcs_by_turn = []
-
-        async def mock_stream(*args, **kwargs):
-            captured_turn_messages.append([message.model_copy(deep=True) for message in kwargs["messages"]])
-            captured_funcs_by_turn.append(list(kwargs.get("funcs", [])))
-            if len(captured_turn_messages) == 1:
-                yield MessageChunk(
-                    role="assistant",
-                    content="",
-                    is_final=True,
-                    tool_calls=[
-                        ToolCall(
-                            id="call-1",
-                            type="function",
-                            function=FunctionCall(name="allowed_tool", arguments="{}"),
-                        )
-                    ],
-                )
-            else:
-                yield MessageChunk(role="assistant", content="Done", is_final=True)
-
-        fake_api.invoke_llm_stream = mock_stream
-        fake_api.call_tool = AsyncMock(return_value="x" * 25)
-        monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
-
-        ctx = make_context(
-            config={"model": {"primary": "model-1", "fallbacks": []}, "max-tool-result-chars": 8},
-            resources=AgentResources(
-                models=[ModelResource(model_id="model-1")],
-                tools=[ToolResource(tool_name="allowed_tool")],
-            ),
-            artifact_read=True,
-        )
-
-        results = [result async for result in runner.run(ctx)]
-
-        first_turn_tool_names = {tool.name for tool in captured_funcs_by_turn[0]}
-        assert "allowed_tool" in first_turn_tool_names
-        assert INTERNAL_ARTIFACT_READ_TOOL_NAME in first_turn_tool_names
-        fetched_tool_names = [call.args[0] for call in fake_api.get_tool_detail.await_args_list]
-        assert fetched_tool_names == ["allowed_tool"]
-
-        artifacts = [r for r in results if r.type == AgentRunResultType.ARTIFACT_CREATED]
-        assert len(artifacts) == 1
-        artifact_data = artifacts[0].data
-        assert artifact_data["artifact_type"] == "tool_result"
-        assert artifact_data["mime_type"] == "text/plain; charset=utf-8"
-        assert artifact_data["size_bytes"] == 25
-        assert base64.b64decode(artifact_data["content_base64"]).decode("utf-8") == "x" * 25
-        assert artifact_data["metadata"]["tool_name"] == "allowed_tool"
-
-        completed = [r for r in results if r.type == AgentRunResultType.TOOL_CALL_COMPLETED]
-        assert completed[0].data["result"]["type"] == "langbot_tool_result_artifact"
-        assert completed[0].data["result"]["artifact"]["artifact_id"] == artifact_data["artifact_id"]
-
-        tool_messages = [message for message in captured_turn_messages[1] if message.role == "tool"]
-        assert len(tool_messages) == 1
-        payload = json.loads(tool_messages[0].content)
-        assert payload["type"] == TOOL_RESULT_ARTIFACT_MARKER
-        assert payload["preview"] == "x" * 8
-        assert payload["artifact"]["artifact_id"] == artifact_data["artifact_id"]
-        assert INTERNAL_ARTIFACT_READ_TOOL_NAME in payload["next_step"]
-
-    @pytest.mark.asyncio
-    async def test_oversized_tool_result_above_inline_artifact_cap_does_not_emit_full_payload(
-        self,
-        runner,
-        monkeypatch,
-    ):
-        """Very large inline results remain previews; sandbox tools should return artifact refs."""
-        fake_api = FakeAgentRunAPIProxy(
-            models=[ModelResource(model_id="model-1")],
-            tools=[ToolResource(tool_name="allowed_tool")],
-        )
-        captured_turn_messages: list[list[Message]] = []
-
-        async def mock_stream(*args, **kwargs):
-            captured_turn_messages.append([message.model_copy(deep=True) for message in kwargs["messages"]])
-            if len(captured_turn_messages) == 1:
-                yield MessageChunk(
-                    role="assistant",
-                    content="",
-                    is_final=True,
-                    tool_calls=[
-                        ToolCall(
-                            id="call-1",
-                            type="function",
-                            function=FunctionCall(name="allowed_tool", arguments="{}"),
-                        )
-                    ],
-                )
-            else:
-                yield MessageChunk(role="assistant", content="Done", is_final=True)
-
-        fake_api.invoke_llm_stream = mock_stream
-        fake_api.call_tool = AsyncMock(return_value="x" * 25)
-        monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
-
-        ctx = make_context(
-            config={
-                "model": {"primary": "model-1", "fallbacks": []},
-                "max-tool-result-chars": 8,
-                "max-tool-result-artifact-bytes": 10,
-            },
-            resources=AgentResources(
-                models=[ModelResource(model_id="model-1")],
-                tools=[ToolResource(tool_name="allowed_tool")],
-            ),
-            artifact_read=True,
-        )
-
-        results = [result async for result in runner.run(ctx)]
-
-        assert not [r for r in results if r.type == AgentRunResultType.ARTIFACT_CREATED]
-        completed = [r for r in results if r.type == AgentRunResultType.TOOL_CALL_COMPLETED]
-        result_payload = completed[0].data.get("result")
-        assert result_payload["type"] == "langbot_tool_result_preview"
-        assert result_payload["reason"] == "artifact_too_large"
-        assert result_payload["preview"] == "x" * 8
-        assert result_payload["original_bytes"] == 25
-        assert "x" * 25 not in str(result_payload)
-
-        tool_messages = [message for message in captured_turn_messages[1] if message.role == "tool"]
-        assert len(tool_messages) == 1
-        assert tool_messages[0].content.startswith("x" * 8)
-        assert "x" * 25 not in tool_messages[0].content
-
-    @pytest.mark.asyncio
-    async def test_tool_result_with_host_refs_is_not_rewrapped_as_runner_artifact(self, runner, monkeypatch):
-        """Sandbox tools can return Host refs directly; runner must not wrap them again."""
+    async def test_tool_result_with_refs_is_passed_as_reference_payload(self, runner, monkeypatch):
+        """Sandbox tools can return refs directly; runner keeps refs plus bounded preview."""
         fake_api = FakeAgentRunAPIProxy(
             models=[ModelResource(model_id="model-1")],
             tools=[ToolResource(tool_name="sandbox_read")],
@@ -2641,19 +2694,9 @@ class TestDefaultAgentRunner:
         fake_api.invoke_llm_stream = mock_stream
         fake_api.call_tool = AsyncMock(
             return_value={
-                "artifact_refs": [
-                    {
-                        "artifact_id": "artifact-big-file",
-                        "artifact_type": "file",
-                        "mime_type": "text/plain",
-                        "size_bytes": 9_000_000,
-                        "name": "big.txt",
-                        "summary": "Large sandbox file result",
-                    }
-                ],
                 "file_refs": [
                     {
-                        "file_key": "sandbox-file-key",
+                        "path": "/workspace/big.txt",
                         "name": "big.txt",
                         "mime_type": "text/plain",
                     }
@@ -2669,17 +2712,14 @@ class TestDefaultAgentRunner:
                 models=[ModelResource(model_id="model-1")],
                 tools=[ToolResource(tool_name="sandbox_read")],
             ),
-            artifact_read=True,
         )
 
         results = [result async for result in runner.run(ctx)]
 
-        assert not [r for r in results if r.type == AgentRunResultType.ARTIFACT_CREATED]
         completed = [r for r in results if r.type == AgentRunResultType.TOOL_CALL_COMPLETED]
         result_payload = completed[0].data.get("result")
         assert result_payload["type"] == TOOL_RESULT_REFERENCE_MARKER
-        assert result_payload["artifact_refs"][0]["artifact_id"] == "artifact-big-file"
-        assert result_payload["file_refs"][0]["file_key"] == "sandbox-file-key"
+        assert result_payload["file_refs"][0]["path"] == "/workspace/big.txt"
         assert result_payload["truncated"] is True
         assert result_payload["preview"]
         assert "x" * 25 not in str(result_payload)
@@ -2688,9 +2728,7 @@ class TestDefaultAgentRunner:
         assert len(tool_messages) == 1
         payload = json.loads(tool_messages[0].content)
         assert payload["type"] == TOOL_RESULT_REFERENCE_MARKER
-        assert payload["artifact_refs"][0]["artifact_id"] == "artifact-big-file"
-        assert payload["file_refs"][0]["file_key"] == "sandbox-file-key"
-        assert "artifact.created" not in tool_messages[0].content
+        assert payload["file_refs"][0]["path"] == "/workspace/big.txt"
 
     @pytest.mark.asyncio
     async def test_authorized_tool_detail_is_fetched_and_passed_to_model(self, runner, monkeypatch):

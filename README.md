@@ -17,12 +17,12 @@ documents how Local Agent consumes that contract:
 - `ctx.event`: event-first metadata for the current trigger.
 - `ctx.conversation`, `ctx.actor`, `ctx.subject`: current run scope metadata.
 - `ctx.input`: current structured input, including text, multimodal contents,
-  and artifact/file references.
+  and lightweight attachment/file references.
 - `ctx.context`: context handles, inline policy, and available pull APIs. Local
   Agent uses the Host history API for conversation history instead of adapter
   bootstrap.
 - `ctx.resources`: run-scoped authorized models, tools, knowledge bases, skills,
-  files, and storage capabilities.
+  and storage capabilities.
 - `ctx.state`: small Host-projected state for the current run.
 - `ctx.runtime`: runtime metadata such as deadline, trace id, query id from
   migration adapter paths, and Host metadata.
@@ -34,8 +34,8 @@ documents how Local Agent consumes that contract:
 
 LangBot does not inline full conversation history by default. When the runner
 needs more context, it should use authorized Host APIs through
-`AgentRunAPIProxy`, for example model, prompt, history, artifact, tool, and
-knowledge-base APIs.
+`AgentRunAPIProxy`, for example model, prompt, history, tool,
+knowledge-base, state, and storage APIs.
 
 AgentRunner components should obtain that proxy with `self.get_run_api(ctx)`.
 They should not use the legacy `self.plugin` proxy that regular non-runner
@@ -60,7 +60,6 @@ plugin components use.
 | max-tool-iterations | integer | no | 20 | Maximum tool-call follow-up iterations |
 | tool-execution-mode | select | no | parallel | Same-batch tool execution: `parallel` or `serial` |
 | max-tool-result-chars | integer | no | 20000 | Maximum serialized tool result characters injected into the next model request |
-| max-tool-result-artifact-bytes | integer | no | 1048576 | Maximum inline artifact payload bytes emitted by the runner for oversized tool text results |
 | context-history-fetch-limit | integer | no | 50 | Transcript messages pulled from the Host history API |
 | context-window-tokens | integer | no | 200000 | Fallback context window, and an upper cap when Host model metadata is available |
 | context-reserve-tokens | integer | no | 16384 | Tokens reserved for the model response and provider overhead, clamped to at most 25% of the effective window |
@@ -97,15 +96,11 @@ manifest-defined `knowledge-bases` binding config.
 `max-tool-result-chars` is a runner-level safety fallback for model-facing tool
 messages. String results, serialized JSON results, and error results are bounded
 before they are appended as `role="tool"` messages for the next model request.
-When Host exposes `ctx.context.available_apis.artifact_read`, oversized
-non-error tool results are emitted as Host `artifact.created` results and the
-model receives only an artifact reference plus a bounded preview. Follow-up
-reads go through the runner-owned `langbot_artifact_read` tool, which calls
-`AgentRunAPIProxy.artifact_read()`. This inline artifact path is capped by
-`max-tool-result-artifact-bytes`; if artifact reads are unavailable or the
-serialized result exceeds that byte cap, Local Agent falls back to a bounded
-preview event and does not emit a full-result payload. Large files should be
-returned by sandbox tools as Host artifact/file references, not inline file
+Oversized non-error tool results are reported as bounded previews; Local Agent
+does not persist runner-owned large-result assets or expose an internal read
+tool for them.
+Large files and generated assets should be returned by sandbox or Host tools as
+sandbox paths, URLs, or other explicit external references, not inline file
 content.
 
 `tool-execution-mode` controls tool calls emitted in the same model turn.
@@ -119,11 +114,10 @@ in that batch sets `terminate: true`; mixed batches continue normally. The hint
 is stripped from the model-facing `role="tool"` message so it does not become
 business data for the next provider request.
 
-When a sandbox or Host tool already returns explicit `artifact_refs`,
-`artifact_id`, `file_refs`, `file_key`, or `file_id` fields, Local Agent treats
-those as authoritative references. It does not create another runner artifact
-for the same tool result; if the surrounding result is large, the model and Host
-events receive the references plus a bounded preview only.
+When a sandbox or Host tool already returns explicit `path` fields, Local Agent
+treats those as authoritative sandbox references. If the surrounding result is
+large, the model and Host events receive those references plus a bounded preview
+only.
 
 ## Context Management
 
@@ -131,10 +125,11 @@ The local agent should be treated as a runner-owned or hybrid-context runner:
 
 - LangBot inlines the current event/input and context handles.
 - The runner pulls transcript history through the authorized Host history API.
-- The runner decides whether to page history, read artifacts, summarize,
-  compact, or construct a model request from scratch.
-- Large files, images, audio, and tool outputs should be consumed as artifact
-  references instead of large inline payloads.
+- The runner decides whether to page history, summarize, compact, or construct
+  a model request from scratch.
+- Large files, images, audio, and tool outputs should be consumed as sandbox
+  paths, URLs, or other explicit references
+  instead of large inline payloads.
 
 Local Agent currently uses a runner-owned context pipeline:
 
@@ -180,7 +175,7 @@ and Host APIs over adapter fields.
 
 ## Host APIs Consumed
 
-Model, prompt, history, state, artifact, tool, knowledge-base, rerank, and
+Model, prompt, history, state, storage, tool, knowledge-base, rerank, and
 steering access go through `AgentRunAPIProxy`. LangBot validates these calls
 with the current `run_id`, run-scoped resource policy / available APIs, and
 caller plugin identity.
@@ -204,11 +199,9 @@ Typical local-agent usage:
 - Retrieve authorized knowledge bases and rerank results.
 - Page transcript history for the model request.
 - Pull authorized steering inputs at turn boundaries.
-- Read artifact content for files, images, or large tool results.
 
 The runner must not bypass `ctx.resources` or call host-private managers to
-access unauthorized models, tools, knowledge bases, files, storage, or platform
-APIs.
+access unauthorized models, tools, knowledge bases, storage, or platform APIs.
 
 ## Capabilities
 
@@ -256,7 +249,7 @@ its host-private structures must not become plugin API.
 We welcome contributions. Useful areas include:
 
 - Protocol v1 adapter fixes
-- history/artifact/state API consumption
+- history/state/storage API consumption
 - tool loop and RAG behavior
 - multimodal input handling
 - focused tests and documentation improvements

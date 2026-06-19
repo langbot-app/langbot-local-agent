@@ -2,19 +2,16 @@
 
 from __future__ import annotations
 
-import base64
-import hashlib
 import json
 import logging
 import re
 import typing
-import uuid
 
 from langbot_plugin.api.entities.builtin.provider.message import ContentElement, Message, MessageChunk
 from langbot_plugin.api.entities.builtin.resource.tool import LLMTool
 from langbot_plugin.api.proxies.agent_run_api import AgentRunAPIProxy, PermissionDeniedError
 
-from pkg.config import DEFAULT_MAX_TOOL_RESULT_ARTIFACT_BYTES, DEFAULT_MAX_TOOL_RESULT_CHARS
+from pkg.config import DEFAULT_MAX_TOOL_RESULT_CHARS
 from pkg.context_pipeline import (
     ContextBudget,
     ContextCompactor,
@@ -24,14 +21,14 @@ from pkg.context_pipeline import (
 )
 from pkg.messages import build_user_message
 from pkg.model_calling import (
-    INTERNAL_ARTIFACT_READ_TOOL_NAME,
     ModelCallError,
     StreamingModelCaller,
-    build_tool_artifact_message,
     build_tool_call_message,
     build_tool_reference_message,
     extract_tool_result_references,
     invoke_with_fallback_result,
+    is_deadline_exceeded_error,
+    model_call_error_from_exception,
     normalize_llm_call_result,
     serialize_tool_result_content,
 )
@@ -43,7 +40,6 @@ from .types import (
     PreparedToolCall,
     ToolCallRequest,
     ToolExecutionOutcome,
-    ToolResultArtifact,
 )
 
 THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
@@ -168,6 +164,8 @@ class LangBotModelAdapter:
                 remove_think=self.remove_think,
             )
         except Exception as e:
+            if is_deadline_exceeded_error(e):
+                raise model_call_error_from_exception(e, prefix="LLM call in tool loop failed") from e
             raise ModelCallError(f"LLM call in tool loop failed: {e}", retryable=True) from e
 
         call_result = normalize_llm_call_result(raw_response)
@@ -191,14 +189,10 @@ class LangBotToolExecutor:
         api: AgentRunAPIProxy,
         allowed_tools: set[str],
         max_result_chars: int = DEFAULT_MAX_TOOL_RESULT_CHARS,
-        max_artifact_bytes: int = DEFAULT_MAX_TOOL_RESULT_ARTIFACT_BYTES,
-        artifact_read_available: bool = False,
     ):
         self.api = api
         self.allowed_tools = allowed_tools
         self.max_result_chars = max_result_chars
-        self.max_artifact_bytes = max_artifact_bytes
-        self.artifact_read_available = artifact_read_available
 
     def prepare(self, request: ToolCallRequest) -> PreparedToolCall:
         parameters: dict[str, typing.Any] = {}
@@ -234,17 +228,16 @@ class LangBotToolExecutor:
             return self.finalize(prepared, result=None, error=prepared.error)
 
         try:
-            if prepared.request.name == INTERNAL_ARTIFACT_READ_TOOL_NAME:
-                result = await self._read_artifact(prepared.parameters)
-            else:
-                result = await self.api.call_tool(
-                    tool_name=prepared.request.name,
-                    parameters=prepared.parameters,
-                )
+            result = await self.api.call_tool(
+                tool_name=prepared.request.name,
+                parameters=prepared.parameters,
+            )
             return self.finalize(prepared, result=result, error=None)
         except PermissionDeniedError as e:
             return self.finalize(prepared, result=None, error=str(e))
         except Exception as e:
+            if is_deadline_exceeded_error(e):
+                raise
             return self.finalize(prepared, result=None, error=f"Tool execution failed: {e}")
 
     def finalize(
@@ -259,7 +252,7 @@ class LangBotToolExecutor:
         model_result = _strip_tool_runtime_hints(result) if error is None else result
         if error is None:
             references = extract_tool_result_references(model_result)
-            if references["artifact_refs"] or references["file_refs"]:
+            if references["file_refs"]:
                 message, event_result = build_tool_reference_message(
                     prepared.request.id,
                     result=model_result,
@@ -279,33 +272,6 @@ class LangBotToolExecutor:
             content = serialize_tool_result_content(model_result, is_error=False)
             if len(content) > self.max_result_chars:
                 preview = content[: self.max_result_chars]
-                content_bytes = content.encode("utf-8")
-                if self.artifact_read_available and len(content_bytes) <= self.max_artifact_bytes:
-                    artifact = self._build_tool_result_artifact(prepared, content, content_bytes=content_bytes)
-                    message = build_tool_artifact_message(
-                        prepared.request.id,
-                        artifact_ref=artifact.to_reference(),
-                        preview=preview,
-                        original_chars=len(content),
-                        kept_chars=len(preview),
-                    )
-                    event_result = {
-                        "type": "langbot_tool_result_artifact",
-                        "artifact": artifact.to_reference(),
-                        "original_chars": len(content),
-                        "kept_preview_chars": len(preview),
-                    }
-                    return ToolExecutionOutcome(
-                        request=prepared.request,
-                        parameters=prepared.parameters,
-                        result=result,
-                        event_result=event_result,
-                        error=None,
-                        message=message,
-                        artifact=artifact,
-                        terminate=terminate,
-                    )
-
                 message = build_tool_call_message(
                     prepared.request.id,
                     prepared.request.name,
@@ -313,13 +279,12 @@ class LangBotToolExecutor:
                     is_error=False,
                     max_result_chars=self.max_result_chars,
                 )
-                reason = "artifact_too_large" if self.artifact_read_available else "artifact_read_unavailable"
                 event_result = {
                     "type": "langbot_tool_result_preview",
                     "truncated": True,
-                    "reason": reason,
+                    "reason": "tool_result_truncated",
                     "original_chars": len(content),
-                    "original_bytes": len(content_bytes),
+                    "original_bytes": len(content.encode("utf-8")),
                     "kept_preview_chars": len(preview),
                     "preview": preview,
                 }
@@ -349,60 +314,6 @@ class LangBotToolExecutor:
             message=message,
             terminate=terminate,
         )
-
-    async def _read_artifact(self, parameters: dict[str, typing.Any]) -> dict[str, typing.Any]:
-        if not self.artifact_read_available:
-            raise PermissionDeniedError("Artifact read API is not available for this run")
-
-        artifact_id = str(parameters.get("artifact_id") or "").strip()
-        if not artifact_id:
-            raise ValueError("artifact_id is required")
-
-        offset = _non_negative_int(parameters.get("offset"), default=0)
-        limit = min(_positive_int(parameters.get("limit"), default=8000), 20_000)
-        result = await self.api.artifact_read(artifact_id=artifact_id, offset=offset, limit=limit)
-
-        content_base64 = _model_or_mapping_get(result, "content_base64")
-        text: str | None = None
-        if isinstance(content_base64, str) and content_base64:
-            text = base64.b64decode(content_base64).decode("utf-8", errors="replace")
-
-        return {
-            "artifact_id": _model_or_mapping_get(result, "artifact_id", artifact_id),
-            "mime_type": _model_or_mapping_get(result, "mime_type"),
-            "size_bytes": _model_or_mapping_get(result, "size_bytes"),
-            "offset": _model_or_mapping_get(result, "offset", offset),
-            "length": _model_or_mapping_get(result, "length"),
-            "has_more": bool(_model_or_mapping_get(result, "has_more", False)),
-            "text": text,
-            "file_key": _model_or_mapping_get(result, "file_key"),
-        }
-
-    def _build_tool_result_artifact(
-        self,
-        prepared: PreparedToolCall,
-        content: str,
-        *,
-        content_bytes: bytes | None = None,
-    ) -> ToolResultArtifact:
-        if content_bytes is None:
-            content_bytes = content.encode("utf-8")
-        artifact_id = f"tool-result-{uuid.uuid4().hex}"
-        return ToolResultArtifact(
-            artifact_id=artifact_id,
-            artifact_type="tool_result",
-            mime_type="text/plain; charset=utf-8",
-            name=f"{prepared.request.name}-{prepared.request.id}.txt",
-            size_bytes=len(content_bytes),
-            sha256=hashlib.sha256(content_bytes).hexdigest(),
-            content_base64=base64.b64encode(content_bytes).decode("ascii"),
-            metadata={
-                "tool_name": prepared.request.name,
-                "tool_call_id": prepared.request.id,
-                "stored_by": "langbot-local-agent",
-            },
-        )
-
 
 class LangBotContextHooks(AgentLoopHooks):
     """LangBot-specific loop hooks for Pi-style per-turn context management."""
@@ -537,9 +448,11 @@ class LangBotSteeringPuller:
 
         text = _model_or_mapping_get(input_data, "text")
         contents = self._content_elements(_model_or_mapping_get(input_data, "contents"))
+        attachments = _model_or_mapping_get(input_data, "attachments")
         return build_user_message(
             user_text=text if isinstance(text, str) else "",
             input_contents=contents,
+            input_attachments=attachments if isinstance(attachments, list) else [],
         )
 
     def _content_elements(self, raw_contents: typing.Any) -> list[ContentElement]:
@@ -556,18 +469,6 @@ class LangBotSteeringPuller:
             except Exception:
                 logger.debug("Ignoring invalid steering content element", exc_info=True)
         return contents
-
-
-def _non_negative_int(value: typing.Any, *, default: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        return default
-    return value
-
-
-def _positive_int(value: typing.Any, *, default: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        return default
-    return value
 
 
 def _model_or_mapping_get(value: typing.Any, key: str, default: typing.Any = None) -> typing.Any:

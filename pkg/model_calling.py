@@ -16,9 +16,7 @@ from langbot_plugin.api.proxies.agent_run_api import AgentRunAPIProxy
 from pkg.config import DEFAULT_MAX_TOOL_RESULT_CHARS
 
 TOOL_RESULT_TRUNCATION_MARKER = "tool result truncated"
-TOOL_RESULT_ARTIFACT_MARKER = "tool result stored as artifact"
 TOOL_RESULT_REFERENCE_MARKER = "tool result references"
-INTERNAL_ARTIFACT_READ_TOOL_NAME = "langbot_artifact_read"
 REFERENCE_RESULT_MAX_REFS = 20
 CONTEXT_OVERFLOW_PATTERNS = (
     "context length",
@@ -55,11 +53,33 @@ class ModelCallError(Exception):
             return True
         return is_context_overflow_error(self)
 
+    @property
+    def is_deadline_exceeded(self) -> bool:
+        return self.code == "deadline_exceeded"
+
 
 def is_context_overflow_error(error: Exception) -> bool:
     """Best-effort provider-neutral context overflow detection."""
     text = str(error).lower()
     return any(pattern in text for pattern in CONTEXT_OVERFLOW_PATTERNS)
+
+
+def is_deadline_exceeded_error(error: BaseException) -> bool:
+    """Return True for SDK/Host deadline_exceeded errors."""
+    sdk_error = getattr(error, "error", None)
+    code = _model_or_mapping_get(sdk_error, "code")
+    if code == "deadline_exceeded":
+        return True
+    return _model_or_mapping_get(error, "code") == "deadline_exceeded"
+
+
+def model_call_error_from_exception(error: BaseException, *, prefix: str | None = None) -> ModelCallError:
+    message = str(error)
+    if prefix:
+        message = f"{prefix}: {message}"
+    if is_deadline_exceeded_error(error):
+        return ModelCallError(message or "Agent run deadline exceeded", retryable=True, code="deadline_exceeded")
+    return ModelCallError(message, retryable=True)
 
 
 async def build_llm_tools(
@@ -104,47 +124,6 @@ async def _build_llm_tool(api: AgentRunAPIProxy, tool_name: str) -> LLMTool | No
         return None
 
 
-def build_artifact_read_tool() -> LLMTool:
-    """Build the runner-owned Host artifact read tool."""
-
-    async def _placeholder_func(**kwargs):
-        return kwargs
-
-    return LLMTool(
-        name=INTERNAL_ARTIFACT_READ_TOOL_NAME,
-        human_desc="Read a slice of a LangBot Host artifact for this run.",
-        description=(
-            "Read a bounded text slice from a LangBot Host artifact by artifact_id. "
-            "Use this when a tool result says the full output was stored as an artifact."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "artifact_id": {
-                    "type": "string",
-                    "description": "Artifact ID returned in a prior tool result reference.",
-                },
-                "offset": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "default": 0,
-                    "description": "Byte offset to start reading from.",
-                },
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 20000,
-                    "default": 8000,
-                    "description": "Maximum bytes to read.",
-                },
-            },
-            "required": ["artifact_id"],
-            "additionalProperties": False,
-        },
-        func=_placeholder_func,
-    )
-
-
 async def invoke_with_fallback(
     api: AgentRunAPIProxy,
     model_ids: list[str],
@@ -181,6 +160,8 @@ async def invoke_with_fallback(
             return response, model_id
         except Exception as e:
             last_error = e
+            if is_deadline_exceeded_error(e):
+                raise model_call_error_from_exception(e)
             if index < len(model_ids) - 1:
                 logger.warning("LLM model failed; falling back to next configured model: %s", model_id, exc_info=True)
             else:
@@ -218,6 +199,8 @@ async def invoke_with_fallback_result(
             return normalize_llm_call_result(response), model_id
         except Exception as e:
             last_error = e
+            if is_deadline_exceeded_error(e):
+                raise model_call_error_from_exception(e)
             if index < len(model_ids) - 1:
                 logger.warning("LLM model failed; falling back to next configured model: %s", model_id, exc_info=True)
             else:
@@ -332,6 +315,8 @@ class StreamingModelCaller:
             except Exception as e:
                 # Failure before first chunk - try next model
                 last_error = e
+                if is_deadline_exceeded_error(e):
+                    raise model_call_error_from_exception(e)
                 if model_id != self.model_ids[-1]:
                     logger.warning(
                         "Streaming LLM model failed before first chunk; falling back to next configured model: %s",
@@ -365,6 +350,11 @@ class StreamingModelCaller:
                 yield chunk, not is_final
         except Exception as e:
             # Post-commit failure - no fallback, raise terminal error
+            if is_deadline_exceeded_error(e):
+                raise model_call_error_from_exception(
+                    e,
+                    prefix=f"Model {model_id} exceeded run deadline after first chunk",
+                )
             raise ModelCallError(
                 f"Model {model_id} failed after first chunk (no fallback possible): {e}",
                 retryable=False,
@@ -505,35 +495,6 @@ def build_tool_call_message(
     )
 
 
-def build_tool_artifact_message(
-    tool_call_id: str,
-    *,
-    artifact_ref: dict[str, typing.Any],
-    preview: str,
-    original_chars: int,
-    kept_chars: int,
-) -> Message:
-    """Build a model-facing tool message that references a Host artifact."""
-    payload = {
-        "type": TOOL_RESULT_ARTIFACT_MARKER,
-        "truncated": True,
-        "original_chars": original_chars,
-        "kept_preview_chars": kept_chars,
-        "artifact": artifact_ref,
-        "preview": preview,
-        "next_step": (
-            f"Use the {INTERNAL_ARTIFACT_READ_TOOL_NAME} tool with this artifact_id "
-            "and an offset/limit when you need more of the full tool output."
-        ),
-    }
-
-    return Message(
-        role="tool",
-        content=json.dumps(payload, ensure_ascii=False),
-        tool_call_id=tool_call_id,
-    )
-
-
 def build_tool_reference_message(
     tool_call_id: str,
     *,
@@ -541,18 +502,16 @@ def build_tool_reference_message(
     references: dict[str, list[dict[str, typing.Any]]],
     max_result_chars: int = DEFAULT_MAX_TOOL_RESULT_CHARS,
 ) -> tuple[Message, dict[str, typing.Any]]:
-    """Build a model-facing tool message for Host/sandbox artifact or file refs."""
+    """Build a model-facing tool message for sandbox/file refs."""
     content = serialize_tool_result_content(result, is_error=False)
     if isinstance(max_result_chars, bool) or not isinstance(max_result_chars, int) or max_result_chars < 1:
         max_result_chars = DEFAULT_MAX_TOOL_RESULT_CHARS
 
     payload: dict[str, typing.Any] = {
         "type": TOOL_RESULT_REFERENCE_MARKER,
-        "artifact_refs": references["artifact_refs"],
         "file_refs": references["file_refs"],
         "original_chars": len(content),
         "next_step": (
-            f"Use {INTERNAL_ARTIFACT_READ_TOOL_NAME} with an artifact_id when you need more artifact content. "
             "For sandbox files, call the sandbox-provided file tools with the returned file reference."
         ),
     }
@@ -580,49 +539,18 @@ def build_tool_reference_message(
 
 
 def extract_tool_result_references(result: typing.Any) -> dict[str, list[dict[str, typing.Any]]]:
-    """Extract explicit Host/sandbox artifact and file references from a tool result."""
-    artifact_refs: list[dict[str, typing.Any]] = []
+    """Extract explicit sandbox path references from a tool result."""
     file_refs: list[dict[str, typing.Any]] = []
-    seen_artifacts: set[str] = set()
     seen_files: set[str] = set()
 
-    def add_artifact_ref(value: dict[str, typing.Any]) -> None:
-        artifact_id = value.get("artifact_id")
-        if not isinstance(artifact_id, str) or not artifact_id or artifact_id in seen_artifacts:
-            return
-        ref = _copy_reference_fields(
-            value,
-            (
-                "artifact_id",
-                "artifact_type",
-                "mime_type",
-                "size",
-                "size_bytes",
-                "name",
-                "source",
-                "url",
-                "sha256",
-                "digest",
-                "summary",
-                "expires_at",
-                "permissions",
-                "metadata",
-            ),
-        )
-        if "size_bytes" not in ref and "size" in ref:
-            ref["size_bytes"] = ref["size"]
-        seen_artifacts.add(artifact_id)
-        artifact_refs.append(ref)
-
     def add_file_ref(value: dict[str, typing.Any]) -> None:
-        file_id = value.get("file_key") or value.get("file_id")
-        if not isinstance(file_id, str) or not file_id or file_id in seen_files:
+        path = value.get("path")
+        if not isinstance(path, str) or not path or path in seen_files:
             return
         ref = _copy_reference_fields(
             value,
             (
-                "file_key",
-                "file_id",
+                "path",
                 "file_name",
                 "name",
                 "mime_type",
@@ -633,16 +561,15 @@ def extract_tool_result_references(result: typing.Any) -> dict[str, list[dict[st
                 "metadata",
             ),
         )
-        seen_files.add(file_id)
+        seen_files.add(path)
         file_refs.append(ref)
 
     def walk(value: typing.Any, depth: int = 0) -> None:
-        if depth > 6 or len(artifact_refs) + len(file_refs) >= REFERENCE_RESULT_MAX_REFS:
+        if depth > 6 or len(file_refs) >= REFERENCE_RESULT_MAX_REFS:
             return
         if isinstance(value, dict):
-            add_artifact_ref(value)
             add_file_ref(value)
-            for key in ("artifact_refs", "artifacts", "file_refs", "files", "attachments", "items", "result"):
+            for key in ("file_refs", "files", "attachments", "items", "result"):
                 nested = value.get(key)
                 if isinstance(nested, (dict, list, tuple)):
                     walk(nested, depth + 1)
@@ -652,7 +579,7 @@ def extract_tool_result_references(result: typing.Any) -> dict[str, list[dict[st
                 walk(item, depth + 1)
 
     walk(result)
-    return {"artifact_refs": artifact_refs, "file_refs": file_refs}
+    return {"file_refs": file_refs}
 
 
 def _normalized_tool_call_id(value: typing.Any) -> str:
@@ -780,8 +707,8 @@ def bound_tool_result_content(
         "\n\n"
         f"[{TOOL_RESULT_TRUNCATION_MARKER}: original_chars={original_chars}, "
         f"kept_chars={len(kept_content)}. "
-        "Only the leading content is included. No readable Host artifact reference was emitted by the runner. "
-        "For large files, tools should return Host artifact or file references instead of inline content.]"
+        "Only the leading content is included. "
+        "For large outputs, tools should return sandbox file references instead of inline content.]"
     )
     return kept_content + marker
 

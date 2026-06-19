@@ -404,6 +404,7 @@ class ContextAssembler:
         user_message = build_user_message(
             user_text=user_text,
             input_contents=self.ctx.input.contents,
+            input_attachments=self.ctx.input.attachments,
         )
         if user_message is not None:
             current_messages.append(user_message)
@@ -472,7 +473,6 @@ class ContextAssembler:
                 "conversation_id": context.conversation_id,
                 "limit": self.budget.history_fetch_limit,
                 "direction": direction,
-                "include_artifacts": True,
             }
             if direction == "forward":
                 kwargs["after_cursor"] = after_cursor
@@ -1522,10 +1522,8 @@ def _attach_summary_references(summary: str | None, messages: list[Message], max
 
 def _summary_reference_block(messages: list[Message]) -> str:
     critical_refs: list[str] = []
-    artifacts: list[str] = []
     files: list[str] = []
     seen_critical_refs: set[str] = set()
-    seen_artifacts: set[str] = set()
     seen_files: set[str] = set()
 
     def add_critical_ref(ref: str) -> None:
@@ -1535,27 +1533,18 @@ def _summary_reference_block(messages: list[Message]) -> str:
         seen_critical_refs.add(ref)
         critical_refs.append(f"- {ref}")
 
-    def add_artifact(value: dict[str, typing.Any]) -> None:
-        artifact_id = value.get("artifact_id")
-        if not isinstance(artifact_id, str) or not artifact_id or artifact_id in seen_artifacts:
-            return
-        seen_artifacts.add(artifact_id)
-        fields = [f"artifact_id={artifact_id}"]
-        artifacts.append("- " + " ".join(str(field) for field in fields))
-
     def add_file(value: dict[str, typing.Any]) -> None:
-        file_id = value.get("file_key") or value.get("file_id")
-        if not isinstance(file_id, str) or not file_id or file_id in seen_files:
+        path = value.get("path")
+        if not isinstance(path, str) or not path or path in seen_files:
             return
-        seen_files.add(file_id)
-        fields = [f"file_id={file_id}"]
+        seen_files.add(path)
+        fields = [f"path={path}"]
         files.append("- " + " ".join(str(field) for field in fields))
 
     def walk(value: typing.Any, depth: int = 0) -> None:
-        if depth > 6 or len(critical_refs) + len(artifacts) + len(files) >= SUMMARY_REFERENCE_LIMIT:
+        if depth > 6 or len(critical_refs) + len(files) >= SUMMARY_REFERENCE_LIMIT:
             return
         if isinstance(value, dict):
-            add_artifact(value)
             add_file(value)
             for nested in value.values():
                 if isinstance(nested, (dict, list, tuple)):
@@ -1571,7 +1560,7 @@ def _summary_reference_block(messages: list[Message]) -> str:
 
     for message in messages:
         if _is_conversation_summary_message(message):
-            _copy_existing_reference_lines(_conversation_summary_body(message), critical_refs, artifacts, files)
+            _copy_existing_reference_lines(_conversation_summary_body(message), critical_refs, files)
         content = message.content
         if isinstance(content, str):
             try:
@@ -1598,9 +1587,6 @@ def _summary_reference_block(messages: list[Message]) -> str:
             + "\n</critical_refs>"
         )
     remaining = max(0, SUMMARY_REFERENCE_LIMIT - len(critical_refs))
-    if artifacts and remaining:
-        blocks.append("<artifacts>\n" + "\n".join(artifacts[:remaining]) + "\n</artifacts>")
-        remaining = max(0, remaining - len(artifacts))
     if files and remaining:
         blocks.append("<files>\n" + "\n".join(files[:remaining]) + "\n</files>")
     return "\n".join(blocks)
@@ -1609,10 +1595,9 @@ def _summary_reference_block(messages: list[Message]) -> str:
 def _copy_existing_reference_lines(
     summary: str,
     critical_refs: list[str],
-    artifacts: list[str],
     files: list[str],
 ) -> None:
-    for tag, target in (("critical_refs", critical_refs), ("artifacts", artifacts), ("files", files)):
+    for tag, target in (("critical_refs", critical_refs), ("files", files)):
         open_tag = f"<{tag}>"
         close_tag = f"</{tag}>"
         if open_tag not in summary or close_tag not in summary:

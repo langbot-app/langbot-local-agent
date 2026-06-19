@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 from unittest.mock import AsyncMock
 
 import pytest
-from langbot_plugin.api.entities.builtin.agent_runner.artifact import ArtifactReadResult
+from langbot_plugin.api.entities.builtin.agent_runner.errors import AgentAPIError, AgentAPIException
 from langbot_plugin.api.entities.builtin.agent_runner.steering import SteeringPullResult
 from langbot_plugin.api.entities.builtin.provider.message import FunctionCall, Message, MessageChunk, ToolCall
 from langbot_plugin.api.proxies.agent_run_api import PermissionDeniedError
@@ -26,7 +25,7 @@ from pkg.agent_core import (
 )
 from pkg.agent_core.langbot import LangBotSteeringPuller
 from pkg.context_pipeline import ContextBudget
-from pkg.model_calling import INTERNAL_ARTIFACT_READ_TOOL_NAME, ModelCallError, StreamingModelCaller
+from pkg.model_calling import ModelCallError, StreamingModelCaller
 
 
 async def _collect_events(loop: AgentLoop):
@@ -440,47 +439,6 @@ async def test_streaming_tool_follow_up_strips_thinking_from_model_context():
 
 
 @pytest.mark.asyncio
-async def test_artifact_read_tool_uses_host_artifact_api_not_tool_call():
-    class FakeAPI:
-        def __init__(self):
-            self.call_tool = AsyncMock()
-            self.artifact_read = AsyncMock(
-                return_value=ArtifactReadResult(
-                    artifact_id="artifact-1",
-                    mime_type="text/plain; charset=utf-8",
-                    size_bytes=11,
-                    offset=2,
-                    length=5,
-                    has_more=True,
-                    content_base64=base64.b64encode("hello".encode("utf-8")).decode("ascii"),
-                )
-            )
-
-    api = FakeAPI()
-    executor = LangBotToolExecutor(
-        api,
-        {INTERNAL_ARTIFACT_READ_TOOL_NAME},
-        artifact_read_available=True,
-    )
-    prepared = executor.prepare(
-        ToolCallRequest(
-            id="call-artifact",
-            name=INTERNAL_ARTIFACT_READ_TOOL_NAME,
-            arguments='{"artifact_id": "artifact-1", "offset": 2, "limit": 5}',
-        )
-    )
-
-    outcome = await executor.execute(prepared)
-
-    assert outcome.error is None
-    assert outcome.result["artifact_id"] == "artifact-1"
-    assert outcome.result["text"] == "hello"
-    assert outcome.result["has_more"] is True
-    api.artifact_read.assert_awaited_once_with(artifact_id="artifact-1", offset=2, limit=5)
-    api.call_tool.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("streaming", [False, True])
 async def test_loop_executes_same_batch_tools_in_parallel_and_preserves_source_order(streaming):
     class BatchModelAdapter:
@@ -590,6 +548,127 @@ async def test_loop_executes_same_batch_tools_in_parallel_and_preserves_source_o
         message.tool_call_id for message in model_adapter.messages_by_turn[1] if message.role == "tool"
     ]
     assert second_model_turn_tool_results == ["call-slow", "call-fast"]
+
+
+@pytest.mark.asyncio
+async def test_loop_cancels_parallel_tool_tasks_when_generator_closes():
+    class ToolBatchModelAdapter:
+        async def invoke_turn(self, *, model_ids, messages, tools):
+            return ModelTurnResult(
+                message=Message(
+                    role="assistant",
+                    content="Need tools",
+                    tool_calls=[
+                        ToolCallRequest(id="call-a", name="tool_a", arguments="{}").to_tool_call(),
+                        ToolCallRequest(id="call-b", name="tool_b", arguments="{}").to_tool_call(),
+                    ],
+                ),
+                tool_calls=[
+                    ToolCallRequest(id="call-a", name="tool_a", arguments="{}"),
+                    ToolCallRequest(id="call-b", name="tool_b", arguments="{}"),
+                ],
+                committed_model_id="model-1",
+            )
+
+    class SleepingToolAPI:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.cancelled: set[str] = set()
+            self.active = 0
+
+        async def call_tool(self, *, tool_name, parameters):
+            self.active += 1
+            if self.active == 2:
+                self.started.set()
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                self.cancelled.add(tool_name)
+                raise
+            finally:
+                self.active -= 1
+
+    api = SleepingToolAPI()
+    loop = AgentLoop(
+        model_adapter=ToolBatchModelAdapter(),
+        tool_executor=LangBotToolExecutor(api, {"tool_a", "tool_b"}),
+        model_ids=["model-1"],
+        messages=[Message(role="user", content="Use tools")],
+        tools=[],
+        streaming=False,
+        max_tool_iterations=10,
+    )
+
+    collected: list[AgentLoopEventType] = []
+    keep_open = asyncio.Event()
+
+    async def consume_until_tools_started():
+        async for event in loop.run():
+            collected.append(event.type)
+            if api.started.is_set():
+                await keep_open.wait()
+
+    task = asyncio.create_task(consume_until_tools_started())
+    await asyncio.wait_for(api.started.wait(), timeout=1)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert AgentLoopEventType.TOOL_EXECUTION_START in collected
+    assert api.cancelled == {"tool_a", "tool_b"}
+    assert api.active == 0
+
+
+@pytest.mark.asyncio
+async def test_tool_deadline_exceeded_maps_to_timeout_with_prior_usage():
+    class ToolDeadlineModelAdapter:
+        def __init__(self):
+            self.turns = 0
+
+        async def invoke_turn(self, *, model_ids, messages, tools):
+            self.turns += 1
+            return ModelTurnResult(
+                message=Message(
+                    role="assistant",
+                    content="Need tool",
+                    tool_calls=[ToolCallRequest(id="call-a", name="tool_a", arguments="{}").to_tool_call()],
+                ),
+                tool_calls=[ToolCallRequest(id="call-a", name="tool_a", arguments="{}")],
+                committed_model_id="model-1",
+                usage={"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
+            )
+
+    class DeadlineToolAPI:
+        async def call_tool(self, *, tool_name, parameters):
+            raise AgentAPIException(
+                AgentAPIError(
+                    code="deadline_exceeded",
+                    message="Agent run deadline has expired",
+                    retryable=True,
+                )
+            )
+
+    loop = AgentLoop(
+        model_adapter=ToolDeadlineModelAdapter(),
+        tool_executor=LangBotToolExecutor(DeadlineToolAPI(), {"tool_a"}),
+        model_ids=["model-1"],
+        messages=[Message(role="user", content="Use tool")],
+        tools=[],
+        streaming=False,
+        max_tool_iterations=10,
+    )
+
+    events = await _collect_events(loop)
+
+    assert events[-1].type == AgentLoopEventType.RUN_FAILED
+    assert events[-1].code == "runner.timeout"
+    assert events[-1].retryable is True
+    assert events[-1].usage == {
+        "model_calls": 1,
+        "turns": [{"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}],
+        "prompt_tokens": 4,
+        "completion_tokens": 2,
+        "total_tokens": 6,
+    }
 
 
 @pytest.mark.asyncio

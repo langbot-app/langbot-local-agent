@@ -6,7 +6,6 @@ import typing
 
 DEFAULT_MAX_TOOL_ITERATIONS = 20
 DEFAULT_MAX_TOOL_RESULT_CHARS = 20000
-DEFAULT_MAX_TOOL_RESULT_ARTIFACT_BYTES = 1_048_576
 DEFAULT_RUN_TIMEOUT_SECONDS = 300
 DEFAULT_TOOL_EXECUTION_MODE = "parallel"
 VALID_TOOL_EXECUTION_MODES = {"parallel", "serial"}
@@ -128,9 +127,23 @@ def get_max_tool_iterations(config: dict[str, typing.Any]) -> int:
     return _positive_int(config.get("max-tool-iterations"), default=DEFAULT_MAX_TOOL_ITERATIONS)
 
 
-def get_run_timeout_seconds(config: dict[str, typing.Any]) -> int:
-    """Get the maximum wall-clock seconds for one agent run."""
-    return _positive_int(config.get("timeout"), default=DEFAULT_RUN_TIMEOUT_SECONDS)
+def get_run_timeout_seconds(config: dict[str, typing.Any]) -> int | None:
+    """Get local runner timeout seconds, or None when disabled.
+
+    Protocol/README behavior treats timeout=0 and timeout=null as an explicit
+    request to rely on Host deadline/cancellation instead of a local wall-clock
+    deadline. Missing or invalid positive config keeps the conservative default.
+    """
+    value = config.get("timeout", DEFAULT_RUN_TIMEOUT_SECONDS)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        return DEFAULT_RUN_TIMEOUT_SECONDS
+    if value == 0:
+        return None
+    if value < 0:
+        return DEFAULT_RUN_TIMEOUT_SECONDS
+    return value
 
 
 def get_tool_execution_mode(config: dict[str, typing.Any]) -> str:
@@ -146,14 +159,6 @@ def get_tool_execution_mode(config: dict[str, typing.Any]) -> str:
 def get_max_tool_result_chars(config: dict[str, typing.Any]) -> int:
     """Get the maximum tool result characters injected into model messages."""
     return _positive_int(config.get("max-tool-result-chars"), default=DEFAULT_MAX_TOOL_RESULT_CHARS)
-
-
-def get_max_tool_result_artifact_bytes(config: dict[str, typing.Any]) -> int:
-    """Get the maximum inline artifact payload bytes emitted by the runner."""
-    return _positive_int(
-        config.get("max-tool-result-artifact-bytes"),
-        default=DEFAULT_MAX_TOOL_RESULT_ARTIFACT_BYTES,
-    )
 
 
 def get_remove_think(config: dict[str, typing.Any]) -> bool:

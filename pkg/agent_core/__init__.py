@@ -13,7 +13,6 @@ from .types import (
     ToolCallRequest,
     ToolExecutionMode,
     ToolExecutionOutcome,
-    ToolResultArtifact,
 )
 
 __all__ = [
@@ -31,5 +30,4 @@ __all__ = [
     "ToolCallRequest",
     "ToolExecutionMode",
     "ToolExecutionOutcome",
-    "ToolResultArtifact",
 ]
