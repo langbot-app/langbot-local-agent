@@ -40,6 +40,8 @@ knowledge-base, state, and storage APIs.
 AgentRunner components should obtain that proxy with `self.get_run_api(ctx)`.
 They should not use the legacy `self.plugin` proxy that regular non-runner
 plugin components use.
+The SDK proxy import path is
+`from langbot_plugin.api.proxies.agent_run import AgentRunAPIProxy`.
 
 ## Runner ID
 

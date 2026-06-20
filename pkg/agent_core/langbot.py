@@ -9,7 +9,7 @@ import typing
 
 from langbot_plugin.api.entities.builtin.provider.message import ContentElement, Message, MessageChunk
 from langbot_plugin.api.entities.builtin.resource.tool import LLMTool
-from langbot_plugin.api.proxies.agent_run_api import AgentRunAPIProxy, PermissionDeniedError
+from langbot_plugin.api.proxies.agent_run import AgentRunAPIProxy, PermissionDeniedError
 
 from pkg.config import DEFAULT_MAX_TOOL_RESULT_CHARS
 from pkg.context_pipeline import (

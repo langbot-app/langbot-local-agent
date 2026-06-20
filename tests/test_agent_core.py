@@ -9,7 +9,7 @@ import pytest
 from langbot_plugin.api.entities.builtin.agent_runner.errors import AgentAPIError, AgentAPIException
 from langbot_plugin.api.entities.builtin.agent_runner.steering import SteeringPullResult
 from langbot_plugin.api.entities.builtin.provider.message import FunctionCall, Message, MessageChunk, ToolCall
-from langbot_plugin.api.proxies.agent_run_api import PermissionDeniedError
+from langbot_plugin.api.proxies.agent_run import PermissionDeniedError
 
 from pkg.agent_core import (
     AgentLoop,

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 
 from langbot_plugin.api.entities.builtin.provider.message import Message, MessageChunk
 from langbot_plugin.api.entities.builtin.resource.tool import LLMTool
-from langbot_plugin.api.proxies.agent_run_api import AgentRunAPIProxy
+from langbot_plugin.api.proxies.agent_run import AgentRunAPIProxy
 
 from pkg.config import DEFAULT_MAX_TOOL_RESULT_CHARS
 

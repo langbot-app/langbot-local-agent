@@ -7,7 +7,7 @@ import logging
 import typing
 from dataclasses import dataclass, field, replace
 
-from langbot_plugin.api.proxies.agent_run_api import AgentRunAPIProxy, PermissionDeniedError
+from langbot_plugin.api.proxies.agent_run import AgentRunAPIProxy, PermissionDeniedError
 
 logger = logging.getLogger(__name__)
 
