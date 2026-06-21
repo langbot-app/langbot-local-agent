@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import typing
 import uuid
 from dataclasses import dataclass
@@ -18,16 +19,41 @@ from pkg.config import DEFAULT_MAX_TOOL_RESULT_CHARS
 TOOL_RESULT_TRUNCATION_MARKER = "tool result truncated"
 TOOL_RESULT_REFERENCE_MARKER = "tool result references"
 REFERENCE_RESULT_MAX_REFS = 20
-CONTEXT_OVERFLOW_PATTERNS = (
-    "context length",
-    "context window",
-    "context too long",
-    "maximum context",
-    "max context",
-    "too many tokens",
-    "token limit",
-    "tokens exceed",
-    "prompt is too long",
+CONTEXT_OVERFLOW_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"prompt is too long", re.IGNORECASE),
+    re.compile(r"request_too_large", re.IGNORECASE),
+    re.compile(r"input is too long for requested model", re.IGNORECASE),
+    re.compile(r"exceeds the context window", re.IGNORECASE),
+    re.compile(
+        r"exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))?",
+        re.IGNORECASE,
+    ),
+    re.compile(r"input token count.*exceeds the maximum", re.IGNORECASE),
+    re.compile(r"maximum prompt length is [\d,]+", re.IGNORECASE),
+    re.compile(r"reduce the length of the messages", re.IGNORECASE),
+    re.compile(r"maximum context length is [\d,]+ tokens", re.IGNORECASE),
+    re.compile(r"exceeds (?:the )?maximum allowed input length of [\d,]+ tokens?", re.IGNORECASE),
+    re.compile(r"input \([\d,]+ tokens\) is longer than the model'?s context length \([\d,]+ tokens\)", re.IGNORECASE),
+    re.compile(r"exceeds the limit of [\d,]+", re.IGNORECASE),
+    re.compile(r"exceeds the available context size", re.IGNORECASE),
+    re.compile(r"greater than the context length", re.IGNORECASE),
+    re.compile(r"context window exceeds limit", re.IGNORECASE),
+    re.compile(r"exceeded model token limit", re.IGNORECASE),
+    re.compile(r"too large for model with [\d,]+ maximum context length", re.IGNORECASE),
+    re.compile(r"model_context_window_exceeded", re.IGNORECASE),
+    re.compile(r"prompt too long; exceeded (?:max )?context length", re.IGNORECASE),
+    re.compile(r"context[_ ]length[_ ]exceeded", re.IGNORECASE),
+    re.compile(r"context (?:length|window|size).*(?:exceeded|too long|overflow)", re.IGNORECASE),
+    re.compile(r"(?:max|maximum) context (?:length|window|size)", re.IGNORECASE),
+    re.compile(r"too many tokens", re.IGNORECASE),
+    re.compile(r"token limit exceeded", re.IGNORECASE),
+    re.compile(r"tokens? exceed(?:s|ed)?", re.IGNORECASE),
+    re.compile(r"^4(?:00|13)\s*(?:status code)?\s*\(no body\)", re.IGNORECASE),
+)
+CONTEXT_NON_OVERFLOW_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^(?:throttling error|service unavailable):", re.IGNORECASE),
+    re.compile(r"rate limit", re.IGNORECASE),
+    re.compile(r"too many requests", re.IGNORECASE),
 )
 
 logger = logging.getLogger(__name__)
@@ -60,8 +86,10 @@ class ModelCallError(Exception):
 
 def is_context_overflow_error(error: Exception) -> bool:
     """Best-effort provider-neutral context overflow detection."""
-    text = str(error).lower()
-    return any(pattern in text for pattern in CONTEXT_OVERFLOW_PATTERNS)
+    text = str(error)
+    if any(pattern.search(text) for pattern in CONTEXT_NON_OVERFLOW_PATTERNS):
+        return False
+    return any(pattern.search(text) for pattern in CONTEXT_OVERFLOW_PATTERNS)
 
 
 def is_deadline_exceeded_error(error: BaseException) -> bool:
@@ -85,32 +113,56 @@ def model_call_error_from_exception(error: BaseException, *, prefix: str | None 
 async def build_llm_tools(
     api: AgentRunAPIProxy,
     allowed_tools: set[str],
+    tool_resources: list | None = None,
 ) -> list[LLMTool]:
     """Build LLMTool list from allowed tool names.
 
-    Fetches tool details from LangBot and converts to LLMTool format
-    for LLM function calling.
+    Prefers the full tool schema the host inlined into ``ctx.resources.tools``
+    (``ToolResource.parameters``); only falls back to a per-tool
+    ``get_tool_detail`` round-trip when the host did not provide it.
 
     Args:
         api: AgentRunAPIProxy for authorized access
         allowed_tools: Set of tool names authorized for this run
+        tool_resources: ctx.resources.tools entries carrying prefilled schemas
 
     Returns:
         List of LLMTool objects ready for LLM invocation
     """
+    prefilled: dict[str, tuple[str, dict]] = {}
+    for res in tool_resources or []:
+        name = getattr(res, "tool_name", None)
+        params = getattr(res, "parameters", None)
+        if name and params is not None:
+            prefilled[name] = (getattr(res, "description", None) or "", params)
+
     tools = await asyncio.gather(
-        *(_build_llm_tool(api, tool_name) for tool_name in sorted(allowed_tools)),
+        *(_build_llm_tool(api, tool_name, prefilled.get(tool_name)) for tool_name in sorted(allowed_tools)),
     )
     return [tool for tool in tools if tool is not None]
 
 
-async def _build_llm_tool(api: AgentRunAPIProxy, tool_name: str) -> LLMTool | None:
+async def _build_llm_tool(
+    api: AgentRunAPIProxy,
+    tool_name: str,
+    prefilled: tuple[str, dict] | None = None,
+) -> LLMTool | None:
+    async def _placeholder_func(**kwargs):
+        return kwargs
+
+    if prefilled is not None:
+        description, parameters = prefilled
+        return LLMTool(
+            name=tool_name,
+            human_desc=description,
+            description=description,
+            parameters=parameters,
+            func=_placeholder_func,
+        )
+
     try:
         detail = await api.get_tool_detail(tool_name)
         description = detail.get("description", "")
-
-        async def _placeholder_func(**kwargs):
-            return kwargs
 
         return LLMTool(
             name=detail.get("name", tool_name),

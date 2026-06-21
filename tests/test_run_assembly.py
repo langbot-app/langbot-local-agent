@@ -80,3 +80,27 @@ async def test_assembler_raises_when_configured_models_are_not_authorized() -> N
         await AgentRunAssembler(api, ctx).assemble()
 
     api.get_tool_detail.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_build_llm_tools_uses_prefilled_schema_without_fetch() -> None:
+    """Host-prefilled ToolResource.parameters avoid a get_tool_detail round-trip."""
+    from unittest.mock import Mock
+
+    from pkg.model_calling import build_llm_tools
+
+    api = Mock()
+    api.get_tool_detail = AsyncMock(side_effect=AssertionError("must not fetch when prefilled"))
+    tool_resources = [
+        ToolResource(
+            tool_name="echo",
+            description="Echo tool",
+            parameters={"type": "object", "properties": {}},
+        ),
+    ]
+
+    tools = await build_llm_tools(api, {"echo"}, tool_resources)
+
+    assert [t.name for t in tools] == ["echo"]
+    assert tools[0].parameters == {"type": "object", "properties": {}}
+    api.get_tool_detail.assert_not_awaited()

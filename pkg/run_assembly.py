@@ -108,7 +108,9 @@ class AgentRunAssembler:
         return runtime_supported and delivery_supported
 
     async def _build_tools(self, allowed_tools: set[str]) -> list[LLMTool]:
-        return await build_llm_tools(self.api, allowed_tools)
+        resources = getattr(self.ctx, "resources", None)
+        tool_resources = getattr(resources, "tools", None) if resources else None
+        return await build_llm_tools(self.api, allowed_tools, tool_resources)
 
 
 __all__ = ["AgentRunAssembler", "AgentRunAssembly", "NoAuthorizedModelError"]
