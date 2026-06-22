@@ -17,6 +17,7 @@ from pkg.config import get_knowledge_base_ids, get_rerank_config, get_retrieval_
 from pkg.messages import (
     build_prompt_messages,
     build_rag_context_message,
+    build_skills_system_message,
     build_user_message,
     get_effective_prompt_config,
 )
@@ -397,6 +398,9 @@ class ContextAssembler:
         history_messages, history_cursors = await self._get_history_messages(checkpoint)
 
         prompt_messages = build_prompt_messages(await self._get_prompt_config())
+        skills_message = build_skills_system_message(self.ctx)
+        if skills_message is not None:
+            prompt_messages = [*prompt_messages, skills_message]
         checkpoint_messages = self._checkpoint_messages(checkpoint)
         checkpoint_cursors = [checkpoint.covers_until for _ in checkpoint_messages] if checkpoint else []
         rag_messages = [rag_message] if rag_message is not None else []

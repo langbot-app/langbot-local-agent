@@ -45,6 +45,73 @@ def build_prompt_messages(
     return messages
 
 
+SKILLS_PROMPT_HEADER = (
+    "The following skills provide specialized instructions for specific tasks. "
+    "When the user's request clearly matches a skill's description, call the "
+    "`activate` tool with the skill's name to load its full instructions. Only "
+    "names and descriptions are shown here; the full instructions arrive as the "
+    "tool result. If no skill clearly matches, proceed normally without "
+    "activating one."
+)
+
+
+def _escape_xml(value: str) -> str:
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
+
+
+def _skill_field(skill: typing.Any, name: str) -> typing.Any:
+    if isinstance(skill, dict):
+        return skill.get(name)
+    return getattr(skill, name, None)
+
+
+def build_skills_system_message(ctx: typing.Any) -> Message | None:
+    """Build a system message advertising the run's authorized skills.
+
+    The host surfaces pipeline-visible skills as run facts in
+    ``ctx.resources.skills`` (``SkillResource``: ``skill_name`` /
+    ``display_name`` / ``description``). Skills are loaded on demand via the
+    ``activate`` tool; this message only injects a name+description index so the
+    model reliably considers skills, following the Agent Skills
+    ``<available_skills>`` convention. Full instructions stay out of context
+    until ``activate`` is called (progressive disclosure).
+
+    This is a runner-owned recall nudge: the host intentionally surfaces skill
+    facts but leaves prompt presentation to each runner. Returns ``None`` when no
+    skills are authorized for the run.
+    """
+    resources = getattr(ctx, "resources", None)
+    skills = getattr(resources, "skills", None) or []
+
+    entries: list[str] = []
+    for skill in skills:
+        skill_name = _skill_field(skill, "skill_name")
+        if not skill_name:
+            continue
+        description = (str(_skill_field(skill, "description") or "")).strip().replace("\n", " ")
+        lines = ["  <skill>", f"    <name>{_escape_xml(str(skill_name))}</name>"]
+        if description:
+            lines.append(f"    <description>{_escape_xml(description)}</description>")
+        lines.append("  </skill>")
+        entries.append("\n".join(lines))
+
+    if not entries:
+        return None
+
+    content = (
+        f"{SKILLS_PROMPT_HEADER}\n\n<available_skills>\n"
+        + "\n".join(entries)
+        + "\n</available_skills>"
+    )
+    return Message(role="system", content=content)
+
+
 def build_user_message(
     user_text: str,
     input_contents: list[ContentElement] | None = None,
