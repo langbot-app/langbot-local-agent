@@ -76,7 +76,7 @@ spec:
         zh_Hans: 最大工具调用轮数
       type: integer
       required: false
-      default: 20
+      default: 100
     - name: tool-execution-mode
       label:
         en_US: Tool Execution Mode
