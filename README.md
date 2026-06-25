@@ -7,6 +7,15 @@ the host infrastructure, authorization, facts, and pull APIs; the runner owns
 the model-facing agent behavior such as prompt assembly, history selection,
 tool loop, RAG orchestration, and optional context compaction.
 
+## Compatibility
+
+This plugin tracks the LangBot 4.11.x AgentRunner integration work. Test it with:
+
+- `langbot-app/LangBot` branch `dev/4.11.x`
+- `langbot-app/langbot-plugin-sdk` branch `dev/4.11.x`
+- `langbot-app/langbot-agent-runner` branch `main`
+- `langbot-app/langbot-agent-control-plane` branch `main`
+
 ## Scope
 
 This repository does not define the LangBot host protocol. It consumes the
@@ -59,7 +68,7 @@ The SDK proxy import path is
 | retrieval-top-k | integer | no | 5 | Retrieval results requested per knowledge base |
 | rerank-model | rerank-model-selector | no | '' | Rerank model for improved retrieval |
 | rerank-top-k | integer | no | 5 | Top-K results after reranking |
-| max-tool-iterations | integer | no | 20 | Maximum tool-call follow-up iterations |
+| max-tool-iterations | integer | no | 100 | Maximum tool-call follow-up iterations |
 | tool-execution-mode | select | no | parallel | Same-batch tool execution: `parallel` or `serial` |
 | max-tool-result-chars | integer | no | 20000 | Maximum serialized tool result characters injected into the next model request |
 | context-history-fetch-limit | integer | no | 50 | Transcript messages pulled from the Host history API |
