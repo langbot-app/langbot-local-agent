@@ -74,7 +74,7 @@ The SDK proxy import path is
 | context-history-fetch-limit | integer | no | 50 | Transcript messages pulled from the Host history API |
 | context-window-tokens | integer | no | 200000 | Fallback context window, and an upper cap when Host model metadata is available |
 | context-reserve-tokens | integer | no | 16384 | Tokens reserved for the model response and provider overhead, clamped to at most 25% of the effective window |
-| context-keep-recent-tokens | integer | no | 20000 | Approximate recent history tokens to retain when compaction triggers |
+| context-keep-recent-tokens | integer | no | 20000 | Recent history tokens to retain when compaction triggers |
 | context-summary-tokens | integer | no | 8000 | Maximum deterministic summary tokens inserted for compacted older history |
 
 `prompt` is the static binding default. When LangBot exposes
@@ -150,8 +150,11 @@ Local Agent currently uses a runner-owned context pipeline:
    available, capped by the runner binding's `context-window-tokens`. If Host
    metadata is unavailable, `context-window-tokens` is the fallback window and
    defaults to 200k tokens.
-3. Estimate message tokens with a conservative local heuristic until LangBot
-   exposes tokenizer/model usage metadata to runner plugins.
+3. Count the final provider-shaped messages through the Host `count_tokens`
+   API. LangBot implements this with the active model requester; the LiteLLM
+   requester uses `litellm.token_counter` with the same messages and tool
+   schemas used for the real model request. Runtime context budgeting fails
+   closed if the Host does not expose token counting.
 4. When the assembled context exceeds the effective input budget
    (`window - reserve`, with reserve clamped for small windows),
    use the authorized Host model API to generate a structured checkpoint summary,
@@ -175,9 +178,9 @@ This is not `max-round` behavior. History is not selected by number of rounds;
 the runner budgets prompt, current input, summary, and recent history together,
 following the Pi-style context threshold and per-turn transform shape. When the
 Host does not expose the state API or a checkpoint cannot be parsed, Local Agent
-falls back to the previous tail-history behavior. Future iterations can replace
-local estimates with tokenizer/model usage metadata from the LiteLLM model-info
-work.
+falls back to the previous tail-history behavior. Token counts are still
+provided by Host `count_tokens`; there is no runtime heuristic token-count
+fallback.
 
 Pipeline adapter data is intentionally narrow. Local Agent does not consume
 `ctx.adapter.extra.prompt`; prompt handoff goes through the run-scoped Host

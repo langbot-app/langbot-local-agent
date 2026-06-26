@@ -16,6 +16,7 @@ from pkg.context_pipeline import (
     ContextBudget,
     ContextCompactor,
     ContextSummarizer,
+    ContextTokenCounter,
     ContextUsageAnchor,
     usage_total_tokens,
 )
@@ -322,10 +323,12 @@ class LangBotContextHooks(AgentLoopHooks):
         self,
         budget: ContextBudget,
         summarizer: ContextSummarizer | None = None,
+        token_counter: ContextTokenCounter | None = None,
         steering_puller: "LangBotSteeringPuller | None" = None,
     ):
         self.budget = budget
         self.summarizer = summarizer
+        self.token_counter = token_counter
         self.steering_puller = steering_puller
         self._usage_anchor: ContextUsageAnchor | None = None
 
@@ -336,6 +339,7 @@ class LangBotContextHooks(AgentLoopHooks):
             self.budget,
             summarizer=self.summarizer,
             usage_anchor=usage_anchor,
+            token_counter=self.token_counter,
         ).compact_messages_async(messages)
         return assembly.messages
 
@@ -365,6 +369,7 @@ class LangBotContextHooks(AgentLoopHooks):
             self.budget,
             summarizer=self.summarizer,
             usage_anchor=usage_anchor,
+            token_counter=self.token_counter,
         ).compact_messages_async(next_messages)
         self._usage_anchor = None
         return assembly.messages
@@ -377,6 +382,7 @@ class LangBotContextHooks(AgentLoopHooks):
         assembly = await ContextCompactor(
             self._overflow_retry_budget(),
             summarizer=self.summarizer,
+            token_counter=self.token_counter,
         ).compact_messages_async(messages)
         if not assembly.compacted or assembly.tokens_after >= assembly.tokens_before:
             return None

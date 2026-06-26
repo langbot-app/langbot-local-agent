@@ -72,9 +72,12 @@ from pkg.context_pipeline import (
     ContextAssembler,
     ContextBudget,
     ContextCompactor,
+    ContextTokenCounterRequiredError,
     ContextUsageAnchor,
+    HostContextTokenCounter,
     LLMContextSummarizer,
     estimate_message_tokens,
+    estimate_messages_tokens,
     estimate_messages_tokens_with_anchor,
     estimate_text_tokens,
     sanitize_provider_messages,
@@ -128,6 +131,7 @@ class FakeAgentRunAPIProxy:
         self.call_tool = AsyncMock()
         self.retrieve_knowledge = AsyncMock()
         self.invoke_rerank = AsyncMock()
+        self.count_tokens = AsyncMock(side_effect=self._count_tokens)
         self.get_prompt = AsyncMock(return_value=[])
         self.steering_pull = AsyncMock(return_value={"items": []})
         self.state_get = AsyncMock(return_value={"value": None})
@@ -158,6 +162,39 @@ class FakeAgentRunAPIProxy:
 
     def get_allowed_knowledge_bases(self) -> list[KnowledgeBaseResource]:
         return self._knowledge_bases
+
+    async def _count_tokens(
+        self,
+        llm_model_uuid: str,
+        messages: list[Message],
+        funcs: list[Any] | None = None,
+        **kwargs: Any,
+    ) -> int:
+        normalized_messages = [
+            message if isinstance(message, Message) else Message.model_validate(message)
+            for message in messages
+        ]
+        tool_tokens = 0
+        for func in funcs or []:
+            name = getattr(func, "name", None)
+            description = getattr(func, "description", None)
+            parameters = getattr(func, "parameters", None)
+            if isinstance(func, dict):
+                name = func.get("name")
+                description = func.get("description")
+                parameters = func.get("parameters")
+            tool_tokens += estimate_text_tokens(
+                json.dumps(
+                    {
+                        "name": name or "",
+                        "description": description or "",
+                        "parameters": parameters or {},
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+        return estimate_messages_tokens(normalized_messages) + tool_tokens
 
 
 def make_context(
@@ -203,6 +240,15 @@ def make_context(
         config=config or {},
         adapter=AdapterContext(extra=adapter_extra or {}),
     )
+
+
+def make_token_counter(
+    api: FakeAgentRunAPIProxy | None = None,
+    *,
+    model_id: str = "model-1",
+    tools: list[Any] | None = None,
+) -> HostContextTokenCounter:
+    return HostContextTokenCounter(api or FakeAgentRunAPIProxy(), model_id, tools or [])
 
 
 # ==================== Config Parsing Tests ====================
@@ -733,7 +779,11 @@ class TestContextCompaction:
         )
         summarizer = LLMContextSummarizer(fake_api, "model-1", remove_think=True)
 
-        assembly = await ContextCompactor(budget, summarizer=summarizer).compact_async(
+        assembly = await ContextCompactor(
+            budget,
+            summarizer=summarizer,
+            token_counter=make_token_counter(fake_api),
+        ).compact_async(
             prompt_messages=[],
             history_messages=history,
             current_messages=[Message(role="user", content="current request")],
@@ -1073,11 +1123,33 @@ class TestContextCompaction:
             summary_tokens=105,
         )
 
-        assembly = await ContextCompactor(budget, summarizer=TruncatedSummary()).compact_messages_async(messages)
+        assembly = await ContextCompactor(
+            budget,
+            summarizer=TruncatedSummary(),
+            token_counter=make_token_counter(),
+        ).compact_messages_async(messages)
 
         assert assembly.summary_message is not None
         assert "<critical_refs>" in assembly.summary_message.content
         assert "qa_compaction_sentinel_7391" in assembly.summary_message.content
+
+    @pytest.mark.asyncio
+    async def test_async_compaction_requires_host_token_counter(self):
+        """Runtime compaction fails closed when Host token counting is unavailable."""
+
+        class APIWithoutCounter:
+            pass
+
+        budget = ContextBudget(window_tokens=80, reserve_tokens=20)
+        with pytest.raises(ContextTokenCounterRequiredError):
+            await ContextCompactor(
+                budget,
+                token_counter=HostContextTokenCounter(APIWithoutCounter(), "model-1"),
+            ).compact_async(
+                prompt_messages=[],
+                history_messages=[],
+                current_messages=[Message(role="user", content="current request")],
+            )
 
 
 class TestContextAssembler:
@@ -1100,7 +1172,7 @@ class TestContextAssembler:
             ],
         )
 
-        assembly = await ContextAssembler(fake_api, ctx).assemble()
+        assembly = await ContextAssembler(fake_api, ctx, token_counter=make_token_counter(fake_api)).assemble()
 
         user_message = assembly.messages[-1]
         assert user_message.role == "user"
@@ -1137,7 +1209,7 @@ class TestContextAssembler:
             input_text="current question",
         )
 
-        assembly = await ContextAssembler(fake_api, ctx).assemble()
+        assembly = await ContextAssembler(fake_api, ctx, token_counter=make_token_counter(fake_api)).assemble()
 
         assert assembly.frame is not None
         assert assembly.diagnostics is not None
@@ -1234,7 +1306,7 @@ class TestContextAssembler:
         ctx.context.available_apis.history_page = True
         ctx.context.available_apis.state = True
 
-        assembly = await ContextAssembler(fake_api, ctx).assemble()
+        assembly = await ContextAssembler(fake_api, ctx, token_counter=make_token_counter(fake_api)).assemble()
 
         fake_api.state_get.assert_awaited_once_with("conversation", CHECKPOINT_STATE_KEY)
         assert fake_api.history_page.await_count == 2
@@ -1291,6 +1363,7 @@ class TestContextAssembler:
             ctx,
             budget=budget,
             summarizer=SentinelSummarizer(),
+            token_counter=make_token_counter(fake_api),
         ).assemble()
 
         assert assembly.compacted is True
@@ -1320,7 +1393,7 @@ class TestDefaultAgentRunner:
         assert manifest["spec"]["capabilities"]["skill_authoring"] is True
         assert manifest["spec"]["capabilities"]["interrupt"] is True
         assert manifest["spec"]["permissions"] == {
-            "models": ["invoke", "stream", "rerank"],
+            "models": ["count_tokens", "invoke", "stream", "rerank"],
             "tools": ["detail", "call"],
             "knowledge_bases": ["list", "retrieve"],
             "history": ["page"],

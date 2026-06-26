@@ -18,7 +18,7 @@ from pkg.config import (
     get_tool_execution_mode,
     parse_model_config,
 )
-from pkg.context_pipeline import ContextAssembler, ContextBudget, LLMContextSummarizer
+from pkg.context_pipeline import ContextAssembler, ContextBudget, HostContextTokenCounter, LLMContextSummarizer
 from pkg.model_calling import build_llm_tools
 
 
@@ -61,14 +61,16 @@ class AgentRunAssembler:
         remove_think = get_remove_think(self.ctx.config)
         context_budget = ContextBudget.from_context(self.ctx)
         summarizer = LLMContextSummarizer(self.api, model_ids[0], remove_think=remove_think)
+        tools = await self._build_tools(allowed_tools)
+        token_counter = HostContextTokenCounter(self.api, model_ids[0], tools)
 
         context_assembly = await ContextAssembler(
             self.api,
             self.ctx,
             budget=context_budget,
             summarizer=summarizer,
+            token_counter=token_counter,
         ).assemble()
-        tools = await self._build_tools(allowed_tools)
 
         return AgentRunAssembly(
             model_ids=model_ids,
@@ -82,6 +84,7 @@ class AgentRunAssembler:
             hooks=LangBotContextHooks(
                 context_budget,
                 summarizer=summarizer,
+                token_counter=token_counter,
                 steering_puller=LangBotSteeringPuller(self.api),
             ),
             streaming=self._streaming_supported(),

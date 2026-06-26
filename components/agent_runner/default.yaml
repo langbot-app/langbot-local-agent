@@ -145,6 +145,7 @@ spec:
     steering: true
   permissions:
     models:
+      - count_tokens
       - invoke
       - stream
       - rerank

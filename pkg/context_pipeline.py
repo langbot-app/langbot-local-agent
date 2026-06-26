@@ -128,7 +128,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ContextBudget:
-    """Token-style context budget with conservative local estimates."""
+    """Token-style context budget resolved from runner config and Host metadata."""
 
     window_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS
     reserve_tokens: int = DEFAULT_CONTEXT_RESERVE_TOKENS
@@ -278,6 +278,15 @@ class ContextUsageAnchor:
     model_id: str | None = None
 
 
+class ContextTokenCounter(typing.Protocol):
+    async def count(self, messages: list[Message]) -> int:
+        """Return provider/tokenizer token count for this model request."""
+
+
+class ContextTokenCounterRequiredError(RuntimeError):
+    """Raised when runtime compaction cannot access Host token counting."""
+
+
 @dataclass(frozen=True)
 class ConversationSummaryEntry:
     index: int
@@ -375,6 +384,28 @@ class LLMContextSummarizer:
         return _wrap_llm_summary(summary_text, max_tokens, message_count=len(messages))
 
 
+class HostContextTokenCounter:
+    """Count model input tokens through the run-scoped Host API."""
+
+    def __init__(self, api: typing.Any, model_id: str, tools: list[typing.Any] | None = None):
+        self.api = api
+        self.model_id = model_id
+        self.tools = tools or []
+
+    async def count(self, messages: list[Message]) -> int:
+        count_tokens = getattr(self.api, "count_tokens", None)
+        if not callable(count_tokens):
+            raise ContextTokenCounterRequiredError("Host count_tokens API is required for local-agent context budgeting")
+        tokens = await count_tokens(
+            llm_model_uuid=self.model_id,
+            messages=messages,
+            funcs=self.tools,
+        )
+        if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
+            raise ContextTokenCounterRequiredError(f"Host count_tokens returned invalid token count: {tokens!r}")
+        return tokens
+
+
 class ContextAssembler:
     """Build the model-facing context for one AgentRunner run."""
 
@@ -384,11 +415,13 @@ class ContextAssembler:
         ctx: AgentRunContext,
         budget: ContextBudget | None = None,
         summarizer: ContextSummarizer | None = None,
+        token_counter: ContextTokenCounter | None = None,
     ):
         self.api = api
         self.ctx = ctx
         self.budget = budget or ContextBudget.from_context(ctx)
         self.summarizer = summarizer
+        self.token_counter = token_counter
 
     async def assemble(self) -> ContextAssembly:
         user_text = self.ctx.input.to_text()
@@ -413,7 +446,11 @@ class ContextAssembler:
         if user_message is not None:
             current_messages.append(user_message)
 
-        assembly = await ContextCompactor(self.budget, summarizer=self.summarizer).compact_async(
+        assembly = await ContextCompactor(
+            self.budget,
+            summarizer=self.summarizer,
+            token_counter=self.token_counter,
+        ).compact_async(
             prompt_messages=prompt_messages,
             history_messages=checkpoint_messages + history_messages,
             rag_messages=rag_messages,
@@ -606,10 +643,12 @@ class ContextCompactor:
         budget: ContextBudget,
         summarizer: ContextSummarizer | None = None,
         usage_anchor: ContextUsageAnchor | None = None,
+        token_counter: ContextTokenCounter | None = None,
     ):
         self.budget = budget
         self.summarizer = summarizer
         self.usage_anchor = usage_anchor
+        self.token_counter = token_counter
 
     def compact_messages(self, messages: list[Message]) -> ContextAssembly:
         """Compact an already-assembled runtime message list.
@@ -629,6 +668,7 @@ class ContextCompactor:
         )
 
     async def compact_messages_async(self, messages: list[Message]) -> ContextAssembly:
+        self._require_token_counter()
         messages = sanitize_provider_messages(messages)
         prompt_messages, existing_summaries, runtime_messages = _split_leading_prompt_messages(messages)
         history_messages, current_messages = _split_runtime_history_and_current(runtime_messages)
@@ -726,16 +766,17 @@ class ContextCompactor:
         rag_messages: list[Message] | None = None,
         rag_chunks: list[RagChunk] | None = None,
     ) -> ContextAssembly:
+        self._require_token_counter()
         prompt = sanitize_provider_messages(prompt_messages)
         prompt, prompt_summaries = _partition_summary_messages(prompt)
         history = sanitize_provider_messages(prompt_summaries + history_messages)
         rag = sanitize_provider_messages(rag_messages or [])
         current = sanitize_provider_messages(current_messages)
         original_messages = prompt + history + rag + current
-        tokens_before = estimate_messages_tokens_with_anchor(original_messages, self.usage_anchor)
+        tokens_before = await self._count_messages_async(original_messages, allow_usage_anchor=True)
 
         if not self.budget.enabled or tokens_before <= self.budget.input_tokens:
-            return self._build_assembly(
+            return await self._build_assembly_async(
                 prompt=prompt,
                 summaries=[],
                 history=history,
@@ -747,10 +788,10 @@ class ContextCompactor:
                 compacted_message_count=0,
             )
 
-        rag = self._fit_rag_before_history_budget(prompt=prompt, history=history, rag=rag, current=current)
-        history_budget = max(self.budget.input_tokens - estimate_messages_tokens(prompt + rag + current), 0)
+        rag = await self._fit_rag_before_history_budget_async(prompt=prompt, history=history, rag=rag, current=current)
+        history_budget = max(self.budget.input_tokens - await self._count_messages_async(prompt + rag + current), 0)
         if not history:
-            return self._build_assembly(
+            return await self._build_assembly_async(
                 prompt=prompt,
                 summaries=[],
                 history=[],
@@ -763,7 +804,7 @@ class ContextCompactor:
             )
         if history_budget <= 0:
             summary_message = await self._build_summary_message_async(history, self.budget.summary_tokens)
-            return self._build_assembly(
+            return await self._build_assembly_async(
                 prompt=prompt,
                 summaries=[summary_message] if summary_message is not None else [],
                 history=[],
@@ -778,12 +819,12 @@ class ContextCompactor:
 
         summary_budget = self._summary_budget(history_budget)
         recent_budget = max(history_budget - summary_budget, 0)
-        first_kept_index = self._select_first_kept_index(history, recent_budget)
+        first_kept_index = await self._select_first_kept_index_async(history, recent_budget)
 
         omitted = history[:first_kept_index]
         recent = history[first_kept_index:]
         summary_message = await self._build_summary_message_async(omitted, summary_budget)
-        return self._build_assembly(
+        return await self._build_assembly_async(
             prompt=prompt,
             summaries=[summary_message] if summary_message is not None else [],
             history=recent,
@@ -848,6 +889,58 @@ class ContextCompactor:
             diagnostics=diagnostics,
         )
 
+    async def _build_assembly_async(
+        self,
+        *,
+        prompt: list[Message],
+        summaries: list[Message],
+        history: list[Message],
+        rag: list[Message],
+        current: list[Message],
+        rag_chunks: list[RagChunk],
+        compacted: bool,
+        tokens_before: int,
+        summary_message: Message | None = None,
+        compacted_message_count: int,
+    ) -> ContextAssembly:
+        prompt, summaries, history, rag, current = await self._fit_frame_to_budget_async(
+            prompt=prompt,
+            summaries=summaries,
+            history=history,
+            rag=rag,
+            current=current,
+        )
+        frame = ContextFrame(
+            prompt=_copy_messages(prompt),
+            summaries=_copy_messages(summaries),
+            history=_copy_messages(history),
+            rag=_copy_messages(rag),
+            current=_copy_messages(current),
+            rag_chunks=list(rag_chunks),
+        )
+        messages = sanitize_provider_messages(frame.to_messages())
+        tokens_after = await self._count_messages_async(messages)
+        diagnostics = ContextDiagnostics(
+            tokens_before=tokens_before,
+            tokens_after=tokens_after,
+            prompt_tokens=await self._count_messages_async(frame.prompt),
+            summary_tokens=await self._count_messages_async(frame.summaries),
+            history_tokens=await self._count_messages_async(frame.history),
+            rag_tokens=await self._count_messages_async(frame.rag),
+            current_tokens=await self._count_messages_async(frame.current),
+            compacted_message_count=compacted_message_count,
+        )
+
+        return ContextAssembly(
+            messages=messages,
+            compacted=compacted,
+            tokens_before=tokens_before,
+            tokens_after=tokens_after,
+            summary_message=summary_message,
+            frame=frame,
+            diagnostics=diagnostics,
+        )
+
     def _fit_rag_before_history_budget(
         self,
         *,
@@ -870,6 +963,29 @@ class ContextCompactor:
         rag_budget = max(available_after_fixed - history_reserve, 0)
         rag_budget = min(rag_budget, max(1, self.budget.input_tokens // RAG_CONTEXT_MAX_INPUT_FRACTION))
         return _fit_messages_to_budget(rag, rag_budget, keep_tail=False)
+
+    async def _fit_rag_before_history_budget_async(
+        self,
+        *,
+        prompt: list[Message],
+        history: list[Message],
+        rag: list[Message],
+        current: list[Message],
+    ) -> list[Message]:
+        if not self.budget.enabled or not rag:
+            return rag
+
+        available_after_fixed = self.budget.input_tokens - await self._count_messages_async(prompt + current)
+        if available_after_fixed <= 0:
+            return []
+
+        if not history:
+            return await self._fit_messages_to_budget_async(rag, available_after_fixed, keep_tail=False)
+
+        history_reserve = min(self.budget.keep_recent_tokens, max(1, available_after_fixed // 2))
+        rag_budget = max(available_after_fixed - history_reserve, 0)
+        rag_budget = min(rag_budget, max(1, self.budget.input_tokens // RAG_CONTEXT_MAX_INPUT_FRACTION))
+        return await self._fit_messages_to_budget_async(rag, rag_budget, keep_tail=False)
 
     def _fit_frame_to_budget(
         self,
@@ -926,6 +1042,61 @@ class ContextCompactor:
         )
         return prompt, summaries, history, rag, current
 
+    async def _fit_frame_to_budget_async(
+        self,
+        *,
+        prompt: list[Message],
+        summaries: list[Message],
+        history: list[Message],
+        rag: list[Message],
+        current: list[Message],
+    ) -> tuple[list[Message], list[Message], list[Message], list[Message], list[Message]]:
+        if not self.budget.enabled:
+            return prompt, summaries, history, rag, current
+
+        input_budget = self.budget.input_tokens
+        if await self._count_messages_async(prompt + summaries + history + rag + current) <= input_budget:
+            return prompt, summaries, history, rag, current
+
+        rag = await self._fit_messages_to_budget_async(
+            rag,
+            input_budget - await self._count_messages_async(prompt + summaries + history + current),
+            keep_tail=False,
+        )
+        if await self._count_messages_async(prompt + summaries + history + rag + current) <= input_budget:
+            return prompt, summaries, history, rag, current
+
+        summaries = await self._fit_messages_to_budget_async(
+            summaries,
+            input_budget - await self._count_messages_async(prompt + history + rag + current),
+            keep_tail=False,
+        )
+        if await self._count_messages_async(prompt + summaries + history + rag + current) <= input_budget:
+            return prompt, summaries, history, rag, current
+
+        history = await self._fit_messages_to_budget_async(
+            history,
+            input_budget - await self._count_messages_async(prompt + summaries + rag + current),
+            keep_tail=True,
+        )
+        if await self._count_messages_async(prompt + summaries + history + rag + current) <= input_budget:
+            return prompt, summaries, history, rag, current
+
+        prompt = await self._fit_messages_to_budget_async(
+            prompt,
+            input_budget - await self._count_messages_async(summaries + history + rag + current),
+            keep_tail=True,
+        )
+        if await self._count_messages_async(prompt + summaries + history + rag + current) <= input_budget:
+            return prompt, summaries, history, rag, current
+
+        current = await self._fit_messages_to_budget_async(
+            current,
+            input_budget - await self._count_messages_async(prompt + summaries + history + rag),
+            keep_tail=True,
+        )
+        return prompt, summaries, history, rag, current
+
     def _summary_budget(self, history_budget: int) -> int:
         if self.budget.summary_tokens <= 0:
             return 0
@@ -951,6 +1122,266 @@ class ContextCompactor:
             first_kept_index = index
 
         return _move_cut_before_tool_result(history, first_kept_index)
+
+    async def _select_first_kept_index_async(self, history: list[Message], recent_budget: int) -> int:
+        if recent_budget <= 0:
+            return len(history)
+
+        total = 0
+        first_kept_index = len(history)
+        for index in range(len(history) - 1, -1, -1):
+            message_tokens = await self._count_messages_async([history[index]])
+            if first_kept_index < len(history) and total + message_tokens > recent_budget:
+                break
+            if first_kept_index == len(history) and message_tokens > recent_budget:
+                break
+            total += message_tokens
+            first_kept_index = index
+
+        return _move_cut_before_tool_result(history, first_kept_index)
+
+    def _require_token_counter(self) -> None:
+        if self.token_counter is None:
+            raise ContextTokenCounterRequiredError("Host count_tokens API is required for local-agent context budgeting")
+
+    async def _count_messages_async(self, messages: list[Message], *, allow_usage_anchor: bool = False) -> int:
+        self._require_token_counter()
+        if allow_usage_anchor and self.usage_anchor is not None:
+            anchor = self.usage_anchor
+            if 0 <= anchor.message_count <= len(messages) and anchor.total_tokens > 0:
+                return anchor.total_tokens + await self._count_messages_async(messages[anchor.message_count :])
+        return await self.token_counter.count(messages)
+
+    async def _fit_messages_to_budget_async(
+        self,
+        messages: list[Message],
+        max_tokens: int,
+        *,
+        keep_tail: bool,
+    ) -> list[Message]:
+        if max_tokens <= 0 or not messages:
+            return []
+
+        copied = _copy_messages(messages)
+        if await self._count_messages_async(copied) <= max_tokens:
+            return copied
+
+        selected: list[Message] = []
+        used_tokens = 0
+
+        if keep_tail:
+            end = len(copied)
+            while end > 0:
+                start = _tail_unit_start(copied, end)
+                unit = copied[start:end]
+                unit_tokens = await self._count_messages_async(unit)
+                remaining = max_tokens - used_tokens
+                if remaining <= 0:
+                    break
+                if unit_tokens <= remaining:
+                    selected[0:0] = _copy_messages(unit)
+                    used_tokens += unit_tokens
+                    end = start
+                    continue
+                if not selected:
+                    truncated = await self._fit_unit_to_budget_async(unit, remaining, keep_tail=True)
+                    selected[0:0] = truncated
+                break
+            return selected
+
+        for message in copied:
+            remaining = max_tokens - used_tokens
+            if remaining <= 0:
+                break
+            message_tokens = await self._count_messages_async([message])
+            if message_tokens <= remaining:
+                selected.append(message.model_copy(deep=True))
+                used_tokens += message_tokens
+                continue
+            truncated = await self._truncate_message_to_tokens_async(message, remaining)
+            if truncated is not None:
+                selected.append(truncated)
+            break
+
+        return selected
+
+    async def _fit_unit_to_budget_async(
+        self,
+        unit: list[Message],
+        max_tokens: int,
+        *,
+        keep_tail: bool,
+    ) -> list[Message]:
+        if max_tokens <= 0 or not unit:
+            return []
+        if len(unit) == 1:
+            message = await self._truncate_message_to_tokens_async(unit[0], max_tokens)
+            return [message] if message is not None else []
+
+        if unit[0].role == "assistant" and unit[0].tool_calls:
+            assistant_tokens = await self._count_messages_async([unit[0]])
+            if assistant_tokens > max_tokens:
+                return []
+            selected = [unit[0].model_copy(deep=True)]
+            used_tokens = assistant_tokens
+            for message in unit[1:]:
+                remaining = max_tokens - used_tokens
+                if remaining <= 0:
+                    break
+                message_tokens = await self._count_messages_async([message])
+                if message_tokens <= remaining:
+                    selected.append(message.model_copy(deep=True))
+                    used_tokens += message_tokens
+                    continue
+                truncated = await self._truncate_message_to_tokens_async(message, remaining)
+                if truncated is not None:
+                    selected.append(truncated)
+                break
+            return selected
+
+        selected: list[Message] = []
+        used_tokens = 0
+        iterable = reversed(unit) if keep_tail else iter(unit)
+        for message in iterable:
+            remaining = max_tokens - used_tokens
+            if remaining <= 0:
+                break
+            message_tokens = await self._count_messages_async([message])
+            if message_tokens <= remaining:
+                if keep_tail:
+                    selected.insert(0, message.model_copy(deep=True))
+                else:
+                    selected.append(message.model_copy(deep=True))
+                used_tokens += message_tokens
+                continue
+            truncated = await self._truncate_message_to_tokens_async(message, remaining)
+            if truncated is not None:
+                if keep_tail:
+                    selected.insert(0, truncated)
+                else:
+                    selected.append(truncated)
+            break
+        return selected
+
+    async def _truncate_message_to_tokens_async(self, message: Message, max_tokens: int) -> Message | None:
+        if max_tokens <= 0:
+            return None
+        if await self._count_messages_async([message]) <= max_tokens:
+            return message.model_copy(deep=True)
+
+        copied = message.model_copy(deep=True)
+        content = copied.content
+        copied.content = ""
+        fixed_tokens = await self._count_messages_async([copied])
+        available_tokens = max_tokens - fixed_tokens
+        if available_tokens <= 0:
+            return None
+
+        if isinstance(content, str):
+            copied.content = await self._truncate_text_to_tokens_async(
+                content,
+                available_tokens,
+                message_template=copied,
+            )
+            return copied if _message_has_model_content(copied) or copied.role == "tool" else None
+
+        if isinstance(content, list):
+            fitted_content = []
+            used_tokens = 0
+            for item in content:
+                remaining = available_tokens - used_tokens
+                if remaining <= 0:
+                    break
+                item_type = getattr(item, "type", "")
+                if item_type == "text" and getattr(item, "text", None):
+                    fitted_item = item.model_copy(deep=True)
+                    probe = copied.model_copy(deep=True)
+                    probe.content = [fitted_item]
+                    item_tokens = await self._count_messages_async([probe]) - fixed_tokens
+                    if item_tokens > remaining:
+                        fitted_item.text = await self._truncate_content_item_text_async(
+                            copied,
+                            item,
+                            fixed_tokens + remaining,
+                        )
+                        if not fitted_item.text:
+                            break
+                        fitted_content.append(fitted_item)
+                        break
+                    fitted_content.append(fitted_item)
+                    used_tokens += item_tokens
+                elif isinstance(item_type, str) and item_type.startswith(("image", "file")):
+                    probe = copied.model_copy(deep=True)
+                    probe.content = [item]
+                    item_tokens = await self._count_messages_async([probe]) - fixed_tokens
+                    if item_tokens > remaining:
+                        continue
+                    fitted_content.append(item.model_copy(deep=True))
+                    used_tokens += item_tokens
+            copied.content = fitted_content
+            return copied if _message_has_model_content(copied) or copied.role == "tool" else None
+
+        return None
+
+    async def _truncate_text_to_tokens_async(
+        self,
+        text: str,
+        max_tokens: int,
+        message_template: Message | None = None,
+    ) -> str:
+        if max_tokens <= 0:
+            return ""
+
+        def probe_message(content: str) -> Message:
+            if message_template is None:
+                return Message(role="user", content=content)
+            copied = message_template.model_copy(deep=True)
+            copied.content = content
+            return copied
+
+        empty_tokens = await self._count_messages_async([probe_message("")])
+        target_total = max_tokens + empty_tokens
+        if await self._count_messages_async([probe_message(text)]) <= target_total:
+            return text
+
+        low = 0
+        high = len(text)
+        while low < high:
+            mid = (low + high + 1) // 2
+            if await self._count_messages_async([probe_message(text[:mid])]) <= target_total:
+                low = mid
+            else:
+                high = mid - 1
+        return text[:low]
+
+    async def _truncate_content_item_text_async(
+        self,
+        message_template: Message,
+        item: typing.Any,
+        max_total_tokens: int,
+    ) -> str:
+        if max_total_tokens <= 0 or not getattr(item, "text", None):
+            return ""
+
+        def probe_message(content: str) -> Message:
+            probe_item = item.model_copy(deep=True)
+            probe_item.text = content
+            probe = message_template.model_copy(deep=True)
+            probe.content = [probe_item]
+            return probe
+
+        if await self._count_messages_async([probe_message(item.text)]) <= max_total_tokens:
+            return item.text
+
+        low = 0
+        high = len(item.text)
+        while low < high:
+            mid = (low + high + 1) // 2
+            if await self._count_messages_async([probe_message(item.text[:mid])]) <= max_total_tokens:
+                low = mid
+            else:
+                high = mid - 1
+        return item.text[:low]
 
     def _build_summary_message(self, omitted: list[Message], summary_budget: int) -> Message | None:
         if not omitted or summary_budget <= 0:
