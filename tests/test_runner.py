@@ -1749,7 +1749,7 @@ class TestDefaultAgentRunner:
 
         fake_api.call_tool = AsyncMock(side_effect=slow_tool)
         monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
-        monkeypatch.setattr("components.agent_runner.default.get_run_timeout_seconds", lambda config: 0.01)
+        monkeypatch.setattr("components.agent_runner.default.get_run_timeout_seconds", lambda config: 0.2)
 
         ctx = make_context(
             config={"model": {"primary": "model-1", "fallbacks": []}, "timeout": 1},

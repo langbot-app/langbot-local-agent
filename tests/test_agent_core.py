@@ -352,6 +352,10 @@ async def test_streaming_loop_pulls_steering_after_tool_batch():
                 return [Message(role="user", content="steering follow-up")]
             return []
 
+    class NoopTokenCounter:
+        async def count(self, messages: list[Message]) -> int:
+            return 0
+
     model_adapter = RecordingModelAdapter()
     steering_puller = SteeringPuller()
     loop = AgentLoop(
@@ -364,6 +368,7 @@ async def test_streaming_loop_pulls_steering_after_tool_batch():
         max_tool_iterations=10,
         hooks=LangBotContextHooks(
             ContextBudget(window_tokens=0, reserve_tokens=0),
+            token_counter=NoopTokenCounter(),
             steering_puller=steering_puller,
         ),
     )
