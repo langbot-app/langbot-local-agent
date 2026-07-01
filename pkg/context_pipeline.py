@@ -399,7 +399,7 @@ class HostContextTokenCounter:
         tokens = await count_tokens(
             llm_model_uuid=self.model_id,
             messages=messages,
-            funcs=self.tools,
+            funcs=[],
         )
         if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
             raise ContextTokenCounterRequiredError(f"Host count_tokens returned invalid token count: {tokens!r}")
@@ -1035,6 +1035,17 @@ class ContextCompactor:
         if estimate_messages_tokens(prompt + summaries + history + rag + current) <= input_budget:
             return prompt, summaries, history, rag, current
 
+        prompt, summaries, history, rag, current = self._preserve_current_with_sync_budget(
+            prompt=prompt,
+            summaries=summaries,
+            history=history,
+            rag=rag,
+            current=current,
+            input_budget=input_budget,
+        )
+        if estimate_messages_tokens(prompt + summaries + history + rag + current) <= input_budget:
+            return prompt, summaries, history, rag, current
+
         current = _fit_messages_to_budget(
             current,
             input_budget - estimate_messages_tokens(prompt + summaries + history + rag),
@@ -1090,11 +1101,84 @@ class ContextCompactor:
         if await self._count_messages_async(prompt + summaries + history + rag + current) <= input_budget:
             return prompt, summaries, history, rag, current
 
+        prompt, summaries, history, rag, current = await self._preserve_current_with_async_budget(
+            prompt=prompt,
+            summaries=summaries,
+            history=history,
+            rag=rag,
+            current=current,
+            input_budget=input_budget,
+        )
+        if await self._count_messages_async(prompt + summaries + history + rag + current) <= input_budget:
+            return prompt, summaries, history, rag, current
+
         current = await self._fit_messages_to_budget_async(
             current,
             input_budget - await self._count_messages_async(prompt + summaries + history + rag),
             keep_tail=True,
         )
+        return prompt, summaries, history, rag, current
+
+    def _preserve_current_with_sync_budget(
+        self,
+        *,
+        prompt: list[Message],
+        summaries: list[Message],
+        history: list[Message],
+        rag: list[Message],
+        current: list[Message],
+        input_budget: int,
+    ) -> tuple[list[Message], list[Message], list[Message], list[Message], list[Message]]:
+        if not current or input_budget <= 0:
+            return prompt, summaries, history, rag, current
+
+        current = _fit_messages_to_budget(current, input_budget, keep_tail=True)
+        if not current:
+            return [], [], [], [], []
+
+        fixed_current_tokens = estimate_messages_tokens(current)
+        remaining = max(input_budget - fixed_current_tokens, 0)
+        if remaining <= 0:
+            return [], [], [], [], current
+
+        prompt = _fit_messages_to_budget(prompt, remaining, keep_tail=True)
+        remaining = max(remaining - estimate_messages_tokens(prompt), 0)
+        summaries = _fit_messages_to_budget(summaries, remaining, keep_tail=False)
+        remaining = max(remaining - estimate_messages_tokens(summaries), 0)
+        history = _fit_messages_to_budget(history, remaining, keep_tail=True)
+        remaining = max(remaining - estimate_messages_tokens(history), 0)
+        rag = _fit_messages_to_budget(rag, remaining, keep_tail=False)
+        return prompt, summaries, history, rag, current
+
+    async def _preserve_current_with_async_budget(
+        self,
+        *,
+        prompt: list[Message],
+        summaries: list[Message],
+        history: list[Message],
+        rag: list[Message],
+        current: list[Message],
+        input_budget: int,
+    ) -> tuple[list[Message], list[Message], list[Message], list[Message], list[Message]]:
+        if not current or input_budget <= 0:
+            return prompt, summaries, history, rag, current
+
+        current = await self._fit_messages_to_budget_async(current, input_budget, keep_tail=True)
+        if not current:
+            return [], [], [], [], []
+
+        fixed_current_tokens = await self._count_messages_async(current)
+        remaining = max(input_budget - fixed_current_tokens, 0)
+        if remaining <= 0:
+            return [], [], [], [], current
+
+        prompt = await self._fit_messages_to_budget_async(prompt, remaining, keep_tail=True)
+        remaining = max(remaining - await self._count_messages_async(prompt), 0)
+        summaries = await self._fit_messages_to_budget_async(summaries, remaining, keep_tail=False)
+        remaining = max(remaining - await self._count_messages_async(summaries), 0)
+        history = await self._fit_messages_to_budget_async(history, remaining, keep_tail=True)
+        remaining = max(remaining - await self._count_messages_async(history), 0)
+        rag = await self._fit_messages_to_budget_async(rag, remaining, keep_tail=False)
         return prompt, summaries, history, rag, current
 
     def _summary_budget(self, history_budget: int) -> int:

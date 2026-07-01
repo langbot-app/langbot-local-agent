@@ -1134,6 +1134,84 @@ class TestContextCompaction:
         assert "qa_compaction_sentinel_7391" in assembly.summary_message.content
 
     @pytest.mark.asyncio
+    async def test_async_compaction_never_evicts_current_input_under_tiny_budget(self):
+        """Provider token counting must not let final budget fitting send empty messages."""
+
+        class ConservativeTokenCounter:
+            async def count(self, messages: list[Message]) -> int:
+                if not messages:
+                    return 0
+                return estimate_messages_tokens(messages) + (12 * len(messages))
+
+        messages = [
+            Message(role="system", content="Static prompt " * 80),
+            Message(role="user", content="remember qa_compaction_sentinel_7391"),
+            Message(role="assistant", content="MEMORY_SET"),
+            Message(
+                role="user",
+                content="padding " + " ".join(f"A{index:03d}" for index in range(1, 100)),
+            ),
+            Message(role="user", content="current request must survive"),
+        ]
+        budget = ContextBudget(
+            window_tokens=45,
+            reserve_tokens=20,
+            keep_recent_tokens=8,
+            summary_tokens=20,
+        )
+
+        assembly = await ContextCompactor(
+            budget,
+            token_counter=ConservativeTokenCounter(),
+        ).compact_messages_async(messages)
+
+        assert assembly.messages
+        assert assembly.messages[-1].role == "user"
+        assert "current" in assembly.messages[-1].content
+        assert await ConservativeTokenCounter().count(assembly.messages) <= budget.input_tokens
+
+    @pytest.mark.asyncio
+    async def test_host_token_counter_does_not_charge_tools_for_each_context_slice(self):
+        """Tool schemas are request-level overhead, not repeated per-slice context cost."""
+        fake_api = FakeAgentRunAPIProxy()
+        large_tools = [
+            {
+                "name": "massive_tool_schema",
+                "description": "large tool schema " * 200,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "payload": {
+                            "type": "string",
+                            "description": "large argument description " * 200,
+                        }
+                    },
+                },
+            }
+        ]
+        budget = ContextBudget(
+            window_tokens=80,
+            reserve_tokens=20,
+            keep_recent_tokens=8,
+            summary_tokens=20,
+        )
+
+        assembly = await ContextCompactor(
+            budget,
+            token_counter=HostContextTokenCounter(fake_api, "model-1", large_tools),
+        ).compact_async(
+            prompt_messages=[Message(role="system", content="static policy " * 200)],
+            history_messages=[],
+            current_messages=[Message(role="user", content="current request must survive")],
+        )
+
+        assert assembly.messages
+        assert assembly.messages[-1].role == "user"
+        assert assembly.messages[-1].content == "current request must survive"
+        assert fake_api.count_tokens.await_args_list
+        assert all(call.kwargs.get("funcs") == [] for call in fake_api.count_tokens.await_args_list)
+
+    @pytest.mark.asyncio
     async def test_async_compaction_requires_host_token_counter(self):
         """Runtime compaction fails closed when Host token counting is unavailable."""
 
@@ -2736,6 +2814,58 @@ class TestDefaultAgentRunner:
         assert result_payload["reason"] == "tool_result_truncated"
         assert result_payload["preview"] == "x" * 8
         assert result_payload["original_chars"] == 25
+
+    @pytest.mark.asyncio
+    async def test_tool_error_is_passed_to_follow_up_model_call(self, runner, monkeypatch):
+        """Tool execution errors are model-facing tool results, not silent loop failures."""
+        fake_api = FakeAgentRunAPIProxy(
+            models=[ModelResource(model_id="model-1")],
+            tools=[ToolResource(tool_name="allowed_tool")],
+        )
+        captured_turn_messages: list[list[Message]] = []
+
+        async def mock_stream(*args, **kwargs):
+            captured_turn_messages.append([message.model_copy(deep=True) for message in kwargs["messages"]])
+            if len(captured_turn_messages) == 1:
+                yield MessageChunk(
+                    role="assistant",
+                    content="",
+                    is_final=True,
+                    tool_calls=[
+                        ToolCall(
+                            id="call-1",
+                            type="function",
+                            function=FunctionCall(name="allowed_tool", arguments='{"text": "boom"}'),
+                        )
+                    ],
+                )
+            else:
+                yield MessageChunk(role="assistant", content="Recovered from tool error", is_final=True)
+
+        fake_api.invoke_llm_stream = mock_stream
+        fake_api.call_tool = AsyncMock(side_effect=RuntimeError("forced failure"))
+        monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
+
+        ctx = make_context(
+            config={"model": {"primary": "model-1", "fallbacks": []}},
+            resources=AgentResources(
+                models=[ModelResource(model_id="model-1")],
+                tools=[ToolResource(tool_name="allowed_tool")],
+            ),
+        )
+
+        results = [result async for result in runner.run(ctx)]
+
+        assert any(r.type == AgentRunResultType.RUN_COMPLETED for r in results)
+        assert len(captured_turn_messages) == 2
+        tool_messages = [message for message in captured_turn_messages[1] if message.role == "tool"]
+        assert len(tool_messages) == 1
+        assert tool_messages[0].tool_call_id == "call-1"
+        assert tool_messages[0].content == "Error: Tool execution failed: forced failure"
+
+        completed = [r for r in results if r.type == AgentRunResultType.TOOL_CALL_COMPLETED]
+        assert len(completed) == 1
+        assert completed[0].data.get("error") == "Tool execution failed: forced failure"
 
     @pytest.mark.asyncio
     async def test_tool_result_with_refs_is_passed_as_reference_payload(self, runner, monkeypatch):
