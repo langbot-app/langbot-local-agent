@@ -44,7 +44,7 @@ async def test_steering_puller_accepts_sdk_result_models():
                     "items": [
                         {
                             "claimed_run_id": "run-1",
-                            "runner_id": "plugin:langbot/local-agent/default",
+                            "runner_id": "plugin:langbot-team/LocalAgent/default",
                             "event": {
                                 "event_id": "evt-follow-up",
                                 "event_type": "message.received",

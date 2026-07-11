@@ -2034,7 +2034,7 @@ class TestDefaultAgentRunner:
                     "items": [
                         {
                             "claimed_run_id": "test-run-id",
-                            "runner_id": "plugin:langbot/local-agent/default",
+                            "runner_id": "plugin:langbot-team/LocalAgent/default",
                             "event": {
                                 "event_id": "evt-follow-up",
                                 "event_type": "message.received",
