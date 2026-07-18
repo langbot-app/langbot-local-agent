@@ -503,7 +503,19 @@ class StreamingModelCaller:
         tc_id = _normalized_tool_call_id(getattr(tool_call, "id", None))
         position_key = _tool_call_position_key(tool_call, position)
         if tc_id:
-            key = self._tool_call_id_keys.get(tc_id) or self._tool_call_position_keys.get(position_key) or f"id:{tc_id}"
+            key = self._tool_call_id_keys.get(tc_id)
+            if key is None:
+                position_candidate = self._tool_call_position_keys.get(position_key)
+                candidate_has_provider_id = position_candidate in self._tool_call_id_keys.values()
+                # Reuse a position-only call when its real id arrives in a later
+                # delta. A different real id at the same list position starts a
+                # new call; some providers emit parallel calls in separate
+                # one-item deltas, so their position is always zero.
+                key = (
+                    position_candidate
+                    if position_candidate is not None and not candidate_has_provider_id
+                    else f"id:{tc_id}"
+                )
             self._tool_call_id_keys[tc_id] = key
             self._tool_call_position_keys[position_key] = key
             return key

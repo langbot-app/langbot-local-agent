@@ -1541,6 +1541,56 @@ class TestDefaultAgentRunner:
         assert final_tool_calls[0].function.arguments == '{"a": 1}'
 
     @pytest.mark.asyncio
+    async def test_streaming_distinct_tool_ids_at_same_delta_position_stay_separate(self):
+        class StreamingAPI:
+            def invoke_llm_stream(self, *args, **kwargs):
+                async def stream():
+                    yield MessageChunk(
+                        role="assistant",
+                        content="",
+                        is_final=False,
+                        tool_calls=[
+                            ToolCall(
+                                id="call-read-a",
+                                type="function",
+                                function=FunctionCall(name="read", arguments='{"path":"/workspace/a.py"}'),
+                            )
+                        ],
+                    )
+                    yield MessageChunk(
+                        role="assistant",
+                        content="",
+                        is_final=True,
+                        tool_calls=[
+                            ToolCall(
+                                id="call-read-b",
+                                type="function",
+                                function=FunctionCall(name="read", arguments='{"path":"/workspace/b.py"}'),
+                            )
+                        ],
+                    )
+
+                return stream()
+
+        caller = StreamingModelCaller(
+            StreamingAPI(),
+            model_ids=["model-1"],
+            messages=[Message(role="user", content="read both files")],
+        )
+
+        chunks = []
+        async for chunk, _ in caller.stream():
+            chunks.append(chunk)
+
+        final_tool_calls = chunks[-1].tool_calls
+        assert final_tool_calls is not None
+        assert [tool_call.id for tool_call in final_tool_calls] == ["call-read-a", "call-read-b"]
+        assert [tool_call.function.arguments for tool_call in final_tool_calls] == [
+            '{"path":"/workspace/a.py"}',
+            '{"path":"/workspace/b.py"}',
+        ]
+
+    @pytest.mark.asyncio
     async def test_streaming_model_caller_uses_usage_event_api_when_available(self):
         """Streaming caller reads SDK stream events and stores final usage."""
 
