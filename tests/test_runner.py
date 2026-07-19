@@ -530,6 +530,16 @@ class TestToolResultBounding:
         assert message.tool_call_id == "call-1"
         assert message.content == "short result"
 
+    def test_mcp_text_content_elements_are_flattened_for_model_follow_up(self):
+        message = build_tool_call_message(
+            "call-mcp",
+            "qa_mcp_echo",
+            [ContentElement.from_text("qa_mcp_echo:mcp-ok-local-agent")],
+            max_result_chars=200,
+        )
+
+        assert message.content == "qa_mcp_echo:mcp-ok-local-agent"
+
     def test_string_result_over_limit_keeps_head_and_marker(self):
         message = build_tool_call_message(
             "call-1",
@@ -2755,6 +2765,51 @@ class TestDefaultAgentRunner:
         assert started[0].data.get("tool_name") == "allowed_tool"
         assert len(completed) == 1
         assert completed[0].data.get("error") is None  # No error
+
+    @pytest.mark.asyncio
+    async def test_tool_success_followed_by_empty_completion_fails_run(self, runner, monkeypatch):
+        fake_api = FakeAgentRunAPIProxy(
+            models=[ModelResource(model_id="model-1")],
+            tools=[ToolResource(tool_name="allowed_tool")],
+        )
+        call_count = 0
+
+        async def mock_stream(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                yield MessageChunk(
+                    role="assistant",
+                    content="",
+                    is_final=True,
+                    tool_calls=[
+                        ToolCall(
+                            id="call-1",
+                            type="function",
+                            function=FunctionCall(name="allowed_tool", arguments="{}"),
+                        )
+                    ],
+                )
+                return
+            yield MessageChunk(role="assistant", content="", is_final=True)
+
+        fake_api.invoke_llm_stream = mock_stream
+        fake_api.call_tool = AsyncMock(return_value=[ContentElement.from_text("tool result")])
+        monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
+
+        ctx = make_context(
+            config={"model": {"primary": "model-1", "fallbacks": []}},
+            resources=AgentResources(
+                models=[ModelResource(model_id="model-1")],
+                tools=[ToolResource(tool_name="allowed_tool")],
+            ),
+        )
+
+        results = [result async for result in runner.run(ctx)]
+
+        assert any(result.type == AgentRunResultType.TOOL_CALL_COMPLETED for result in results)
+        assert any(result.type == AgentRunResultType.RUN_FAILED for result in results)
+        assert not any(result.type == AgentRunResultType.RUN_COMPLETED for result in results)
 
     @pytest.mark.asyncio
     async def test_skill_activation_uses_host_tool_call(self, runner, monkeypatch):

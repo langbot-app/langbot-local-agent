@@ -301,7 +301,7 @@ class StreamingModelCaller:
             chunk, usage = _normalize_stream_chunk(raw_chunk)
             if usage is not None:
                 self._usage = usage
-            if chunk is not None:
+            if chunk is not None and _stream_chunk_has_model_output(chunk):
                 return chunk
 
     async def stream(
@@ -722,6 +722,15 @@ def _normalize_stream_chunk(raw_chunk: typing.Any) -> tuple[MessageChunk | None,
     return MessageChunk.model_validate(raw_chunk), usage
 
 
+def _stream_chunk_has_model_output(chunk: MessageChunk) -> bool:
+    """Reject transport/final sentinels that contain no model-visible output."""
+    if chunk.tool_calls:
+        return True
+    if isinstance(chunk.content, str):
+        return bool(chunk.content.strip())
+    return bool(chunk.content)
+
+
 def _normalize_usage(usage: typing.Any) -> dict[str, typing.Any] | None:
     if usage is None:
         return None
@@ -783,4 +792,23 @@ def serialize_tool_result_content(result: typing.Any, *, is_error: bool = False)
         return f"Error: {result}"
     if isinstance(result, str):
         return result
+    text_content = _serialize_text_content_elements(result)
+    if text_content is not None:
+        return text_content
     return json.dumps(result, ensure_ascii=False, default=str)
+
+
+def _serialize_text_content_elements(result: typing.Any) -> str | None:
+    """Flatten MCP-style text-only ContentElement lists for model tool messages."""
+    if not isinstance(result, (list, tuple)) or not result:
+        return None
+
+    texts: list[str] = []
+    for item in result:
+        if _model_or_mapping_get(item, "type") != "text":
+            return None
+        text = _model_or_mapping_get(item, "text")
+        if not isinstance(text, str):
+            return None
+        texts.append(text)
+    return "\n".join(texts)
