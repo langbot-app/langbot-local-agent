@@ -3379,6 +3379,45 @@ class TestDefaultAgentRunner:
         assert "no fallback possible" in failed[0].data.get("error", "").lower()
 
     @pytest.mark.asyncio
+    async def test_streaming_truncated_after_first_chunk_no_fallback(self, runner, monkeypatch):
+        """A stream that ends without a final chunk is a terminal committed failure."""
+        fake_api = FakeAgentRunAPIProxy(
+            models=[
+                ModelResource(model_id="model-1"),
+                ModelResource(model_id="model-2"),
+            ],
+        )
+        call_count = {"model-1": 0, "model-2": 0}
+
+        async def mock_stream(llm_model_uuid, *args, **kwargs):
+            call_count[llm_model_uuid] += 1
+            if llm_model_uuid == "model-1":
+                yield MessageChunk(role="assistant", content="Truncated content", is_final=False)
+                return
+            yield MessageChunk(role="assistant", content="Fallback response", is_final=True)
+
+        fake_api.invoke_llm_stream = mock_stream
+        monkeypatch.setattr(runner, "get_run_api", lambda ctx: fake_api)
+
+        ctx = make_context(
+            config={"model": {"primary": "model-1", "fallbacks": ["model-2"]}},
+            resources=AgentResources(
+                models=[
+                    ModelResource(model_id="model-1"),
+                    ModelResource(model_id="model-2"),
+                ]
+            ),
+        )
+
+        results = [result async for result in runner.run(ctx)]
+
+        assert call_count == {"model-1": 1, "model-2": 0}
+        failed = [result for result in results if result.type == AgentRunResultType.RUN_FAILED]
+        assert len(failed) == 1
+        assert "ended without a final chunk" in failed[0].data.get("error", "").lower()
+        assert not any(result.type == AgentRunResultType.RUN_COMPLETED for result in results)
+
+    @pytest.mark.asyncio
     async def test_streaming_tool_loop_stops_at_iteration_limit(self, runner, monkeypatch):
         """Repeated tool requests complete with a fallback assistant message."""
         fake_api = FakeAgentRunAPIProxy(

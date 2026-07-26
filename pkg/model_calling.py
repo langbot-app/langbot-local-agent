@@ -323,6 +323,7 @@ class StreamingModelCaller:
         stream = None
         last_error: Exception | None = None
         model_id = None
+        stream_finished = False
 
         for model_id in self.model_ids:
             try:
@@ -342,6 +343,7 @@ class StreamingModelCaller:
 
                 # Yield first chunk
                 chunk, is_final = self._process_chunk(first_chunk)
+                stream_finished = is_final
                 yield chunk, not is_final
 
                 # BREAK THE FALLBACK LOOP - we are now committed
@@ -399,7 +401,14 @@ class StreamingModelCaller:
                 if raw_chunk is None:
                     continue
                 chunk, is_final = self._process_chunk(raw_chunk)
+                stream_finished = stream_finished or is_final
                 yield chunk, not is_final
+            if not stream_finished:
+                raise ModelCallError(
+                    f"Model {model_id} stream ended without a final chunk "
+                    "after first chunk (no fallback possible)",
+                    retryable=False,
+                )
         except Exception as e:
             # Post-commit failure - no fallback, raise terminal error
             if is_deadline_exceeded_error(e):
@@ -407,6 +416,8 @@ class StreamingModelCaller:
                     e,
                     prefix=f"Model {model_id} exceeded run deadline after first chunk",
                 )
+            if isinstance(e, ModelCallError):
+                raise
             raise ModelCallError(
                 f"Model {model_id} failed after first chunk (no fallback possible): {e}",
                 retryable=False,
