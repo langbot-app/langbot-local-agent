@@ -305,8 +305,7 @@ class DefaultAgentRunner(AgentRunner):
                     return
 
             if (
-                not assembly.streaming
-                and event.type == AgentLoopEventType.MESSAGE_END
+                event.type == AgentLoopEventType.MESSAGE_END
                 and event.message is not None
                 and event.message.role == "assistant"
                 and not event.message.tool_calls
@@ -323,7 +322,7 @@ class DefaultAgentRunner(AgentRunner):
                         usage=terminal_usage,
                     )
                     return
-                if not assembly.streaming and final_message is not None:
+                if final_message is not None:
                     yield AgentRunResult.message_completed(run_id, final_message)
                 yield AgentRunResult.run_completed(
                     run_id,

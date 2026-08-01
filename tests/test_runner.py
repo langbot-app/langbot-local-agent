@@ -1941,9 +1941,15 @@ class TestDefaultAgentRunner:
         async for result in runner.run(ctx):
             results.append(result)
 
-        # Should have message deltas and run.completed
+        # Streaming still emits a completed message so the Host can persist
+        # the final assistant transcript before the terminal run event.
         assert any(r.type == AgentRunResultType.MESSAGE_DELTA for r in results)
+        completed = [r for r in results if r.type == AgentRunResultType.MESSAGE_COMPLETED]
+        assert len(completed) == 1
+        assert completed[0].data.get("message", {}).get("content") == "Hello world"
         assert any(r.type == AgentRunResultType.RUN_COMPLETED for r in results)
+        assert results[-2].type == AgentRunResultType.MESSAGE_COMPLETED
+        assert results[-1].type == AgentRunResultType.RUN_COMPLETED
         fake_api.history_page.assert_not_awaited()
 
     @pytest.mark.asyncio
