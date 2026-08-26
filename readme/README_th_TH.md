@@ -24,6 +24,7 @@
 | `prompt` | `prompt-editor` | ใช่ | `[{content: You are a helpful assistant., role: system}]` |
 | `remove-think` | `boolean` | ไม่ | false |
 | `knowledge-bases` | `knowledge-base-multi-selector` | ไม่ | `[]` |
+| `advanced-settings` | `boolean` | ไม่ | `false` |
 | `retrieval-top-k` | `integer` | ไม่ | `5` |
 | `rerank-model` | `rerank-model-selector` | ไม่ | ว่าง |
 | `rerank-top-k` | `integer` | ไม่ | `5` |

@@ -1487,6 +1487,7 @@ class TestDefaultAgentRunner:
             "history": ["page"],
         }
         config_names = {item["name"] for item in manifest["spec"]["config"]}
+        assert "advanced-settings" in config_names
         assert "remove-think" in config_names
         assert "context-window-tokens" in config_names
         assert "context-keep-recent-tokens" in config_names
@@ -1500,6 +1501,16 @@ class TestDefaultAgentRunner:
         tool_execution_mode = next(item for item in manifest["spec"]["config"] if item["name"] == "tool-execution-mode")
         assert tool_execution_mode["default"] == "parallel"
         assert [option["name"] for option in tool_execution_mode["options"]] == ["parallel", "serial"]
+        config = {item["name"]: item for item in manifest["spec"]["config"]}
+        assert config["advanced-settings"]["default"] is False
+        basic_fields = {"model", "prompt", "knowledge-bases", "advanced-settings"}
+        advanced_fields = config_names - basic_fields
+        for field_name in advanced_fields:
+            assert config[field_name]["show_if"] == {
+                "field": "advanced-settings",
+                "operator": "eq",
+                "value": True,
+            }
 
     @pytest.mark.asyncio
     async def test_streaming_tool_call_arguments_continue_when_later_delta_has_no_id(self):

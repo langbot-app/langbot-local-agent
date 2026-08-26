@@ -24,6 +24,7 @@ Agente integrado con modelos de respaldo, herramientas y recuperación de conoci
 | `prompt` | `prompt-editor` | Sí | `[{content: You are a helpful assistant., role: system}]` |
 | `remove-think` | `boolean` | No | false |
 | `knowledge-bases` | `knowledge-base-multi-selector` | No | `[]` |
+| `advanced-settings` | `boolean` | No | `false` |
 | `retrieval-top-k` | `integer` | No | `5` |
 | `rerank-model` | `rerank-model-selector` | No | Vacío |
 | `rerank-top-k` | `integer` | No | `5` |

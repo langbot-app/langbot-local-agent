@@ -39,6 +39,7 @@ LangBot 负责运行信封、资源授权与结果投递；Local Agent 负责 Ag
 | `prompt` | `prompt-editor` | 是 | `You are a helpful assistant.` | 默认系统提示词；Host 提供有效提示词 API 时优先使用预处理后的结果 |
 | `remove-think` | `boolean` | 否 | `false` | 请求模型适配器移除思考内容 |
 | `knowledge-bases` | `knowledge-base-multi-selector` | 否 | `[]` | 用于 RAG 的知识库 |
+| `advanced-settings` | `boolean` | 否 | `false` | 展开检索、工具、超时和上下文管理的高级参数；仅影响表单显示 |
 | `retrieval-top-k` | `integer` | 否 | `5` | 每个知识库请求的检索条数 |
 | `rerank-model` | `rerank-model-selector` | 否 | 空 | 可选重排模型 |
 | `rerank-top-k` | `integer` | 否 | `5` | 重排后保留的结果数 |

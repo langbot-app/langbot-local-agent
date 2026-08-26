@@ -24,6 +24,7 @@
 | `prompt` | `prompt-editor` | Да | `[{content: You are a helpful assistant., role: system}]` |
 | `remove-think` | `boolean` | Нет | false |
 | `knowledge-bases` | `knowledge-base-multi-selector` | Нет | `[]` |
+| `advanced-settings` | `boolean` | Нет | `false` |
 | `retrieval-top-k` | `integer` | Нет | `5` |
 | `rerank-model` | `rerank-model-selector` | Нет | Пусто |
 | `rerank-top-k` | `integer` | Нет | `5` |

@@ -24,6 +24,7 @@
 | `prompt` | `prompt-editor` | はい | `[{content: You are a helpful assistant., role: system}]` |
 | `remove-think` | `boolean` | いいえ | false |
 | `knowledge-bases` | `knowledge-base-multi-selector` | いいえ | `[]` |
+| `advanced-settings` | `boolean` | いいえ | `false` |
 | `retrieval-top-k` | `integer` | いいえ | `5` |
 | `rerank-model` | `rerank-model-selector` | いいえ | 空 |
 | `rerank-top-k` | `integer` | いいえ | `5` |

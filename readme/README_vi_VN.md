@@ -24,6 +24,7 @@ Tác nhân tích hợp hỗ trợ mô hình dự phòng, gọi công cụ và tr
 | `prompt` | `prompt-editor` | Có | `[{content: You are a helpful assistant., role: system}]` |
 | `remove-think` | `boolean` | Không | false |
 | `knowledge-bases` | `knowledge-base-multi-selector` | Không | `[]` |
+| `advanced-settings` | `boolean` | Không | `false` |
 | `retrieval-top-k` | `integer` | Không | `5` |
 | `rerank-model` | `rerank-model-selector` | Không | Trống |
 | `rerank-top-k` | `integer` | Không | `5` |

@@ -65,6 +65,7 @@ The SDK proxy import path is
 | prompt | prompt-editor | yes | system: "You are a helpful assistant." | Default system prompt edited in LangBot UI |
 | remove-think | boolean | no | false | Ask Host model APIs to remove provider thinking output when supported |
 | knowledge-bases | knowledge-base-multi-selector | no | [] | Knowledge bases for RAG |
+| advanced-settings | boolean | no | false | Show advanced retrieval, tool, timeout, and context controls; affects form visibility only |
 | retrieval-top-k | integer | no | 5 | Retrieval results requested per knowledge base |
 | rerank-model | rerank-model-selector | no | '' | Rerank model for improved retrieval |
 | rerank-top-k | integer | no | 5 | Top-K results after reranking |
