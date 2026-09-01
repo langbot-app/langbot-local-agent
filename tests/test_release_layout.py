@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from xml.etree import ElementTree
 
 import yaml
 
@@ -51,3 +52,14 @@ def test_local_agent_has_publishable_marketplace_layout() -> None:
         assert len(localized_readme.encode("utf-8")) >= 1_000
         assert all(field in localized_readme for field in config_fields)
         assert runner_id in localized_readme
+
+
+def test_local_agent_icon_uses_blue_robot_mark() -> None:
+    icon = ElementTree.parse(ROOT / "assets" / "icon.svg").getroot()
+    path = icon.find("{http://www.w3.org/2000/svg}path")
+
+    assert icon.attrib["viewBox"] == "0 0 24 24"
+    assert path is not None
+    assert path.attrib["fill"].upper() == "#4692DD"
+    assert path.attrib["d"].startswith("M13.5 2")
+    assert "currentColor" not in (ROOT / "assets" / "icon.svg").read_text(encoding="utf-8")
