@@ -15,6 +15,8 @@ from langbot_plugin.api.entities.builtin.provider.message import Message
 
 from pkg.config import get_knowledge_base_ids, get_rerank_config, get_retrieval_top_k
 from pkg.messages import (
+    build_event_context_message,
+    build_platform_tools_system_message,
     build_prompt_messages,
     build_rag_context_message,
     build_skills_system_message,
@@ -395,7 +397,9 @@ class HostContextTokenCounter:
     async def count(self, messages: list[Message]) -> int:
         count_tokens = getattr(self.api, "count_tokens", None)
         if not callable(count_tokens):
-            raise ContextTokenCounterRequiredError("Host count_tokens API is required for local-agent context budgeting")
+            raise ContextTokenCounterRequiredError(
+                "Host count_tokens API is required for local-agent context budgeting"
+            )
         tokens = await count_tokens(
             llm_model_uuid=self.model_id,
             messages=messages,
@@ -434,10 +438,16 @@ class ContextAssembler:
         skills_message = build_skills_system_message(self.ctx)
         if skills_message is not None:
             prompt_messages = [*prompt_messages, skills_message]
+        platform_tools_message = build_platform_tools_system_message(self.ctx)
+        if platform_tools_message is not None:
+            prompt_messages = [*prompt_messages, platform_tools_message]
         checkpoint_messages = self._checkpoint_messages(checkpoint)
         checkpoint_cursors = [checkpoint.covers_until for _ in checkpoint_messages] if checkpoint else []
         rag_messages = [rag_message] if rag_message is not None else []
         current_messages = []
+        event_message = build_event_context_message(self.ctx)
+        if event_message is not None:
+            current_messages.append(event_message)
         user_message = build_user_message(
             user_text=user_text,
             input_contents=self.ctx.input.contents,
@@ -1226,7 +1236,9 @@ class ContextCompactor:
 
     def _require_token_counter(self) -> None:
         if self.token_counter is None:
-            raise ContextTokenCounterRequiredError("Host count_tokens API is required for local-agent context budgeting")
+            raise ContextTokenCounterRequiredError(
+                "Host count_tokens API is required for local-agent context budgeting"
+            )
 
     async def _count_messages_async(self, messages: list[Message], *, allow_usage_anchor: bool = False) -> int:
         self._require_token_counter()

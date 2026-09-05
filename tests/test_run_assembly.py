@@ -6,6 +6,7 @@ import pytest
 from langbot_plugin.api.entities.builtin.agent_runner.resources import AgentResources, ModelResource, ToolResource
 
 from pkg.agent_core import LangBotContextHooks, LangBotToolExecutor
+from pkg.messages import build_platform_tools_system_message
 from pkg.run_assembly import AgentRunAssembler, NoAuthorizedModelError
 from tests.test_runner import FakeAgentRunAPIProxy, make_context
 
@@ -82,6 +83,27 @@ async def test_assembler_raises_when_configured_models_are_not_authorized() -> N
     api.get_tool_detail.assert_not_awaited()
 
 
+def test_platform_action_tools_add_run_scoped_safety_guidance() -> None:
+    ctx = make_context(
+        resources=AgentResources(
+            tools=[
+                ToolResource(
+                    tool_name="event_reply",
+                    tool_type="platform",
+                    description="Reply to the current event",
+                )
+            ]
+        )
+    )
+
+    message = build_platform_tools_system_message(ctx)
+
+    assert message is not None
+    assert "event_reply" in message.content
+    assert "targets frozen by LangBot" in message.content
+    assert "never claim an action succeeded" in message.content
+
+
 @pytest.mark.asyncio
 async def test_build_llm_tools_uses_prefilled_schema_without_fetch() -> None:
     """Host-prefilled ToolResource.parameters avoid a get_tool_detail round-trip."""
@@ -104,3 +126,45 @@ async def test_build_llm_tools_uses_prefilled_schema_without_fetch() -> None:
     assert [t.name for t in tools] == ["echo"]
     assert tools[0].parameters == {"type": "object", "properties": {}}
     api.get_tool_detail.assert_not_awaited()
+
+
+@pytest.mark.parametrize("mock", [True, False])
+def test_platform_mock_guidance_is_scoped_to_debug_runs(mock):
+    ctx = make_context(resources=AgentResources(tools=[ToolResource(tool_name="event_reply", tool_type="platform")]))
+    ctx.delivery.platform_capabilities = {"debug_mock": mock}
+    message = build_platform_tools_system_message(ctx)
+    assert message is not None
+    assert ("A successful mock result fully satisfies" in message.content) is mock
+    assert "empty object schema" in message.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        "group.member_joined",
+        "group.member_left",
+        "friend.request_received",
+        "feedback.received",
+        "message.edited",
+        "message.deleted",
+        "message.reaction",
+        "custom.probe",
+    ],
+)
+async def test_event_data_reaches_model_context(event_type):
+    api = FakeAgentRunAPIProxy(models=[ModelResource(model_id="model-primary")])
+    ctx = make_context(
+        config={"model": {"primary": "model-primary"}},
+        resources=AgentResources(models=[ModelResource(model_id="model-primary")]),
+        input_text="Read probe",
+    )
+    ctx.event.event_type = event_type
+    ctx.event.data = {"probe": "E2E-42", "nested": {"member_id": "member-1"}}
+    assembly = await AgentRunAssembler(api, ctx).assemble()
+    facts = assembly.messages[-2]
+    assert facts.role == "user"
+    assert event_type in facts.content
+    assert '"probe": "E2E-42"' in facts.content
+    assert '"member_id": "member-1"' in facts.content
+    assert assembly.messages[-1].content == "Read probe"
