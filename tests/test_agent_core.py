@@ -318,6 +318,36 @@ async def test_streaming_model_all_empty_streams_fail():
 
 
 @pytest.mark.asyncio
+async def test_streaming_model_empty_normal_stop_commits_and_preserves_usage():
+    class StreamingAPI:
+        def __init__(self):
+            self.model_ids = []
+
+        async def invoke_llm_stream_events(self, *, llm_model_uuid, **kwargs):
+            self.model_ids.append(llm_model_uuid)
+            yield {"chunk": MessageChunk(role="assistant", content=" ", is_final=False)}
+            yield {
+                "chunk": MessageChunk(
+                    role="assistant", content="", is_final=True, provider_specific_fields={"finish_reason": "stop"}
+                )
+            }
+            yield {"usage": {"prompt_tokens": 20, "completion_tokens": 1, "total_tokens": 21}}
+
+    api = StreamingAPI()
+    caller = StreamingModelCaller(
+        api, model_ids=["model-1", "model-2"], messages=[Message(role="user", content="hello")]
+    )
+
+    chunks = [chunk async for chunk, _ in caller.stream()]
+
+    assert api.model_ids == ["model-1"]
+    assert caller.get_committed_model_id() == "model-1"
+    assert chunks[-1].is_final
+    assert not caller.get_tool_calls()
+    assert caller.get_usage()["total_tokens"] == 21
+
+
+@pytest.mark.asyncio
 async def test_streaming_model_all_empty_final_chunks_fail():
     class StreamingAPI:
         def invoke_llm_stream(self, *, llm_model_uuid, messages, funcs, remove_think):

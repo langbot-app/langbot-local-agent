@@ -295,13 +295,18 @@ class StreamingModelCaller:
         self._msg_sequence = 0
         self._usage: dict[str, typing.Any] | None = None
 
-    async def _next_non_empty_chunk(self, stream: typing.AsyncIterator[typing.Any]) -> MessageChunk:
+    async def _next_model_chunk(self, stream: typing.AsyncIterator[typing.Any]) -> MessageChunk:
         while True:
             raw_chunk = await stream.__anext__()
             chunk, usage = _normalize_stream_chunk(raw_chunk)
             if usage is not None:
                 self._usage = usage
-            if chunk is not None and _stream_chunk_has_model_output(chunk):
+            if chunk is not None and (
+                _stream_chunk_has_model_output(chunk)
+                or (chunk.is_final and (chunk.provider_specific_fields or {}).get("finish_reason") == "stop")
+            ):
+                # A normal provider stop is a valid turn with no further tool calls.
+                # Empty transport sentinels still do not commit the model.
                 return chunk
 
     async def stream(
@@ -337,7 +342,7 @@ class StreamingModelCaller:
                     funcs=self.tools,
                     remove_think=self.remove_think,
                 )
-                first_chunk = await self._next_non_empty_chunk(stream)
+                first_chunk = await self._next_model_chunk(stream)
                 # First chunk received - model is now committed
                 self._committed_model_id = model_id
 

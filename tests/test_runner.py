@@ -2784,7 +2784,10 @@ class TestDefaultAgentRunner:
         assert completed[0].data.get("error") is None  # No error
 
     @pytest.mark.asyncio
-    async def test_tool_success_followed_by_empty_completion_fails_run(self, runner, monkeypatch):
+    @pytest.mark.parametrize("finish_reason", [None, "stop", "length", "content_filter", "tool_calls"])
+    async def test_tool_success_followed_by_empty_completion_requires_normal_stop(
+        self, runner, monkeypatch, finish_reason
+    ):
         fake_api = FakeAgentRunAPIProxy(
             models=[ModelResource(model_id="model-1")],
             tools=[ToolResource(tool_name="allowed_tool")],
@@ -2808,7 +2811,12 @@ class TestDefaultAgentRunner:
                     ],
                 )
                 return
-            yield MessageChunk(role="assistant", content="", is_final=True)
+            yield MessageChunk(
+                role="assistant",
+                content="",
+                is_final=True,
+                provider_specific_fields={"finish_reason": finish_reason} if finish_reason else None,
+            )
 
         fake_api.invoke_llm_stream = mock_stream
         fake_api.call_tool = AsyncMock(return_value=[ContentElement.from_text("tool result")])
@@ -2825,8 +2833,10 @@ class TestDefaultAgentRunner:
         results = [result async for result in runner.run(ctx)]
 
         assert any(result.type == AgentRunResultType.TOOL_CALL_COMPLETED for result in results)
-        assert any(result.type == AgentRunResultType.RUN_FAILED for result in results)
-        assert not any(result.type == AgentRunResultType.RUN_COMPLETED for result in results)
+        assert call_count == 2
+        fake_api.call_tool.assert_awaited_once()
+        assert any(result.type == AgentRunResultType.RUN_FAILED for result in results) is (finish_reason != "stop")
+        assert any(result.type == AgentRunResultType.RUN_COMPLETED for result in results) is (finish_reason == "stop")
 
     @pytest.mark.asyncio
     async def test_skill_activation_uses_host_tool_call(self, runner, monkeypatch):
