@@ -171,8 +171,7 @@ class FakeAgentRunAPIProxy:
         **kwargs: Any,
     ) -> int:
         normalized_messages = [
-            message if isinstance(message, Message) else Message.model_validate(message)
-            for message in messages
+            message if isinstance(message, Message) else Message.model_validate(message) for message in messages
         ]
         tool_tokens = 0
         for func in funcs or []:

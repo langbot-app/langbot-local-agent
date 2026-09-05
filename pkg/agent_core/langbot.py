@@ -316,6 +316,7 @@ class LangBotToolExecutor:
             terminate=terminate,
         )
 
+
 class LangBotContextHooks(AgentLoopHooks):
     """LangBot-specific loop hooks for Pi-style per-turn context management."""
 

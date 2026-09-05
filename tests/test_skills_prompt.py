@@ -59,9 +59,7 @@ def test_skill_without_description_still_listed() -> None:
 
 
 def test_xml_special_characters_are_escaped() -> None:
-    msg = build_skills_system_message(
-        _ctx([SkillResource(skill_name="x", description='a < b & c "d" <tag>')])
-    )
+    msg = build_skills_system_message(_ctx([SkillResource(skill_name="x", description='a < b & c "d" <tag>')]))
     assert msg is not None
     assert "&lt;" in msg.content and "&amp;" in msg.content and "&quot;" in msg.content
     # Raw description markup must not pass through verbatim.

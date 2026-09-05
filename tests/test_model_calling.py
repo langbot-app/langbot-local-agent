@@ -9,7 +9,7 @@ from pkg.model_calling import ModelCallError, is_context_overflow_error
     "message",
     [
         "prompt is too long: 213462 tokens > 200000 maximum",
-        "413 {\"error\":{\"type\":\"request_too_large\",\"message\":\"Request exceeds the maximum size\"}}",
+        '413 {"error":{"type":"request_too_large","message":"Request exceeds the maximum size"}}',
         "Your input exceeds the context window of this model",
         "Requested token count exceeds the model's maximum context length of 131072 tokens.",
         "Input length (265330) exceeds model's maximum context length (262144).",

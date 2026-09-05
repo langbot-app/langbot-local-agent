@@ -410,8 +410,7 @@ class StreamingModelCaller:
                 yield chunk, not is_final
             if not stream_finished:
                 raise ModelCallError(
-                    f"Model {model_id} stream ended without a final chunk "
-                    "after first chunk (no fallback possible)",
+                    f"Model {model_id} stream ended without a final chunk after first chunk (no fallback possible)",
                     retryable=False,
                 )
         except Exception as e:
@@ -591,9 +590,7 @@ def build_tool_reference_message(
         "type": TOOL_RESULT_REFERENCE_MARKER,
         "file_refs": references["file_refs"],
         "original_chars": len(content),
-        "next_step": (
-            "For sandbox files, call the sandbox-provided file tools with the returned file reference."
-        ),
+        "next_step": ("For sandbox files, call the sandbox-provided file tools with the returned file reference."),
     }
     if len(content) <= max_result_chars:
         payload["result"] = result
