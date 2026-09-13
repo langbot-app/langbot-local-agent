@@ -1,3 +1,7 @@
+> **Moved:** Development continues in [Runner/LocalAgent](https://github.com/langbot-app/langbot-plugins/tree/main/Runner/LocalAgent) in `langbot-app/langbot-plugins`. Please submit changes and new issues there. This repository is retained for its history and existing issues.
+>
+> **已迁移：** 后续开发请前往 [langbot-plugins/Runner/LocalAgent](https://github.com/langbot-app/langbot-plugins/tree/main/Runner/LocalAgent)。本仓库保留历史记录和已有 Issue。
+
 # Local Agent
 
 Local Agent 是 LangBot 官方的进程内运行器。它在 LangBot 插件进程中完成提示词组装、模型调用、工具循环、知识库检索、上下文压缩和技能调用，适合使用 LangBot 托管模型与工具的通用 Agent 场景。
